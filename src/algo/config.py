@@ -135,6 +135,10 @@ class Settings(BaseSettings):
             url = "postgresql+psycopg://" + url.removeprefix("postgres://")
         elif url.startswith("postgresql://") and "+psycopg" not in url:
             url = "postgresql+psycopg://" + url.removeprefix("postgresql://")
+        # Prefer Supabase transaction pooler (6543) over session (5432).
+        # Session mode maxes ~15 clients and breaks Render deploys / dual local+cloud.
+        if "pooler.supabase.com:5432" in url:
+            url = url.replace("pooler.supabase.com:5432", "pooler.supabase.com:6543", 1)
         return url
 
 

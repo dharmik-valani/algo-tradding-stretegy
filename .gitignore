@@ -1,3 +1,7 @@
+.cursor/
+uploads/
+assets/
+*.png
 .env
 .venv/
 venv/

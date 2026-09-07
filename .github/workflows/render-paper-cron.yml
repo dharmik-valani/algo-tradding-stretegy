@@ -66,7 +66,7 @@ jobs:
           set -euo pipefail
           BASE="${APP_URL:-https://algo-paper-desk.onrender.com}"
           BASE="${BASE%/}"
-          HDR=(-H "User-Agent: algo-paper-desk-cron/1.0")
+          HDR=(-H "User-Agent: algo-paper-desk-cron/1.0" -H "Content-Type: application/json")
           if [ -n "${CRON_SECRET:-}" ]; then
             HDR+=(-H "X-Cron-Secret: ${CRON_SECRET}")
           fi
@@ -82,7 +82,7 @@ jobs:
               if [ "$method" = "GET" ]; then
                 body=$(curl -sS -m 90 -w "\n%{http_code}" "${HDR[@]}" "${BASE}${path}" || true)
               else
-                body=$(curl -sS -m 90 -w "\n%{http_code}" -X "$method" "${HDR[@]}" "${BASE}${path}" || true)
+                body=$(curl -sS -m 90 -w "\n%{http_code}" -X "$method" "${HDR[@]}" -d '{}' "${BASE}${path}" || true)
               fi
               code=$(echo "$body" | tail -n1)
               echo "$body" | sed '$d' | head -c 500
@@ -96,9 +96,16 @@ jobs:
             return 1
           }
 
+          # Warm the free instance before wake/sleep so cold-start does not fail the action.
           case "$ACTION" in
             health) attempt GET  /api/health ;;
-            wake)   attempt POST "/api/session/wake?poll_seconds=15" ;;
-            sleep)  attempt POST /api/session/sleep ;;
+            wake)
+              attempt GET /api/health || true
+              attempt POST "/api/session/wake?poll_seconds=15"
+              ;;
+            sleep)
+              attempt GET /api/health || true
+              attempt POST /api/session/sleep
+              ;;
             *) echo "unknown action"; exit 1 ;;
           esac
