@@ -2,19 +2,21 @@ from __future__ import annotations
 
 """Multi-symbol paper runner for NIFTY500 gainer/loser ORB baskets."""
 
-from datetime import datetime
+from datetime import datetime, timedelta, time as time_cls
 from typing import Any
 from zoneinfo import ZoneInfo
 
 from algo.config import Settings
 from algo.paper.broker import PaperBroker, utcnow
 from algo.paper.equity_orb import _EquityOrbBase
+from algo.paper.equity_orb_tier import _EquityOrbTierBase
 from algo.paper.journal import close_trade, open_trade, record_selections
 from algo.paper.models import Bar, Position, Side, SignalAction, StrategyState
 from algo.paper.quotes import LiveQuoteProvider
 from algo.paper.universe import resolve_universe
 
 IST = ZoneInfo("Asia/Kolkata")
+_BasketStrategy = _EquityOrbBase | _EquityOrbTierBase
 
 
 class BasketRunner:
@@ -22,7 +24,7 @@ class BasketRunner:
         self,
         *,
         instance_id: str,
-        strategy: _EquityOrbBase,
+        strategy: _BasketStrategy,
         timeframe: str = "1m",
         starting_cash: float = 100_000.0,
         quantity: int | None = None,
@@ -182,6 +184,17 @@ class BasketRunner:
         if self._scanned and self.strategy.selected:
             self.selected = list(self.strategy.selected)
             return
+        p = {**self.strategy.default_params(), **self.strategy.params}
+        scan_at_raw = str(p.get("scan_at") or "").strip()
+        if scan_at_raw:
+            try:
+                hh, mm = [int(x) for x in scan_at_raw.split(":")[:2]]
+                now = datetime.now(IST).time().replace(tzinfo=None)
+                if now < time_cls(hh, mm):
+                    self._log(f"Waiting scan_at {scan_at_raw} IST (now {now.strftime('%H:%M:%S')})")
+                    return
+            except Exception:
+                pass
         universe = resolve_universe(self.strategy.params)
         snaps: list[dict[str, Any]] = []
         try:
@@ -208,6 +221,7 @@ class BasketRunner:
                 b.bind(self.strategy.id, f"NSE:EQ:{sym}", sym)
                 self.brokers[sym] = b
                 self.histories.setdefault(sym, [])
+        self._seed_opening_ranges(quotes, p)
         if self.journal_session_id:
             record_selections(
                 session_id=self.journal_session_id,
@@ -219,6 +233,41 @@ class BasketRunner:
             f"Selected {len(self.selected)}: {', '.join(self.selected) or 'none'} "
             f"(from {len(snaps)} scanned)"
         )
+
+    def _seed_opening_ranges(self, quotes: LiveQuoteProvider, params: dict[str, Any]) -> None:
+        """Backfill 09:15→now range highs/lows so a 09:18 scan still gets a full first candle."""
+        seed_fn = getattr(self.strategy, "seed_range", None)
+        if not callable(seed_fn):
+            return
+        open_s = str(params.get("session_open") or "09:15")
+        range_mins = int(params.get("range_minutes") or 5)
+        try:
+            oh, om = [int(x) for x in open_s.split(":")[:2]]
+        except Exception:
+            return
+        now = datetime.now(IST)
+        day = now.date()
+        open_dt = datetime.combine(day, time_cls(oh, om), tzinfo=IST)
+        range_end = open_dt + timedelta(minutes=range_mins)
+        end_dt = min(now, range_end)
+        for sym in self.selected:
+            try:
+                bars = quotes.load_public_bars(sym, interval="1m", range_="1d")
+            except Exception as exc:
+                self._log(f"range seed skip {sym}: {exc}")
+                continue
+            highs: list[float] = []
+            lows: list[float] = []
+            for bar in bars:
+                ts = bar.timestamp.astimezone(IST)
+                if ts.date() != day:
+                    continue
+                if open_dt <= ts <= end_dt:
+                    highs.append(float(bar.high))
+                    lows.append(float(bar.low))
+            if highs and lows:
+                seed_fn(sym, max(highs), min(lows))
+                self._log(f"Seeded {sym} range H={max(highs):.2f} L={min(lows):.2f}")
 
     def on_symbol_bar(self, symbol: str, bar: Bar) -> None:
         if not self.enabled:
@@ -411,19 +460,37 @@ class BasketRunner:
         elif signal.action is SignalAction.FLAT and pos != 0:
             before = broker.realized_pnl
             side = Side.SELL if pos > 0 else Side.BUY
+            close_frac = meta.get("close_frac")
+            if close_frac is not None and 0 < float(close_frac) < 1:
+                qty_close = max(1, int(round(abs(pos) * float(close_frac))))
+                qty_close = min(qty_close, abs(pos) - 1) if abs(pos) > 1 else abs(pos)
+            else:
+                qty_close = abs(pos)
             order = broker.submit_market(
                 strategy_id=self.strategy.id,
                 instrument_id=f"NSE:EQ:{symbol}",
                 symbol=symbol,
                 side=side,
-                quantity=abs(pos),
+                quantity=qty_close,
                 last_price=fill_px,
                 ts=ts,
             )
             if order.status.value == "FILLED":
                 pnl_delta = broker.realized_pnl - before
-                tid = self.open_trade_ids.pop(symbol, None)
                 trade_side = "LONG" if pos > 0 else "SHORT"
+                still_open = broker.position.quantity != 0
+                if still_open:
+                    # Partial scale-out at R1 — keep journal trade open until final exit.
+                    self._log(
+                        f"{symbol} scaled out qty={qty_close} @ {order.fill_price or fill_px:.2f} "
+                        f"(left {broker.position.quantity})"
+                    )
+                    return
+                # Full exit (incl. tiny positions where partial collapsed to 100%)
+                leg = (getattr(self.strategy, "_legs", {}) or {}).get(symbol)
+                if isinstance(leg, dict):
+                    leg["in_trade"] = False
+                tid = self.open_trade_ids.pop(symbol, None)
                 if self.journal_session_id and tid:
                     close_trade(
                         trade_id=tid,
@@ -441,8 +508,14 @@ class BasketRunner:
                     )
 
     def _entry_qty(self, broker: PaperBroker, fill_px: float, signal) -> int:
-        """Fixed qty for classic ORB; cash-fit qty for *_cash strategies."""
-        wanted = max(int(self.qty), 1)
+        """Tiered qty (brother strategies), fixed qty, or cash-fit for *_cash."""
+        meta = signal.meta or {}
+        if meta.get("qty"):
+            wanted = max(int(meta["qty"]), 1)
+        elif getattr(self.strategy, "use_price_tiers", False) and hasattr(self.strategy, "qty_for_price"):
+            wanted = max(int(self.strategy.qty_for_price(fill_px)), 1)
+        else:
+            wanted = max(int(self.qty), 1)
         if not getattr(self.strategy, "auto_size_cash", False):
             return wanted
         if fill_px <= 0:

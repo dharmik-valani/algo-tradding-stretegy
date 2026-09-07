@@ -17,6 +17,11 @@ from algo.paper.equity_orb import (
     Nifty500LoserOrbStrategy,
     _EquityOrbBase,
 )
+from algo.paper.equity_orb_tier import (
+    Nifty500TopGainerBrkStrategy,
+    Nifty500TopLoserBrkStrategy,
+    _EquityOrbTierBase,
+)
 from algo.paper.journal import end_journal_session, list_open_trades, start_journal_session
 from algo.paper.models import Bar, SessionSnapshot, Side, SignalAction, StrategyState
 from algo.paper.quotes import LiveQuoteProvider
@@ -33,6 +38,8 @@ BASKET_IDS = {
     Nifty500LoserOrbStrategy.id,
     Nifty500GainerOrbCashStrategy.id,
     Nifty500LoserOrbCashStrategy.id,
+    Nifty500TopGainerBrkStrategy.id,
+    Nifty500TopLoserBrkStrategy.id,
 }
 
 
@@ -275,7 +282,7 @@ class PaperSession:
                 if key in self.runners:
                     raise ValueError(f"Strategy instance already on desk: {key}")
                 get_engine(self.settings)
-                assert isinstance(strategy, _EquityOrbBase)
+                assert isinstance(strategy, (_EquityOrbBase, _EquityOrbTierBase))
                 runner = BasketRunner(
                     instance_id=key,
                     strategy=strategy,

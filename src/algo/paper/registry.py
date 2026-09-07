@@ -15,6 +15,10 @@ from algo.paper.equity_orb import (
     Nifty500LoserOrbCashStrategy,
     Nifty500LoserOrbStrategy,
 )
+from algo.paper.equity_orb_tier import (
+    Nifty500TopGainerBrkStrategy,
+    Nifty500TopLoserBrkStrategy,
+)
 from algo.paper.zen_credit import ZenCreditSpreadOvernightStrategy
 
 _REGISTRY: dict[str, type[Strategy]] = {
@@ -29,6 +33,8 @@ _REGISTRY: dict[str, type[Strategy]] = {
     Nifty500LoserOrbStrategy.id: Nifty500LoserOrbStrategy,
     Nifty500GainerOrbCashStrategy.id: Nifty500GainerOrbCashStrategy,
     Nifty500LoserOrbCashStrategy.id: Nifty500LoserOrbCashStrategy,
+    Nifty500TopGainerBrkStrategy.id: Nifty500TopGainerBrkStrategy,
+    Nifty500TopLoserBrkStrategy.id: Nifty500TopLoserBrkStrategy,
 }
 
 

@@ -46,7 +46,9 @@ function isBasketId(id) {
     id === "nifty500_gainer_orb" ||
     id === "nifty500_loser_orb" ||
     id === "nifty500_gainer_orb_cash" ||
-    id === "nifty500_loser_orb_cash"
+    id === "nifty500_loser_orb_cash" ||
+    id === "nifty500_top_gainer_brk" ||
+    id === "nifty500_top_loser_brk"
   );
 }
 
