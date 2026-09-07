@@ -1273,3 +1273,23 @@ def reset_session() -> PaperSession:
             save_strategies(saved, prefs=prefs)
         _SESSION.message = "Session runtime reset — desk strategies kept"
         return _SESSION
+
+
+def reload_session_from_disk() -> PaperSession:
+    """Stop live, re-open SQLite, restore desk + runtime from data/ files."""
+    global _SESSION
+    with _SESSION_LOCK:
+        if _SESSION and _SESSION.running:
+            _SESSION.stop()
+        from algo.storage.db import get_engine, reset_engine
+
+        reset_engine()
+        get_engine()
+        _SESSION = PaperSession()
+        _SESSION.install_signal_handlers()
+        _SESSION.restore_desk()
+        _SESSION.restore_runtime()
+        _SESSION.message = (
+            f"Restored from disk — {len(_SESSION.runners)} strategies on desk"
+        )
+        return _SESSION
