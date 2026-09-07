@@ -1074,9 +1074,11 @@ class PaperSession:
             self.updated_at = utcnow()
 
     def _run_live(self) -> None:
-        assert self._quotes is not None
         try:
             while not self._stop.is_set():
+                quotes = self._quotes
+                if quotes is None:
+                    break
                 with self._lock:
                     runners = list(self.runners.values())
                 # Keep WebSocket subscriptions warm for all enabled legs.
@@ -1094,10 +1096,10 @@ class PaperSession:
                     else:
                         want_syms.append(getattr(runner, "symbol", "") or "")
                 try:
-                    self._quotes.ensure_subscribed([s for s in want_syms if s])
+                    quotes.ensure_subscribed([s for s in want_syms if s])
                 except Exception:
                     pass
-                src = self._quotes.feed_status
+                src = quotes.feed_status
                 labels: list[str] = []
                 for runner in runners:
                     if not runner.enabled:
@@ -1105,8 +1107,8 @@ class PaperSession:
                     try:
                         if isinstance(runner, BasketRunner):
                             runner.journal_session_id = self.journal_session_id
-                            labels.extend(runner.tick_live(self._quotes))
-                            src = self._quotes.feed_status
+                            labels.extend(runner.tick_live(quotes))
+                            src = quotes.feed_status
                         elif runner.strategy.id == "zen_credit_spread":
                             bar = self._live_zen_bar(runner)
                             runner.on_bar(bar)
@@ -1116,10 +1118,10 @@ class PaperSession:
                                 f"ZEN {runner.symbol} {a}"
                                 + (f" mark={mark:.1f}" if mark is not None else f" spot={bar.close:.1f}")
                             )
-                            src = self._quotes.feed_status
+                            src = quotes.feed_status
                         elif runner.asset_kind == "option":
                             p = runner.strategy.params
-                            bar, st = self._quotes.option_premium_bar(
+                            bar, st = quotes.option_premium_bar(
                                 runner.symbol,
                                 option_type=str(p.get("option_type", "CE")),
                                 strike_mode=str(p.get("strike_mode", "ATM")),
@@ -1133,9 +1135,9 @@ class PaperSession:
                             labels.append(
                                 f"{runner.symbol}{p.get('option_type', 'CE')}@{int(st.get('strike', 0))}={bar.close:.1f}"
                             )
-                            src = self._quotes.feed_status
+                            src = quotes.feed_status
                         else:
-                            price, ts, used = self._quotes.get_ltp(runner.symbol)
+                            price, ts, used = quotes.get_ltp(runner.symbol)
                             bar = Bar(
                                 timestamp=ts, open=price, high=price, low=price, close=price, volume=0
                             )
