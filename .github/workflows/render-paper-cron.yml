@@ -1,0 +1,104 @@
+# Free-tier Render keep-alive + NSE session automation (UTC schedules).
+# Render Cron Jobs are paid; GitHub Actions is free for this repo.
+#
+# Secrets (repo → Settings → Secrets → Actions):
+#   RENDER_APP_URL  = https://algo-paper-desk.onrender.com
+#   CRON_SECRET     = same value as Render env CRON_SECRET
+#
+# IST ↔ UTC (no DST): IST = UTC+5:30
+#   08:50 IST wake  → 03:20 UTC
+#   market hours    → ~03:30–10:00 UTC
+#   15:45 IST sleep → 10:15 UTC
+
+name: Render paper desk cron
+
+on:
+  schedule:
+    # Keep free instance awake Mon–Fri during NSE window (+ buffer)
+    - cron: "*/10 3-10 * * 1-5"
+    # Pre-market: start live ~08:50 IST
+    - cron: "20 3 * * 1-5"
+    # Post-market: stop live ~15:45 IST
+    - cron: "15 10 * * 1-5"
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "health | wake | sleep"
+        required: true
+        default: health
+        type: choice
+        options:
+          - health
+          - wake
+          - sleep
+
+concurrency:
+  group: render-paper-cron
+  cancel-in-progress: false
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Resolve action
+        id: pick
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "action=${{ inputs.action }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # schedule: github.event.schedule is the cron expression that fired
+          CRON='${{ github.event.schedule }}'
+          case "$CRON" in
+            "20 3 * * 1-5")   echo "action=wake"   >> "$GITHUB_OUTPUT" ;;
+            "15 10 * * 1-5")  echo "action=sleep"  >> "$GITHUB_OUTPUT" ;;
+            *)                echo "action=health" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Call Paper Desk
+        env:
+          APP_URL: ${{ secrets.RENDER_APP_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          ACTION: ${{ steps.pick.outputs.action }}
+        run: |
+          set -euo pipefail
+          BASE="${APP_URL:-https://algo-paper-desk.onrender.com}"
+          BASE="${BASE%/}"
+          HDR=(-H "User-Agent: algo-paper-desk-cron/1.0")
+          if [ -n "${CRON_SECRET:-}" ]; then
+            HDR+=(-H "X-Cron-Secret: ${CRON_SECRET}")
+          fi
+
+          echo "action=${ACTION} base=${BASE}"
+
+          # Free Render may cold-start 30–60s — retry a few times
+          attempt() {
+            local method="$1" path="$2"
+            local code body
+            for i in 1 2 3 4 5; do
+              echo "try ${i}: ${method} ${path}"
+              if [ "$method" = "GET" ]; then
+                body=$(curl -sS -m 90 -w "\n%{http_code}" "${HDR[@]}" "${BASE}${path}" || true)
+              else
+                body=$(curl -sS -m 90 -w "\n%{http_code}" -X "$method" "${HDR[@]}" "${BASE}${path}" || true)
+              fi
+              code=$(echo "$body" | tail -n1)
+              echo "$body" | sed '$d' | head -c 500
+              echo
+              echo "http=${code}"
+              if [ "$code" = "200" ]; then
+                return 0
+              fi
+              sleep $((i * 15))
+            done
+            return 1
+          }
+
+          case "$ACTION" in
+            health) attempt GET  /api/health ;;
+            wake)   attempt POST "/api/session/wake?poll_seconds=15" ;;
+            sleep)  attempt POST /api/session/sleep ;;
+            *) echo "unknown action"; exit 1 ;;
+          esac

@@ -1,6 +1,7 @@
 # Free Hobby deploy for Paper Desk (testing).
-# Free web services sleep after ~15 min idle — use an external cron to hit
-# /api/health and POST /api/session/start before market open.
+# Free web services sleep after ~15 min idle.
+# Keep-alive + pre-market wake: GitHub Actions (.github/workflows/render-paper-cron.yml)
+# — Render Cron Jobs are paid; do not add type:cron here on free tier.
 # Docs: https://render.com/docs/free
 
 services:
@@ -21,8 +22,12 @@ services:
       - key: DHAN_MODE
         value: live
       - key: DATABASE_URL
-        value: sqlite:///./data/algo.db
+        sync: false
       - key: DHAN_CLIENT_ID
         sync: false
       - key: DHAN_ACCESS_TOKEN
+        sync: false
+      - key: CRON_SECRET
+        sync: false
+      - key: PAPER_SYNC_TOKEN
         sync: false

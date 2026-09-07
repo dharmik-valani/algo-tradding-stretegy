@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -24,6 +25,15 @@ STATIC = Path(__file__).parent / "static"
 
 app = FastAPI(title="Algo Paper Desk", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+
+def _require_cron_secret(x_cron_secret: str | None) -> None:
+    """If CRON_SECRET is set on the service, cron callers must send matching header."""
+    expected = (os.environ.get("CRON_SECRET") or "").strip()
+    if not expected:
+        return
+    if (x_cron_secret or "").strip() != expected:
+        raise HTTPException(status_code=401, detail="invalid cron secret")
 
 
 class AddStrategyBody(BaseModel):
@@ -55,27 +65,68 @@ def index() -> FileResponse:
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "service": "paper-desk"}
+    """Liveness probe + free-tier keep-alive target (GitHub Actions / external cron)."""
+    session = get_session()
+    return {
+        "ok": True,
+        "service": "paper-desk",
+        "running": bool(session.running),
+        "mode": session.mode,
+        "strategies": len(session.runners),
+    }
 
 
 @app.post("/api/session/wake")
-def wake_live(poll_seconds: float = Query(15.0, ge=5.0, le=120.0)) -> dict:
-    """Idempotent live start for free-tier cron keep-alive / pre-market wake.
+def wake_live(
+    poll_seconds: float = Query(15.0, ge=5.0, le=120.0),
+    x_cron_secret: str | None = Header(default=None, alias="X-Cron-Secret"),
+) -> dict:
+    """Idempotent live start for free-tier cron (pre-market wake + keep-alive).
 
     - If already running: no-op success
     - If strategies exist and idle: start live paper
     """
+    _require_cron_secret(x_cron_secret)
     session = get_session()
     if session.running and session.mode == "live":
-        return {"ok": True, "already_running": True, **session.snapshot().model_dump(mode="json")}
+        return {
+            "ok": True,
+            "already_running": True,
+            "running": True,
+            "strategies": len(session.runners),
+            "message": session.message,
+        }
     if not session.runners:
-        raise HTTPException(status_code=400, detail="No strategies on desk — configure once in the UI first")
+        raise HTTPException(
+            status_code=400,
+            detail="No strategies on desk — open the UI once and add strategies first",
+        )
     try:
         session.start_live(poll_seconds=poll_seconds)
     except RuntimeError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.persist_desk()
-    return {"ok": True, "already_running": False, **session.snapshot().model_dump(mode="json")}
+    return {
+        "ok": True,
+        "already_running": False,
+        "running": True,
+        "strategies": len(session.runners),
+        "message": session.message,
+    }
+
+
+@app.post("/api/session/sleep")
+def sleep_live(
+    x_cron_secret: str | None = Header(default=None, alias="X-Cron-Secret"),
+) -> dict:
+    """Stop live session after market close (optional cron). Idempotent."""
+    _require_cron_secret(x_cron_secret)
+    session = get_session()
+    if not session.running:
+        return {"ok": True, "already_stopped": True, "running": False}
+    session.stop()
+    session.persist_desk()
+    return {"ok": True, "already_stopped": False, "running": False, "message": session.message}
 
 
 class SnapshotRestoreBody(BaseModel):

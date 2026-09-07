@@ -71,10 +71,25 @@ docs/          paper-trading.md, dhan-mcp.md, architecture
 
 1. Push this repo to GitHub (auto-deploy on `main`).
 2. Create a **Web Service** from the repo (or apply `render.yaml` Blueprint).
-3. Set env vars in the Dashboard: `DHAN_CLIENT_ID`, `DHAN_ACCESS_TOKEN` (never commit `.env`).
-4. Open the service URL → configure strategies once → Start live.
-5. Free tier sleeps after ~15 min idle. Use a free external cron (e.g. cron-job.org):
-   - Every 10–12 min (market hours): `GET https://YOUR-APP.onrender.com/api/health`
-   - ~08:55 IST: `POST https://YOUR-APP.onrender.com/api/session/wake`
+3. Set env vars in the Dashboard: `DHAN_CLIENT_ID`, `DHAN_ACCESS_TOKEN`, `DATABASE_URL` (Supabase), `CRON_SECRET`.
+4. Open the service URL → configure strategies once → Start live (or let cron wake).
+5. Free tier sleeps after ~15 min idle. **GitHub Actions** (not paid Render Cron) keeps it alive:
 
-**Database on free Render:** keep `DATABASE_URL=sqlite:///./data/algo.db` for testing. Expect resets when the instance sleeps. Switch to free Supabase Postgres later if you need durable trade history.
+### Cron (GitHub Actions — free)
+
+Workflow: `.github/workflows/render-paper-cron.yml`
+
+| When (IST, Mon–Fri) | Action |
+|---------------------|--------|
+| Every ~10 min, ~09:00–15:30 | `GET /api/health` (keep awake) |
+| ~08:50 | `POST /api/session/wake` (start live) |
+| ~15:45 | `POST /api/session/sleep` (stop live) |
+
+Repo secrets:
+
+- `RENDER_APP_URL` = `https://algo-paper-desk.onrender.com`
+- `CRON_SECRET` = same as Render env `CRON_SECRET`
+
+Also grant Render’s GitHub app access to this **private** repo, or deploys will fail to clone.
+
+**Database:** use Supabase Postgres (`DATABASE_URL`) so reports survive sleep. Do not run live on laptop + Render at the same time.
