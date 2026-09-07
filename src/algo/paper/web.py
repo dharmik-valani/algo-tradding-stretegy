@@ -65,15 +65,17 @@ def index() -> FileResponse:
 
 @app.get("/api/health")
 def health() -> dict:
-    """Liveness probe + free-tier keep-alive target (GitHub Actions / external cron)."""
-    session = get_session()
-    return {
-        "ok": True,
-        "service": "paper-desk",
-        "running": bool(session.running),
-        "mode": session.mode,
-        "strategies": len(session.runners),
-    }
+    """Liveness probe + free-tier keep-alive target (must stay cheap/fast)."""
+    out: dict[str, Any] = {"ok": True, "service": "paper-desk"}
+    try:
+        session = get_session()
+        out["running"] = bool(session.running)
+        out["mode"] = session.mode
+        out["strategies"] = len(session.runners)
+    except Exception:
+        # Never fail the probe — Render / cron only need ok=true.
+        out["running"] = None
+    return out
 
 
 @app.post("/api/session/wake")
