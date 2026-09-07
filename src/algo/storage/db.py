@@ -24,7 +24,9 @@ def get_engine(settings: Settings | None = None) -> Engine:
         path.parent.mkdir(parents=True, exist_ok=True)
         engine = create_engine(url, connect_args={"check_same_thread": False})
     else:
-        engine = create_engine(url)
+        # Long-lived paper desk: direct / session Postgres (not transaction pooler).
+        # pool_pre_ping avoids stale connections after Render sleep.
+        engine = create_engine(url, pool_pre_ping=True, pool_size=5, max_overflow=5)
     Base.metadata.create_all(engine)
     _ENGINE = engine
     _SESSION = sessionmaker(bind=engine, expire_on_commit=False)

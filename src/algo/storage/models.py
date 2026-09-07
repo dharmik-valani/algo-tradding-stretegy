@@ -190,3 +190,15 @@ class PaperFillJournalRow(Base):
     reason: Mapped[str | None] = mapped_column(String(256), nullable=True)
     filled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     meta_json: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
+class PaperAppStateRow(Base):
+    """Shared desk/runtime blobs so laptop + Render stay in sync on Postgres."""
+
+    __tablename__ = "paper_app_state"
+
+    key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    value_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )

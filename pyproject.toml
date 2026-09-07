@@ -25,6 +25,7 @@ dependencies = [
   "certifi>=2024.0",
   "dhanhq>=2.2.0",
   "pyotp>=2.9",
+  "psycopg[binary]>=3.2",
 ]
 
 [project.optional-dependencies]

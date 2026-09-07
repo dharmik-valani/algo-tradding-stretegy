@@ -126,10 +126,15 @@ class Settings(BaseSettings):
         return self.yaml_config.get("timezone", {}).get("market", "Asia/Kolkata")
 
     def resolve_db_url(self) -> str:
-        url = self.database_url
+        url = (self.database_url or "").strip()
         if url.startswith("sqlite:///./"):
             rel = url.removeprefix("sqlite:///./")
             return f"sqlite:///{(ROOT / rel).resolve()}"
+        # Supabase / Heroku often give postgres:// — SQLAlchemy 2 wants postgresql+psycopg://
+        if url.startswith("postgres://"):
+            url = "postgresql+psycopg://" + url.removeprefix("postgres://")
+        elif url.startswith("postgresql://") and "+psycopg" not in url:
+            url = "postgresql+psycopg://" + url.removeprefix("postgresql://")
         return url
 
 
