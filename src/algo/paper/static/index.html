@@ -183,7 +183,7 @@
             <button type="button" class="ghost" data-range="month">This month</button>
             <button type="button" class="ghost" data-range="all">All time</button>
           </div>
-          <p class="hint">Trades live in local SQLite (<code>data/algo.db</code>). Desk + open positions restore after restart.</p>
+          <p class="hint">Trades live in SQLite (<code>data/algo.db</code>). On <strong>free Render</strong> that file is wiped when the service sleeps or redeploys — weekly reports will not survive unless you use Supabase Postgres. Local laptop DB is separate and is <strong>not</strong> auto-synced.</p>
         </div>
 
         <div class="panel">

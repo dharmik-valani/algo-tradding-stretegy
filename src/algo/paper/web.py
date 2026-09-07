@@ -18,7 +18,7 @@ from algo.paper.journal import (
     report_summary,
     trades_csv,
 )
-from algo.paper.session import get_session, reset_session
+from algo.paper.session import get_session, reload_session_from_disk, reset_session
 
 STATIC = Path(__file__).parent / "static"
 
@@ -76,6 +76,60 @@ def wake_live(poll_seconds: float = Query(15.0, ge=5.0, le=120.0)) -> dict:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     session.persist_desk()
     return {"ok": True, "already_running": False, **session.snapshot().model_dump(mode="json")}
+
+
+class SnapshotRestoreBody(BaseModel):
+    """Base64 payloads from a laptop `data/` folder (one-shot sync to Render)."""
+
+    sync_token: str
+    desk_json_b64: str | None = None
+    runtime_json_b64: str | None = None
+    sqlite_b64: str | None = None
+
+
+@app.post("/api/admin/restore-snapshot")
+def restore_snapshot(body: SnapshotRestoreBody) -> dict:
+    """Replace desk/runtime/SQLite from a local export. Requires PAPER_SYNC_TOKEN."""
+    import base64
+    import os
+    from pathlib import Path
+
+    from algo.config import ROOT
+
+    expected = (os.environ.get("PAPER_SYNC_TOKEN") or "").strip()
+    if not expected or body.sync_token.strip() != expected:
+        raise HTTPException(status_code=401, detail="invalid sync token")
+
+    data_dir = ROOT / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    written: list[str] = []
+
+    def _write(name: str, b64: str | None) -> None:
+        if not b64:
+            return
+        raw = base64.b64decode(b64)
+        path = data_dir / name
+        path.write_bytes(raw)
+        written.append(name)
+
+    try:
+        _write("paper_desk.json", body.desk_json_b64)
+        _write("paper_runtime.json", body.runtime_json_b64)
+        _write("algo.db", body.sqlite_b64)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"decode/write failed: {exc}") from exc
+
+    if not written:
+        raise HTTPException(status_code=400, detail="nothing to restore")
+
+    session = reload_session_from_disk()
+    snap = session.snapshot().model_dump(mode="json")
+    return {
+        "ok": True,
+        "written": written,
+        "strategies": len(snap.get("strategies") or []),
+        "message": snap.get("message"),
+    }
 
 
 class DhanTokenBody(BaseModel):
