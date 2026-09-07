@@ -1,0 +1,5 @@
+{
+  "status": "failure",
+  "remarks": {"error_code": "DH-902", "error_message": "Data APIs not subscribed"},
+  "errorCode": "DH-902"
+}

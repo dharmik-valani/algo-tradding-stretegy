@@ -1,0 +1,14 @@
+services:
+  db:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: algo
+      POSTGRES_PASSWORD: algo
+      POSTGRES_DB: algo
+    ports:
+      - "5432:5432"
+    volumes:
+      - algo_pg:/var/lib/postgresql/data
+
+volumes:
+  algo_pg:

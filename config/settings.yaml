@@ -1,0 +1,39 @@
+provider: dhan
+
+universe:
+  indices:
+    - NIFTY
+    - BANKNIFTY
+    - FINNIFTY
+
+timeframes:
+  canonical: [1m, 5m, 15m, 1h, 1D]
+  # Dhan has native 25m, not 30m. 30m is a later resample from 5m.
+  native_only: [1m, 5m, 15m, 25m, 1h, 1D]
+
+historical_data:
+  intraday_chunk_days: 90
+  daily_chunk_days: 365
+  save_raw: true
+  max_retries: 5
+  retry_backoff_seconds: 1.0
+  retry_backoff_max_seconds: 30.0
+
+dhan:
+  base_url: https://api.dhan.co/v2
+  instrument_master_url: https://images.dhan.co/api-data/api-scrip-master.csv
+  rate_limit:
+    requests_per_second: 5
+    requests_per_day: 100000
+  timeout_seconds: 30
+
+timezone:
+  storage: UTC
+  market: Asia/Kolkata
+
+market:
+  exchange: NSE
+  session:
+    open: "09:15"
+    close: "15:30"
+  calendar_file: data/calendars/nse.yaml
