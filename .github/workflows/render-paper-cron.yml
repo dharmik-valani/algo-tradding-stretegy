@@ -118,7 +118,7 @@ jobs:
           # Free Render may cold-start 30–60s — retry a few times
           attempt() {
             local method="$1" path="$2"
-            local code body payload
+            local code body
             for i in 1 2 3 4 5; do
               echo "try ${i}: ${method} ${path}"
               if [ "$method" = "GET" ]; then
@@ -127,20 +127,10 @@ jobs:
                 body=$(curl -sS -m 120 -w "\n%{http_code}" -X "$method" "${HDR[@]}" -d '{}' "${BASE}${path}" || true)
               fi
               code=$(echo "$body" | tail -n1)
-              payload=$(echo "$body" | sed '$d')
-              echo "$payload" | head -c 1200
+              echo "$body" | sed '$d' | head -c 1200
               echo
-              # Compact digest for report/deep responses (email field is past the 1200-char cut)
-              echo "$payload" | python3 -c 'import sys,json; raw=sys.stdin.read().strip();\
-import sys as _s;\
-\
-' 2>/dev/null || true
-              printf '%s' "$payload" | python3 -c "import sys,json; raw=sys.stdin.read().strip();
-d=json.loads(raw) if raw else {};
-email=d.get('email') if isinstance(d,dict) else None;
-health=d.get('health') if isinstance(d,dict) else d;
-print('digest summary=', (health or {}).get('summary'), 'smtp=', (health or {}).get('smtp_configured'), 'to=', (health or {}).get('report_email_to'), 'issues=', ((health or {}).get('issues') or [])[:3]) if isinstance(health,dict) else None;
-print('email', email) if isinstance(email, dict) else None" 2>/dev/null || true
+              # For report endpoints, also print the trailing email status object
+              echo "$body" | sed '$d' | tr ',' '\n' | grep -E '"email"|"provider"|"message_id"|"smtp_configured"|"summary"|"ok"' | head -n 40 || true
               echo "http=${code}"
               if [ "$code" = "200" ]; then
                 return 0
