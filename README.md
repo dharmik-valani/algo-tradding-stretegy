@@ -97,9 +97,9 @@ Repo secrets (GitHub Actions):
 Render env for email digests (to `dharmikvalani57@gmail.com`):
 
 - `REPORT_EMAIL_TO` = `dharmikvalani57@gmail.com`
-- `SMTP_USER` = your Gmail address
-- `SMTP_PASSWORD` = [Gmail App Password](https://myaccount.google.com/apppasswords) (not the normal password)
-- Optional: `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_FROM`
+- `EMAIL_USER` / `SMTP_FROM` = `hello@mail.weupsell.com` (verified Brevo sender)
+- `BREVO_API_KEY` = Brevo transactional API key (preferred; uses HTTPS, ignores `EMAIL_HOST`)
+- Optional SMTP fallback: `SMTP_USER` + `SMTP_PASSWORD` + `EMAIL_HOST` / `SMTP_HOST`
 
 Manual test (Actions → this workflow → Run workflow):
 

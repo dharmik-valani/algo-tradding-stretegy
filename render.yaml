@@ -33,11 +33,11 @@ services:
         sync: false
       - key: REPORT_EMAIL_TO
         value: dharmikvalani57@gmail.com
-      - key: SMTP_USER
+      - key: EMAIL_USER
+        value: hello@mail.weupsell.com
+      - key: SMTP_FROM
+        value: hello@mail.weupsell.com
+      - key: BREVO_API_KEY
         sync: false
-      - key: SMTP_PASSWORD
-        sync: false
-      - key: SMTP_HOST
+      - key: EMAIL_HOST
         value: smtp.gmail.com
-      - key: SMTP_PORT
-        value: "587"
