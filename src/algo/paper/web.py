@@ -310,7 +310,7 @@ def add_orb_pair() -> dict:
                 symbol="NIFTY",
                 timeframe="1m",
                 quantity=1,
-                starting_cash=100_000.0,
+                starting_cash=500_000.0,
                 asset_kind="option",
                 enabled=True,
             )
