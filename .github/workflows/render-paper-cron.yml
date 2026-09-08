@@ -118,7 +118,7 @@ jobs:
           # Free Render may cold-start 30–60s — retry a few times
           attempt() {
             local method="$1" path="$2"
-            local code body
+            local code body payload
             for i in 1 2 3 4 5; do
               echo "try ${i}: ${method} ${path}"
               if [ "$method" = "GET" ]; then
@@ -127,8 +127,32 @@ jobs:
                 body=$(curl -sS -m 120 -w "\n%{http_code}" -X "$method" "${HDR[@]}" -d '{}' "${BASE}${path}" || true)
               fi
               code=$(echo "$body" | tail -n1)
-              echo "$body" | sed '$d' | head -c 1200
+              payload=$(echo "$body" | sed '$d')
+              echo "$payload" | head -c 1200
               echo
+              # Compact digest for report/deep responses (email field is past the 1200-char cut)
+              echo "$payload" | python3 -c '
+import sys, json
+raw = sys.stdin.read().strip()
+if not raw:
+    raise SystemExit(0)
+try:
+    d = json.loads(raw)
+except Exception:
+    raise SystemExit(0)
+email = d.get("email") if isinstance(d, dict) else None
+health = d.get("health") if isinstance(d, dict) else d
+if isinstance(health, dict):
+    print(
+        "digest",
+        "summary=", health.get("summary"),
+        "smtp=", health.get("smtp_configured"),
+        "to=", health.get("report_email_to"),
+        "issues=", (health.get("issues") or [])[:3],
+    )
+if isinstance(email, dict):
+    print("email", email)
+' 2>/dev/null || true
               echo "http=${code}"
               if [ "$code" = "200" ]; then
                 return 0
