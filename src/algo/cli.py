@@ -21,9 +21,11 @@ app = typer.Typer(help="Algo trading toolkit — historical data + paper desk.")
 instruments_app = typer.Typer(help="Instrument master")
 data_app = typer.Typer(help="Download, inspect, validate stored candles")
 paper_app = typer.Typer(help="Paper trading (virtual fills — not Dhan Sandbox)")
+dhan_app = typer.Typer(help="Dhan access-token status / RenewToken")
 app.add_typer(instruments_app, name="instruments")
 app.add_typer(data_app, name="data")
 app.add_typer(paper_app, name="paper")
+app.add_typer(dhan_app, name="dhan")
 
 console = Console()
 IST = ZoneInfo("Asia/Kolkata")
@@ -62,6 +64,53 @@ def doctor() -> None:
     console.print(f"Data plan: {profile.get('dataPlan')} until {profile.get('dataValidity')}")
     if str(profile.get("dataPlan", "")).lower() not in {"active", "true"}:
         console.print("[yellow]Data APIs may not be subscribed. Historical download will fail with DH-902 / 806.[/yellow]")
+
+
+@dhan_app.command("status")
+def dhan_status_cmd() -> None:
+    """Show whether the stored Dhan JWT is valid / renewable."""
+    from algo.providers.dhan.auth import dhan_connection_status
+    from algo.providers.dhan.token_store import resolve_access_token
+
+    settings = get_settings()
+    status = dhan_connection_status(settings)
+    console.print(f"Client ID: {status.get('client_id') or settings.dhan_client_id or '(missing)'}")
+    console.print(f"Access token: {_mask(resolve_access_token(settings.dhan_access_token))}")
+    console.print(f"Consumer: {status.get('consumer_type') or '—'}")
+    console.print(f"Renewable (SELF): {status.get('renewable')}")
+    console.print(f"Storage: {status.get('storage')}")
+    console.print(f"TOTP configured: {status.get('totp_configured')}")
+    console.print(f"Expiry: {status.get('expiry_time') or '—'} ({status.get('seconds_left')}s left)")
+    if status.get("ok"):
+        console.print(f"[green]Connected[/green] · plan={status.get('profile', {}).get('dataPlan')}")
+    else:
+        console.print(f"[red]Not connected[/red] · {status.get('error')}")
+        raise typer.Exit(code=1)
+
+
+@dhan_app.command("renew")
+def dhan_renew_cmd(
+    force: bool = typer.Option(True, "--force/--if-needed", help="Force RenewToken / TOTP remint"),
+) -> None:
+    """Refresh the access token (cron-friendly). Exits 0 on success."""
+    from algo.providers.dhan.auth import ensure_fresh_token
+    from algo.providers.dhan.token_store import resolve_access_token, token_status as file_status
+
+    settings = get_settings()
+    before = resolve_access_token(settings.dhan_access_token)
+    try:
+        after = ensure_fresh_token(settings, force_renew=force)
+    except ProviderError as exc:
+        console.print(f"[red]Renew failed:[/red] {exc} (code={exc.code})")
+        raise typer.Exit(code=1) from exc
+    get_settings.cache_clear()
+    st = file_status(after, settings.dhan_client_id)
+    rotated = bool(after and after != before)
+    console.print(
+        f"{'Rotated' if rotated else 'Kept'} token {_mask(after)} · "
+        f"consumer={st.get('consumer_type')} · expires={st.get('expiry_time')} · "
+        f"{st.get('seconds_left')}s left"
+    )
 
 
 @instruments_app.command("sync")

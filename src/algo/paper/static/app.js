@@ -1,10 +1,10 @@
 const $ = (id) => document.getElementById(id);
 
 const VIEW_META = {
+  analytics: { title: "Analytics", subtitle: "Day / week / month and strategy performance" },
   execute: { title: "Execute", subtitle: "Day capital, live strategies, and paper fills" },
-  reports: { title: "Reports", subtitle: "Day / week / month history and exports" },
+  reports: { title: "Reports", subtitle: "Trade / strategy / daily exports" },
   settings: { title: "Settings", subtitle: "Session mode and paper controls" },
-  analytics: { title: "Execute", subtitle: "Day capital, live strategies, and paper fills" },
 };
 
 async function api(path, options = {}) {
@@ -20,6 +20,27 @@ async function api(path, options = {}) {
 function money(n) {
   if (n == null || Number.isNaN(n)) return "—";
   return Number(n).toLocaleString("en-IN", { maximumFractionDigits: 2 });
+}
+
+/** Compact INR for desk columns: 1L, 5L, 10k, 2.5k, etc. */
+function moneyShort(n) {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  const v = Number(n);
+  const abs = Math.abs(v);
+  const sign = v < 0 ? "-" : "";
+  if (abs >= 10000000) {
+    const cr = abs / 10000000;
+    return `${sign}${cr % 1 === 0 ? cr.toFixed(0) : cr.toFixed(1).replace(/\.0$/, "")}Cr`;
+  }
+  if (abs >= 100000) {
+    const lakh = abs / 100000;
+    return `${sign}${lakh % 1 === 0 ? lakh.toFixed(0) : lakh.toFixed(1).replace(/\.0$/, "")}L`;
+  }
+  if (abs >= 1000) {
+    const k = abs / 1000;
+    return `${sign}${k % 1 === 0 ? k.toFixed(0) : k.toFixed(1).replace(/\.0$/, "")}k`;
+  }
+  return `${sign}${money(abs)}`;
 }
 
 /** Format ISO timestamps as Asia/Kolkata (IST) for the whole UI. */
@@ -47,6 +68,18 @@ function formatIst(iso, withSeconds = true) {
     ? `${get("hour")}:${get("minute")}:${get("second")}`
     : `${get("hour")}:${get("minute")}`;
   return `${date} ${time}`;
+}
+
+/** Two-line IST stamp for tight journal columns (date / time). */
+function formatIstStack(iso, withSeconds = true) {
+  if (!iso) return "—";
+  const full = formatIst(iso, withSeconds);
+  if (!full || full === "—") return "—";
+  const sp = full.lastIndexOf(" ");
+  if (sp <= 0) return escapeHtml(full);
+  const date = full.slice(0, sp);
+  const time = full.slice(sp + 1);
+  return `<span class="dt-stack"><span class="dt-date">${escapeHtml(date)}</span><span class="dt-time">${escapeHtml(time)}</span></span>`;
 }
 
 function pct(n) {
@@ -83,11 +116,16 @@ let catalog = [];
 let instruments = { indices: [], stocks: [], option_underlyings: [], timeframes: ["1m", "5m", "15m"] };
 let lastSession = { strategies: [] };
 let lastAnalytics = { strategies: [], overall: {} };
-let currentView = "execute";
+let lastAnalyticsBoard = null;
+let analyticsBoardSeq = 0;
+let calYear = new Date().getFullYear();
+let calMonth = new Date().getMonth() + 1;
+let analyticsSelectSig = "";
+let currentView = "analytics";
 
 function setView(view) {
-  if (view === "dashboard" || view === "analytics") view = "execute";
-  if (!VIEW_META[view] || view === "analytics") view = "execute";
+  if (view === "dashboard") view = "analytics";
+  if (!VIEW_META[view]) view = "analytics";
   currentView = view;
   document.querySelectorAll(".nav-item").forEach((el) => {
     el.classList.toggle("active", el.dataset.view === view);
@@ -95,7 +133,7 @@ function setView(view) {
   document.querySelectorAll(".view").forEach((el) => {
     el.classList.toggle("active", el.dataset.view === view);
   });
-  const meta = VIEW_META[view] || VIEW_META.execute;
+  const meta = VIEW_META[view] || VIEW_META.analytics;
   setText("viewTitle", meta.title);
   setText("viewSubtitle", meta.subtitle);
   if (location.hash !== `#${view}`) {
@@ -104,6 +142,7 @@ function setView(view) {
   const scroller = document.querySelector(".main");
   if (scroller) scroller.scrollTop = 0;
   else window.scrollTo(0, 0);
+  if (view === "analytics") refreshAnalyticsBoard();
   if (view === "reports") refreshReports();
   if (view === "settings") refreshDhanStatus();
 }
@@ -121,6 +160,12 @@ async function boot() {
   window.addEventListener("hashchange", () => setView(location.hash.slice(1)));
   const initial = location.hash.slice(1);
   if (initial && VIEW_META[initial]) currentView = initial;
+  // Default Analytics to today so day KPIs match the market session.
+  if ($("anFrom") && !$("anFrom").value) {
+    const today = isoDay(new Date());
+    $("anFrom").value = today;
+    $("anTo").value = today;
+  }
   renderRegistry();
   onStrategyChange();
   await refresh();
@@ -407,8 +452,180 @@ function renderSummary(session) {
   renderExecDayKpis(session);
 }
 
+function analyticsQuery() {
+  const from = $("anFrom")?.value || "";
+  const to = $("anTo")?.value || "";
+  const strat = ($("anStrategy")?.value || "").trim();
+  const q = new URLSearchParams();
+  if (from) q.set("from_date", from);
+  if (to) q.set("to_date", to);
+  if (strat) q.set("strategy_id", strat);
+  return q.toString();
+}
+
+function moneyOrDash(n, prefix = "₹") {
+  if (n == null || Number.isNaN(Number(n))) return "—";
+  return `${prefix}${money(n)}`;
+}
+
+function fillAnalyticsStrategySelect(byStrategy) {
+  const sel = $("anStrategy");
+  if (!sel) return;
+  const ranked = (byStrategy || []).slice().sort((a, b) => (b.net_pnl || 0) - (a.net_pnl || 0));
+  const seen = new Set(ranked.map((r) => r.strategy_id));
+  const extras = (catalog || [])
+    .map((c) => c.id)
+    .filter((id) => id && !seen.has(id));
+  const sig = [
+    ...ranked.map((r) => `${r.strategy_id}:${r.net_pnl}:${r.win_rate}`),
+    ...extras,
+  ].join("|");
+  const current = sel.value;
+  // Rebuild only when ranking/options change — avoids select flicker + change loops.
+  if (sig === analyticsSelectSig && sel.options.length > 1) {
+    if (current && [...sel.options].some((o) => o.value === current)) sel.value = current;
+    return;
+  }
+  analyticsSelectSig = sig;
+  const opts = [`<option value="">All strategies</option>`];
+  ranked.forEach((r, i) => {
+    const label = `${i + 1}. ${r.strategy_id} · ₹${money(r.net_pnl || 0)} · ${pct(r.win_rate)}`;
+    opts.push(`<option value="${escapeHtml(r.strategy_id)}">${escapeHtml(label)}</option>`);
+  });
+  extras.forEach((id) => {
+    opts.push(`<option value="${escapeHtml(id)}">${escapeHtml(id)} (no closed trades)</option>`);
+  });
+  sel.innerHTML = opts.join("");
+  if (current && [...sel.options].some((o) => o.value === current)) sel.value = current;
+  else if (!current) sel.value = "";
+}
+
+function renderAnalyticsBoard(board) {
+  lastAnalyticsBoard = board;
+  const summary = board?.summary || {};
+  const capital = board?.capital || {};
+  const live = board?.live || {};
+  const net = Number(summary.net_pnl || capital.net_pnl || 0);
+  setText("anInvested", moneyOrDash(capital.invested));
+  setText("anGenerated", moneyOrDash(capital.generated), pnlClass(net));
+  setText("anNet", moneyOrDash(net), pnlClass(net));
+  setText("anWinRate", pct(summary.win_rate));
+  setText("anPf", summary.profit_factor != null ? String(summary.profit_factor) : "—");
+  setText("anExpectancy", moneyOrDash(summary.expectancy));
+  setText("anAvgWin", moneyOrDash(summary.avg_win));
+  setText("anAvgLoss", moneyOrDash(summary.avg_loss));
+  setText("anAvgTrade", moneyOrDash(summary.avg_trade));
+  setText("anMaxWin", moneyOrDash(summary.largest_win));
+  setText("anMaxLoss", moneyOrDash(summary.largest_loss));
+  setText("anStored", String(summary.trades || 0));
+  setText("anClosedOpen", `${summary.closed || 0} / ${summary.open || 0}`);
+  setText("anWinLoss", `${summary.wins || 0} / ${summary.losses || 0}`);
+  const liveWr = live.win_rate != null ? live.win_rate : (lastAnalytics.overall || {}).win_rate;
+  setText("anLiveWr", pct(liveWr));
+
+  const byStrat = summary.by_strategy || [];
+  const rank = board?.strategy_rank || byStrat;
+  fillAnalyticsStrategySelect(rank);
+  setText("anStratCount", String(byStrat.length));
+  const sbody = $("anStrategyBody");
+  if (sbody) {
+    sbody.innerHTML = byStrat.length
+      ? byStrat
+          .map(
+            (r, i) => `<tr class="an-strat-row">
+          <td data-label="#">${i + 1}</td>
+          <td data-label="Strategy"><strong>${escapeHtml(r.strategy_id)}</strong></td>
+          <td data-label="Trades">${r.trades || 0}</td>
+          <td data-label="Win rate">${pct(r.win_rate)}</td>
+          <td data-label="Avg win" class="pos">${moneyOrDash(r.avg_win)}</td>
+          <td data-label="Avg loss" class="neg">${moneyOrDash(r.avg_loss)}</td>
+          <td data-label="PF">${r.profit_factor != null ? r.profit_factor : "—"}</td>
+          <td data-label="Net PnL" class="${pnlClass(r.net_pnl)}"><strong>₹${money(r.net_pnl || 0)}</strong></td>
+        </tr>`
+          )
+          .join("")
+      : `<tr><td colspan="8" class="empty-cell">No closed trades in this range.</td></tr>`;
+  }
+
+  const days = board?.daily?.days || [];
+  setText("anDayCount", String(days.length));
+  const dbody = $("anDailyBody");
+  if (dbody) {
+    dbody.innerHTML = days.length
+      ? days
+          .map(
+            (d) => `<tr>
+          <td data-label="Date">${d.date}</td>
+          <td data-label="Trades">${d.trades}</td>
+          <td data-label="Closed">${d.closed}</td>
+          <td data-label="Win rate">${pct(d.win_rate)}</td>
+          <td data-label="Avg win" class="pos">${moneyOrDash(d.avg_win)}</td>
+          <td data-label="Avg loss" class="neg">${moneyOrDash(d.avg_loss)}</td>
+          <td data-label="Net PnL" class="${pnlClass(d.net_pnl)}">₹${money(d.net_pnl)}</td>
+          <td data-label="Symbols">${(d.symbols || []).slice(0, 12).join(", ") || "—"}${(d.symbols || []).length > 12 ? "…" : ""}</td>
+        </tr>`
+          )
+          .join("")
+      : `<tr><td colspan="8" class="empty-cell">No daily data yet.</td></tr>`;
+  }
+}
+
+function renderCalendar(cal) {
+  if (!cal) return;
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  setText("calLabel", `${months[cal.month - 1]} ${cal.year}`);
+  setText("calMonthPnl", `₹${money(cal.month_pnl || 0)}`, pnlClass(cal.month_pnl || 0));
+  const calGrid = $("calGrid");
+  if (!calGrid) return;
+  calGrid.innerHTML = (cal.cells || [])
+    .map((c) => {
+      if (!c.date) return `<div class="cal-cell empty"></div>`;
+      const day = c.date.slice(-2);
+      const pnl = c.pnl;
+      const cls = pnl == null ? "" : pnlClass(pnl);
+      return `<div class="cal-cell ${cls}"><span class="d">${day}</span><strong>${pnl == null ? "—" : `₹${money(pnl)}`}</strong></div>`;
+    })
+    .join("");
+}
+
+async function refreshAnalyticsBoard() {
+  const seq = ++analyticsBoardSeq;
+  try {
+    const q = analyticsQuery();
+    const strat = ($("anStrategy")?.value || "").trim();
+    const calQ = new URLSearchParams({ year: String(calYear), month: String(calMonth) });
+    if (strat) calQ.set("strategy_id", strat);
+    const [board, cal] = await Promise.all([
+      api(`/api/analytics/board${q ? `?${q}` : ""}`),
+      api(`/api/reports/calendar?${calQ.toString()}`),
+    ]);
+    if (seq !== analyticsBoardSeq) return;
+    renderAnalyticsBoard(board);
+    renderCalendar(cal);
+  } catch (err) {
+    if (seq !== analyticsBoardSeq) return;
+    console.warn(err);
+    setText("sessionMsg", err.message || String(err));
+  }
+}
+
+function tickAnalyticsLive() {
+  if (currentView !== "analytics") return;
+  const overall = lastAnalytics.overall || {};
+  setText("anLiveWr", pct(overall.win_rate));
+}
+
 function renderAnalytics() {
-  /* Analytics tab removed — day KPIs live on Execute. */
+  /* no-op — board loads via filters / setView / Refresh */
+}
+
+let deskExpanded = new Set();
+
+function levelCell(value, hint) {
+  if (value == null || value === "" || value === "—") {
+    return `<div>—</div>${hint ? `<div class="meta pnl-sub">${escapeHtml(hint)}</div>` : ""}`;
+  }
+  return `<div>${value}</div>${hint ? `<div class="meta pnl-sub">${escapeHtml(hint)}</div>` : ""}`;
 }
 
 function renderExecStats(session) {
@@ -434,115 +651,122 @@ function renderExecStats(session) {
       const generated = Number(tv.generated != null ? tv.generated : invested + dayPnl);
       const total = tv.desk_settled ? dayPnl : realized + unreal;
       const basket = s.basket || [];
+      const isBasket = basket.length > 0 || (s.params?.selected || []).length > 0;
       const active = basket.filter((l) => l.in_trade);
       const selected = (s.params?.selected || []).length || basket.length || 0;
       const inTrade = s.legs_in_trade != null ? s.legs_in_trade : active.length;
       const posQty = s.position?.quantity || 0;
-      const isOpen = !!(inTrade || (posQty && !basket.length) || tv.in_trade);
+      const isOpen = !!(inTrade || (posQty && !isBasket) || tv.in_trade);
+      const settled = !!tv.desk_settled;
+      const lc = tv.last_closed || null;
 
       let stocks;
-      if (basket.length || selected) {
-        stocks = `${inTrade}/${selected || basket.length}`;
+      let posTitle;
+      if (isBasket) {
+        stocks = `${settled ? 0 : inTrade}/${selected || basket.length}`;
+        posTitle = "Open legs / selected symbols in basket";
       } else {
-        stocks = posQty ? String(Math.abs(posQty)) : "0";
+        stocks = isOpen ? String(Math.abs(posQty) || 1) : "0";
+        posTitle = "Open position quantity (lots/shares)";
       }
-      const posLabel = basket.length ? "In trade" : "Pos";
 
+      // Market = live mark only while a trade is open. Flat/settled desk stays blank (fresh start).
       let market = "—";
       let entry = "—";
+      let exitPx = "—";
       let sl = "—";
       let tp = "—";
-      let levelsHint = "";
-      if (basket.length) {
+      let levelsHint = settled ? "settled" : "no open trade";
+
+      if (settled) {
+        levelsHint = "settled · fresh desk";
+      } else if (isBasket) {
         if (active.length === 1) {
-          market = money(active[0].last ?? s.last_price);
-          entry = active[0].avg != null ? money(active[0].avg) : (s.entry_price != null ? money(s.entry_price) : "—");
+          market = money(active[0].last);
+          entry = active[0].entry != null ? money(active[0].entry) : (active[0].avg != null ? money(active[0].avg) : "—");
+          exitPx = "—";
           sl = active[0].stop != null ? money(active[0].stop) : "—";
           tp = active[0].target != null ? money(active[0].target) : "—";
           levelsHint = "open";
         } else if (active.length > 1) {
           market = `${active.length} open`;
           entry = "multi";
+          exitPx = "—";
           sl = "multi";
           tp = "multi";
-          levelsHint = "open";
-        } else {
-          if (s.last_price != null) market = money(s.last_price);
-          const lc = tv.last_closed;
-          if (lc && lc.entry != null) {
-            entry = money(lc.entry);
-            levelsHint = "last closed";
-            sl = "flat";
-            tp = lc.exit != null ? money(lc.exit) : "flat";
-          } else {
-            entry = "flat";
-            sl = "flat";
-            tp = "flat";
-            levelsHint = "no open trade";
-          }
+          levelsHint = "open · expand for legs";
+        } else if (lc && (lc.exit != null || lc.entry != null)) {
+          market = "—";
+          entry = lc.entry != null ? money(lc.entry) : "—";
+          exitPx = lc.exit != null ? money(lc.exit) : "—";
+          sl = "—";
+          tp = "—";
+          levelsHint = "last exit";
         }
       } else if (isOpen && s.entry_price != null) {
         market = s.last_price != null ? money(s.last_price) : "—";
         entry = money(s.entry_price);
+        exitPx = "—";
         sl = s.stop_price != null ? money(s.stop_price) : "—";
         tp = s.target_price != null ? money(s.target_price) : "—";
         levelsHint = "open";
-      } else {
-        market = s.last_price != null ? money(s.last_price) : "—";
-        const lc = tv.last_closed;
-        if (lc && lc.entry != null) {
-          entry = money(lc.entry);
-          levelsHint = "last closed";
-          sl = "flat";
-          tp = lc.exit != null ? money(lc.exit) : "flat";
-        } else {
-          entry = "flat";
-          sl = "flat";
-          tp = "flat";
-          levelsHint = "no open trade";
-        }
+      } else if (lc && (lc.exit != null || lc.entry != null)) {
+        market = "—";
+        entry = lc.entry != null ? money(lc.entry) : "—";
+        exitPx = lc.exit != null ? money(lc.exit) : "—";
+        sl = "—";
+        tp = "—";
+        levelsHint = "last exit";
       }
 
-      const pnlSub = tv.desk_settled
+      const pnlSub = settled
         ? `settled day`
         : Math.abs(unreal) > 1e-9
           ? `R ${money(realized)} · U ${money(unreal)}`
           : Math.abs(realized) > 1e-9
             ? `realized`
             : `flat`;
-      const note = escapeHtml(s.note || s.last_signal || "—");
       const nameSub = escapeHtml(
-        [s.params?.option_type, s.timeframe, basket.length ? "basket" : s.instrument]
+        [s.params?.option_type, s.timeframe, isBasket ? "basket" : s.instrument]
           .filter(Boolean)
           .join(" · ")
       );
       const status = s.enabled ? "run" : "paused";
       const toggleLabel = s.enabled ? "Pause" : "Resume";
       const toggleAct = s.enabled ? "pause" : "start";
+      const expanded = deskExpanded.has(id);
+      const canExpand = isBasket && basket.length > 0;
+      const expandBtn = canExpand
+        ? `<button type="button" class="desk-expand" data-expand="${escapeHtml(id)}" aria-expanded="${expanded}" title="${expanded ? "Collapse legs" : "Expand legs"}">${expanded ? "▼" : "▶"}</button>`
+        : "";
 
-      return `
-      <tr class="click-row desk-row ${s.enabled ? "is-run" : "is-paused"} ${isOpen ? "has-open" : "is-flat"}" data-id="${escapeHtml(id)}" tabindex="0" role="button" aria-label="Open settings for ${escapeHtml(s.name)}">
-        <td data-label="Status"><span class="badge ${s.enabled ? "on" : ""}">${status}</span></td>
+      const parent = `
+      <tr class="click-row desk-row ${s.enabled ? "is-run" : "is-paused"} ${isOpen ? "has-open" : "is-flat"} ${expanded ? "is-expanded" : ""}" data-id="${escapeHtml(id)}" tabindex="0" role="button" aria-label="Open settings for ${escapeHtml(s.name)}">
         <td data-label="Strategy" class="col-strategy">
-          <div class="row-title">${escapeHtml(s.name)}</div>
-          <div class="meta">${nameSub}</div>
+          <div class="row-title">
+            ${expandBtn}
+            <span class="badge ${s.enabled ? "on" : ""}">${status}</span>
+            <span class="strat-name">${escapeHtml(s.name)}</span>
+          </div>
+          <div class="meta">${nameSub}${canExpand ? ` · ${basket.length} symbols` : ""}</div>
         </td>
-        <td data-label="Capital" class="mono" title="Paper capital for this strategy">₹${money(invested)}</td>
-        <td data-label="Generated" class="mono ${pnlClass(dayPnl)}" title="Capital + day PnL">
-          <div>₹${money(generated)}</div>
-          <div class="meta pnl-sub">day ₹${money(dayPnl)}</div>
+        <td data-label="Capital" class="mono" title="Paper capital ₹${money(invested)}">₹${moneyShort(invested)}</td>
+        <td data-label="Generated" class="mono ${pnlClass(dayPnl)}" title="Capital + day PnL · ₹${money(generated)}">
+          <div>₹${moneyShort(generated)}</div>
+          <div class="meta pnl-sub">day ₹${moneyShort(dayPnl)}</div>
         </td>
-        <td data-label="PnL" class="mono ${pnlClass(total)}" title="Open row PnL (0 after EOD settle)">
-          <div>₹${money(total)}</div>
+        <td data-label="PnL" class="mono ${pnlClass(total)}" title="Open row PnL (0 after EOD settle) · ₹${money(total)}">
+          <div>₹${moneyShort(total)}</div>
           <div class="meta pnl-sub">${escapeHtml(pnlSub)}</div>
         </td>
-        <td data-label="Signal" class="col-note">${note}</td>
-        <td data-label="Market" class="mono" title="Current market / premium mark">${market}</td>
-        <td data-label="Entry" class="mono" title="${levelsHint === "last closed" ? "Last closed entry (not an open trade)" : levelsHint === "open" ? "Open trade entry" : "No open trade"}">
-          <div>${entry}</div>
-          ${levelsHint && levelsHint !== "open" ? `<div class="meta pnl-sub">${escapeHtml(levelsHint)}</div>` : ""}
+        <td data-label="Market" class="mono" title="Live mark only while in trade">${market}</td>
+        <td data-label="Entry" class="mono" title="Fill price when trade opens">
+          ${levelCell(entry, levelsHint === "open" ? "" : levelsHint)}
         </td>
-        <td data-label="${posLabel}" class="mono">${stocks}</td>
+        <td data-label="Exit" class="mono" title="Fill price when trade closes">
+          ${levelCell(exitPx, levelsHint === "last exit" ? "last exit" : (isOpen ? "open" : ""))}
+        </td>
+        <td data-label="Open" class="mono" title="${escapeHtml(posTitle)}">${stocks}</td>
         <td data-label="Stop" class="mono">${sl}</td>
         <td data-label="Target" class="mono">${tp}</td>
         <td data-label="Win" class="mono">${pct(a.win_rate)}</td>
@@ -553,28 +777,73 @@ function renderExecStats(session) {
           </div>
         </td>
       </tr>`;
+
+      if (!canExpand || !expanded) return parent;
+
+      const childRows = basket
+        .map((leg) => {
+          const legOpen = !!leg.in_trade;
+          const legCap = Number(leg.capital != null ? leg.capital : invested / Math.max(basket.length, 1));
+          const legPnl = Number(leg.leg_pnl != null ? leg.leg_pnl : (legOpen ? leg.unrealized : leg.realized) || 0);
+          const legGen = legCap + legPnl;
+          const legMarket = legOpen && leg.last != null ? money(leg.last) : "—";
+          const legEntry =
+            leg.entry != null
+              ? money(leg.entry)
+              : legOpen && leg.avg != null
+                ? money(leg.avg)
+                : "—";
+          const legExit = !legOpen && leg.exit != null ? money(leg.exit) : "—";
+          const legSl = legOpen && leg.stop != null ? money(leg.stop) : "—";
+          const legTp = legOpen && leg.target != null ? money(leg.target) : "—";
+          const legHint = legOpen ? "open" : leg.exit != null ? "last exit" : (leg.status || "flat");
+          return `
+          <tr class="desk-leg-row ${legOpen ? "has-open" : "is-flat"}" data-parent="${escapeHtml(id)}">
+            <td data-label="Symbol" class="col-strategy">
+              <div class="row-title leg-indent">
+                <span class="badge ${legOpen ? "on" : ""}">${legOpen ? "open" : "flat"}</span>
+                <span class="strat-name">${escapeHtml(leg.symbol || "")}</span>
+              </div>
+              <div class="meta">${escapeHtml(leg.status || "")}${leg.side ? ` · ${escapeHtml(String(leg.side))}` : ""}</div>
+            </td>
+            <td data-label="Capital" class="mono" title="Allocated to this symbol ₹${money(legCap)}">₹${moneyShort(legCap)}</td>
+            <td data-label="Generated" class="mono ${pnlClass(legPnl)}">
+              <div>₹${moneyShort(legGen)}</div>
+              <div class="meta pnl-sub">day ₹${moneyShort(legPnl)}</div>
+            </td>
+            <td data-label="PnL" class="mono ${pnlClass(legPnl)}">₹${moneyShort(legPnl)}</td>
+            <td data-label="Market" class="mono">${legMarket}</td>
+            <td data-label="Entry" class="mono">${levelCell(legEntry, legOpen ? "" : (leg.exit != null ? "" : legHint))}</td>
+            <td data-label="Exit" class="mono">${levelCell(legExit, legOpen ? "open" : (leg.exit != null ? "exited" : ""))}</td>
+            <td data-label="Open" class="mono">${legOpen ? Math.abs(leg.qty || 1) : 0}</td>
+            <td data-label="Stop" class="mono">${legSl}</td>
+            <td data-label="Target" class="mono">${legTp}</td>
+            <td data-label="Win" class="mono">—</td>
+            <td data-label="Actions" class="desk-actions-cell"><span class="meta">leg</span></td>
+          </tr>`;
+        })
+        .join("");
+
+      return parent + childRows;
     })
     .join("");
 
   root.innerHTML = `
-    <p class="hint desk-legend">
-      <strong>Capital</strong> = paper cash assigned (e.g. ₹5L).
-      <strong>Generated</strong> = capital + day PnL.
-      After <strong>15:00 IST</strong> settle, row PnL shows day result then clears to 0; Reports keep history.
+    <p class="hint desk-legend tight">
+      Market = LTP while open · Entry/Exit = fills · Open = in-trade/selected · ▶ expands basket legs
     </p>
     <div class="table-wrap desk-table-wrap">
       <table class="data-table dense cards-on-mobile" id="execStatsTable">
         <thead>
           <tr>
-            <th>Status</th>
             <th>Strategy</th>
             <th title="Paper capital">Capital</th>
             <th title="Capital + day PnL">Generated</th>
             <th title="Live / settled day PnL">PnL</th>
-            <th>Signal</th>
-            <th title="Current mark">Market</th>
-            <th title="Open entry, or last closed when flat">Entry</th>
-            <th>Pos</th>
+            <th title="Live mark while in trade">Market</th>
+            <th title="Entry fill">Entry</th>
+            <th title="Exit fill">Exit</th>
+            <th title="Basket: in-trade / selected. Single: open qty">Open</th>
             <th>Stop</th>
             <th>Target</th>
             <th>Win</th>
@@ -584,6 +853,17 @@ function renderExecStats(session) {
         <tbody>${rows}</tbody>
       </table>
     </div>`;
+
+  root.querySelectorAll(".desk-expand").forEach((btn) => {
+    btn.addEventListener("click", (e) => {
+      e.stopPropagation();
+      const sid = btn.dataset.expand;
+      if (!sid) return;
+      if (deskExpanded.has(sid)) deskExpanded.delete(sid);
+      else deskExpanded.add(sid);
+      renderExecStats(lastSession);
+    });
+  });
 
   root.querySelectorAll(".desk-row").forEach((row) => {
     const id = row.dataset.id;
@@ -896,40 +1176,101 @@ function closeStrategyModal() {
   modalInstanceId = null;
 }
 
-let calYear = new Date().getFullYear();
-let calMonth = new Date().getMonth() + 1;
 
 function reportQuery() {
   const from = $("rpFrom")?.value || "";
   const to = $("rpTo")?.value || "";
   const strat = ($("rpStrategy")?.value || "").trim();
+  const kind = ($("rpReportType")?.value || "trades").trim();
   const q = new URLSearchParams();
   if (from) q.set("from_date", from);
   if (to) q.set("to_date", to);
   if (strat) q.set("strategy_id", strat);
-  return q.toString();
+  if (kind) q.set("kind", kind);
+  return q;
+}
+
+function reportType() {
+  return ($("rpReportType")?.value || "trades").trim();
+}
+
+function syncReportPanels() {
+  const kind = reportType();
+  const showTrades = kind === "trades" || kind === "full";
+  const showStrategy = kind === "strategy" || kind === "full";
+  const showDaily = kind === "daily" || kind === "full";
+  const showBasket = kind === "basket" || kind === "full";
+  const setHidden = (id, hidden) => {
+    const el = $(id);
+    if (el) el.hidden = !!hidden;
+  };
+  setHidden("rpPanelTrades", !showTrades);
+  setHidden("rpPanelStrategy", !showStrategy);
+  setHidden("rpPanelDaily", !showDaily);
+  setHidden("rpPanelBasket", !showBasket);
+}
+
+function fillReportsStrategySelect(byStrategy) {
+  const sel = $("rpStrategy");
+  if (!sel || sel.tagName !== "SELECT") return;
+  const current = sel.value;
+  const ranked = (byStrategy || []).slice().sort((a, b) => (b.net_pnl || 0) - (a.net_pnl || 0));
+  const seen = new Set(ranked.map((r) => r.strategy_id));
+  const extras = (catalog || []).map((c) => c.id).filter((id) => id && !seen.has(id));
+  const opts = [`<option value="">All strategies</option>`];
+  ranked.forEach((r, i) => {
+    opts.push(
+      `<option value="${escapeHtml(r.strategy_id)}">${escapeHtml(`${i + 1}. ${r.strategy_id} · ₹${money(r.net_pnl || 0)}`)}</option>`
+    );
+  });
+  extras.forEach((id) => {
+    opts.push(`<option value="${escapeHtml(id)}">${escapeHtml(id)}</option>`);
+  });
+  sel.innerHTML = opts.join("");
+  if (current && [...sel.options].some((o) => o.value === current)) sel.value = current;
 }
 
 async function refreshReports() {
   try {
+    syncReportPanels();
     const q = reportQuery();
+    const qStr = q.toString();
+    const kind = reportType();
     const exportLink = $("btnExportCsv");
-    const exportFull = $("btnExportCsvFull");
     const exportPdf = $("btnExportPdf");
-    if (exportLink) exportLink.href = `/api/reports/export.csv${q ? `?${q}` : ""}`;
-    if (exportFull) {
-      const fullQ = new URLSearchParams(q);
-      fullQ.set("kind", "full");
-      exportFull.href = `/api/reports/export.csv?${fullQ.toString()}`;
+    if (exportLink) exportLink.href = `/api/reports/export.csv?${qStr}`;
+    if (exportPdf) {
+      const pdfQ = new URLSearchParams(q);
+      pdfQ.delete("kind");
+      exportPdf.href = `/api/reports/export.pdf${pdfQ.toString() ? `?${pdfQ}` : ""}`;
     }
-    if (exportPdf) exportPdf.href = `/api/reports/export.pdf${q ? `?${q}` : ""}`;
-    const [summary, trades, sels, daily, cal] = await Promise.all([
-      api(`/api/reports/summary${q ? `?${q}` : ""}`),
-      api(`/api/reports/trades${q ? `?${q}` : ""}`),
-      api("/api/reports/selections"),
-      api(`/api/reports/daily${q ? `?${q}` : ""}`),
-      api(`/api/reports/calendar?year=${calYear}&month=${calMonth}`),
-    ]);
+    const fetches = [
+      api(`/api/reports/summary${qStr ? `?${qStr}` : ""}`),
+    ];
+    const selQ = new URLSearchParams();
+    const from = $("rpFrom")?.value || "";
+    const to = $("rpTo")?.value || "";
+    const strat = ($("rpStrategy")?.value || "").trim();
+    if (from) selQ.set("from_date", from);
+    if (to) selQ.set("to_date", to);
+    if (strat) selQ.set("strategy_id", strat);
+    if (kind === "basket" || kind === "full") {
+      fetches.push(api(`/api/reports/selections${selQ.toString() ? `?${selQ}` : ""}`));
+    } else {
+      fetches.push(Promise.resolve({ selections: [] }));
+    }
+    if (kind === "trades" || kind === "full") {
+      fetches.push(api(`/api/reports/trades${qStr ? `?${qStr}` : ""}`));
+    } else {
+      fetches.push(Promise.resolve({ trades: [] }));
+    }
+    if (kind === "daily" || kind === "full") {
+      fetches.push(api(`/api/reports/daily${qStr ? `?${qStr}` : ""}`));
+    } else {
+      fetches.push(Promise.resolve({ days: [] }));
+    }
+    const [summary, sels, trades, daily] = await Promise.all(fetches);
+    fillReportsStrategySelect(summary.by_strategy || []);
     setText("rpTrades", String(summary.trades || 0));
     setText("rpClosed", String(summary.closed || 0));
     setText("rpWinRate", pct(summary.win_rate));
@@ -940,67 +1281,109 @@ async function refreshReports() {
       net.textContent = `₹${money(summary.net_pnl || 0)}`;
       net.className = pnlClass(summary.net_pnl || 0);
     }
-    const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-    setText("calLabel", `${months[cal.month - 1]} ${cal.year}`);
-    setText("calMonthPnl", `₹${money(cal.month_pnl || 0)}`, pnlClass(cal.month_pnl || 0));
-    const calGrid = $("calGrid");
-    if (calGrid) {
-      calGrid.innerHTML = (cal.cells || [])
-      .map((c) => {
-        if (!c.date) return `<div class="cal-cell empty"></div>`;
-        const day = c.date.slice(-2);
-        const pnl = c.pnl;
-        const cls = pnl == null ? "" : pnlClass(pnl);
-        return `<div class="cal-cell ${cls}"><span class="d">${day}</span><strong>${pnl == null ? "—" : `₹${money(pnl)}`}</strong></div>`;
-      })
-      .join("");
+
+    const byStrat = summary.by_strategy || [];
+    setText("rpStratCount", String(byStrat.length));
+    const stratBody = $("reportStrategyBody");
+    if (stratBody) {
+      stratBody.innerHTML = byStrat.length
+        ? byStrat
+            .map(
+              (r, i) => `<tr>
+            <td data-label="#">${i + 1}</td>
+            <td data-label="Strategy"><strong>${escapeHtml(r.strategy_id)}</strong></td>
+            <td data-label="Trades">${r.trades || 0}</td>
+            <td data-label="Win rate">${pct(r.win_rate)}</td>
+            <td data-label="Avg win" class="pos">${r.avg_win != null ? `₹${money(r.avg_win)}` : "—"}</td>
+            <td data-label="Avg loss" class="neg">${r.avg_loss != null ? `₹${money(r.avg_loss)}` : "—"}</td>
+            <td data-label="PF">${r.profit_factor != null ? r.profit_factor : "—"}</td>
+            <td data-label="Net PnL" class="${pnlClass(r.net_pnl)}"><strong>₹${money(r.net_pnl || 0)}</strong></td>
+          </tr>`
+            )
+            .join("")
+        : `<tr><td colspan="8" class="empty-cell">No strategy data yet.</td></tr>`;
     }
+
     const dbody = $("reportDailyBody");
     const days = daily.days || [];
-    dbody.innerHTML = days.length
-      ? days.map((d) => `<tr>
+    setText("rpDayCount", String(days.length));
+    if (dbody) {
+      dbody.innerHTML = days.length
+        ? days
+            .map(
+              (d) => `<tr>
           <td data-label="Date">${d.date}</td>
           <td data-label="Trades">${d.trades}</td>
           <td data-label="Closed">${d.closed}</td>
           <td data-label="Win rate">${pct(d.win_rate)}</td>
           <td data-label="Net PnL" class="${pnlClass(d.net_pnl)}">₹${money(d.net_pnl)}</td>
-          <td data-label="Symbols">${(d.symbols || []).join(", ")}</td></tr>`).join("")
-      : `<tr><td colspan="6" class="empty-cell">No daily data yet.</td></tr>`;
+          <td data-label="Symbols">${(d.symbols || []).join(", ")}</td></tr>`
+            )
+            .join("")
+        : `<tr><td colspan="6" class="empty-cell">No daily data yet.</td></tr>`;
+    }
+
     const tbody = $("reportTradesBody");
     const list = trades.trades || [];
-    tbody.innerHTML = list.length
-      ? list.slice(0, 150).map((t) => {
-          const entry = formatIst(t.entry_at);
-          const exit = t.exit_at ? formatIst(t.exit_at) : "—";
-          return `<tr>
-            <td data-label="Entry">${entry}</td>
-            <td data-label="Exit">${exit}</td>
-            <td data-label="Strategy">${t.strategy_id}</td>
-            <td data-label="Symbol">${t.symbol}</td>
-            <td data-label="Side">${t.side}</td>
+    const shown = list.slice(0, 150);
+    const buys = list.filter((t) => /^(buy|long)$/i.test(String(t.side || ""))).length;
+    const sells = list.filter((t) => /^(sell|short)$/i.test(String(t.side || ""))).length;
+    setText("rpTradeCount", String(list.length));
+    setText(
+      "rpTradeBreakdown",
+      list.length
+        ? `${buys} buy · ${sells} sell${list.length > shown.length ? ` · showing ${shown.length}` : ""}`
+        : "0 trades"
+    );
+    if (tbody) {
+      tbody.innerHTML = list.length
+        ? shown
+            .map((t) => {
+              const entry = formatIstStack(t.entry_at);
+              const exit = t.exit_at ? formatIstStack(t.exit_at) : "—";
+              const reason = t.exit_reason ? escapeHtml(t.exit_reason) : "";
+              return `<tr>
+            <td data-label="Entry" class="col-dt">${entry}</td>
+            <td data-label="Exit" class="col-dt">${exit}</td>
+            <td data-label="Strategy" class="col-strat-id">${escapeHtml(t.strategy_id || "")}</td>
+            <td data-label="Symbol">${escapeHtml(t.symbol || "")}</td>
+            <td data-label="Side">${escapeHtml(t.side || "")}</td>
+            <td data-label="Qty" class="mono">${t.quantity != null ? t.quantity : "—"}</td>
             <td data-label="Entry ₹">${money(t.entry_price)}</td>
             <td data-label="Exit ₹">${t.exit_price != null ? money(t.exit_price) : "—"}</td>
             <td data-label="SL / TP">${t.stop_price != null ? money(t.stop_price) : "—"} / ${t.target_price != null ? money(t.target_price) : "—"}</td>
             <td data-label="PnL" class="${pnlClass(t.realized_pnl || 0)}">${t.realized_pnl != null ? `₹${money(t.realized_pnl)}` : "—"}</td>
-            <td data-label="Status">${t.status}${t.exit_reason ? ` · ${escapeHtml(t.exit_reason)}` : ""}</td></tr>`;
-        }).join("")
-      : `<tr><td colspan="10" class="empty-cell">No stored trades yet.</td></tr>`;
+            <td data-label="Status" class="col-status">
+              <div class="status-main">${escapeHtml(t.status || "—")}</div>
+              ${reason ? `<div class="status-sub">${reason}</div>` : ""}
+            </td></tr>`;
+            })
+            .join("")
+        : `<tr><td colspan="11" class="empty-cell">No stored trades yet.</td></tr>`;
+    }
+
     const sbody = $("reportSelBody");
     const selsList = sels.selections || [];
-    sbody.innerHTML = selsList.length
-      ? selsList.slice(0, 100).map((r) => {
-          const when = formatIst(r.selected_at);
-          return `<tr>
-            <td data-label="When">${when}</td>
-            <td data-label="Strategy">${r.strategy_id}</td>
-            <td data-label="Symbol">${r.symbol}</td>
-            <td data-label="Mode">${r.mode}</td>
+    setText("rpSelCount", String(selsList.length));
+    if (sbody) {
+      sbody.innerHTML = selsList.length
+        ? selsList
+            .slice(0, 100)
+            .map((r) => {
+              const when = formatIstStack(r.selected_at);
+              return `<tr>
+            <td data-label="When" class="col-dt">${when}</td>
+            <td data-label="Strategy">${escapeHtml(r.strategy_id || "")}</td>
+            <td data-label="Symbol">${escapeHtml(r.symbol || "")}</td>
+            <td data-label="Mode">${escapeHtml(r.mode || "")}</td>
             <td data-label="% chg">${r.pct_change != null ? Number(r.pct_change).toFixed(2) : "—"}</td>
             <td data-label="Open">${money(r.open)}</td>
             <td data-label="High">${money(r.high)}</td>
             <td data-label="Low">${money(r.low)}</td></tr>`;
-        }).join("")
-      : `<tr><td colspan="8" class="empty-cell">No basket selections stored yet.</td></tr>`;
+            })
+            .join("")
+        : `<tr><td colspan="8" class="empty-cell">No basket selections stored yet.</td></tr>`;
+    }
   } catch (err) {
     console.warn(err);
   }
@@ -1017,7 +1400,8 @@ function render(session) {
   renderSummary(session);
   renderRegistry();
   renderExecStats(session);
-  if (currentView === "reports") refreshReports();
+  // Poll must not re-fetch journal Analytics/Reports boards (caused KPI flicker).
+  tickAnalyticsLive();
 }
 
 async function refresh() {
@@ -1105,6 +1489,12 @@ $("btnRefreshReports")?.addEventListener("click", () => refreshReports());
 $("rpFrom")?.addEventListener("change", () => refreshReports());
 $("rpTo")?.addEventListener("change", () => refreshReports());
 $("rpStrategy")?.addEventListener("change", () => refreshReports());
+$("rpReportType")?.addEventListener("change", () => refreshReports());
+
+$("btnRefreshAnalytics")?.addEventListener("click", () => refreshAnalyticsBoard());
+$("anFrom")?.addEventListener("change", () => refreshAnalyticsBoard());
+$("anTo")?.addEventListener("change", () => refreshAnalyticsBoard());
+$("anStrategy")?.addEventListener("change", () => refreshAnalyticsBoard());
 
 function isoDay(d) {
   const y = d.getFullYear();
@@ -1113,30 +1503,39 @@ function isoDay(d) {
   return `${y}-${m}-${day}`;
 }
 
+function applyDateRange(range, fromId, toId, onDone) {
+  const to = new Date();
+  const from = new Date();
+  if (range === "today") {
+    // from = to = today
+  } else if (range === "week") {
+    const day = to.getDay();
+    const mondayOffset = day === 0 ? -6 : 1 - day;
+    from.setDate(to.getDate() + mondayOffset);
+  } else if (range === "7d") {
+    from.setDate(to.getDate() - 6);
+  } else if (range === "month") {
+    from.setDate(1);
+  } else if (range === "all") {
+    if ($(fromId)) $(fromId).value = "";
+    if ($(toId)) $(toId).value = "";
+    onDone();
+    return;
+  }
+  if ($(fromId)) $(fromId).value = isoDay(from);
+  if ($(toId)) $(toId).value = isoDay(to);
+  onDone();
+}
+
 document.querySelectorAll("[data-range]").forEach((btn) => {
   btn.addEventListener("click", () => {
-    const range = btn.dataset.range;
-    const to = new Date();
-    const from = new Date();
-    if (range === "today") {
-      // from = to = today
-    } else if (range === "week") {
-      const day = to.getDay(); // 0 Sun … 6 Sat
-      const mondayOffset = day === 0 ? -6 : 1 - day;
-      from.setDate(to.getDate() + mondayOffset);
-    } else if (range === "7d") {
-      from.setDate(to.getDate() - 6);
-    } else if (range === "month") {
-      from.setDate(1);
-    } else if (range === "all") {
-      if ($("rpFrom")) $("rpFrom").value = "";
-      if ($("rpTo")) $("rpTo").value = "";
-      refreshReports();
-      return;
-    }
-    if ($("rpFrom")) $("rpFrom").value = isoDay(from);
-    if ($("rpTo")) $("rpTo").value = isoDay(to);
-    refreshReports();
+    applyDateRange(btn.dataset.range, "rpFrom", "rpTo", () => refreshReports());
+  });
+});
+
+document.querySelectorAll("[data-an-range]").forEach((btn) => {
+  btn.addEventListener("click", () => {
+    applyDateRange(btn.dataset.anRange, "anFrom", "anTo", () => refreshAnalyticsBoard());
   });
 });
 
@@ -1146,7 +1545,8 @@ $("calPrev")?.addEventListener("click", () => {
     calMonth = 12;
     calYear -= 1;
   }
-  refreshReports();
+  if (currentView === "analytics") refreshAnalyticsBoard();
+  else refreshReports();
 });
 $("calNext")?.addEventListener("click", () => {
   calMonth += 1;
@@ -1154,7 +1554,8 @@ $("calNext")?.addEventListener("click", () => {
     calMonth = 1;
     calYear += 1;
   }
-  refreshReports();
+  if (currentView === "analytics") refreshAnalyticsBoard();
+  else refreshReports();
 });
 document.querySelectorAll("[data-close-modal]").forEach((el) => {
   el.addEventListener("click", closeStrategyModal);
@@ -1210,15 +1611,22 @@ async function refreshDhanStatus() {
     const plan = s.profile?.dataPlan || "—";
     const valid = s.profile?.tokenValidity || s.expiry_time || "—";
     const left = s.seconds_left != null ? `${Math.round(s.seconds_left / 3600)}h left` : "unknown";
-    const auto = s.renewable
-      ? (s.auto_renew ? "auto-renew on (SELF)" : "renewable SELF")
-      : "PARTNER · no API renew (paste daily)";
-    const totp = "";
+    const store = s.storage ? ` · store=${s.storage}` : "";
+    let mode;
+    if (s.renewable) {
+      mode = s.auto_renew ? "auto RenewToken (SELF)" : "SELF · renewable";
+    } else if (s.totp_configured) {
+      mode = s.auto_renew ? "auto generateAccessToken (TOTP)" : "PARTNER · TOTP remint ready";
+    } else {
+      mode = "PARTNER · paste daily or add TOTP secret";
+    }
+    const note = s.renew_note ? ` · ${s.renew_note}` : "";
+    const warn = s.warning ? ` · ${s.warning}` : "";
     if (s.ok) {
-      el.textContent = `Connected · Data plan: ${plan} · Token valid: ${valid} (${left}) · ${auto}${totp}`;
+      el.textContent = `Connected · Data plan: ${plan} · Token valid: ${valid} (${left})${store} · ${mode}${note}`;
       el.style.color = "var(--accent)";
     } else {
-      el.textContent = `Not connected · ${s.error || "paste a fresh access token"} · ${left} · ${auto}${totp}`;
+      el.textContent = `Not connected · ${s.error || "paste a fresh access token"} · ${left}${store} · ${mode}${note}${warn}`;
       el.style.color = "var(--bad)";
     }
   } catch (err) {
@@ -1243,11 +1651,40 @@ $("btnDhanSave")?.addEventListener("click", async () => {
     alert(err.message);
   }
 });
+$("btnDhanCreds")?.addEventListener("click", async () => {
+  try {
+    const pin = $("dhanPin")?.value?.trim() ?? "";
+    const totp_secret = $("dhanTotp")?.value?.trim() ?? "";
+    if (!pin && !totp_secret) {
+      alert("Enter PIN and/or TOTP secret");
+      return;
+    }
+    const body = {};
+    if (pin) body.pin = pin;
+    if (totp_secret) body.totp_secret = totp_secret;
+    await api("/api/dhan/credentials", { method: "POST", body: JSON.stringify(body) });
+    if ($("dhanPin")) $("dhanPin").value = "";
+    if ($("dhanTotp")) $("dhanTotp").value = "";
+    await refreshDhanStatus();
+    alert("PIN/TOTP saved to .env. Use Generate via TOTP or Renew / remint now.");
+  } catch (err) {
+    alert(err.message);
+  }
+});
+$("btnDhanGenerate")?.addEventListener("click", async () => {
+  try {
+    await api("/api/dhan/generate", { method: "POST", body: "{}" });
+    await refreshDhanStatus();
+    alert("New token minted via PIN+TOTP.");
+  } catch (err) {
+    alert(err.message);
+  }
+});
 $("btnDhanRenew")?.addEventListener("click", async () => {
   try {
     await api("/api/dhan/renew", { method: "POST", body: "{}" });
     await refreshDhanStatus();
-    alert("Token renewed.");
+    alert("Token check done (renew only runs when <12h left).");
   } catch (err) {
     alert(err.message);
   }

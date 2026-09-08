@@ -250,31 +250,108 @@ def list_open_trades(
     )
 
 
-def list_selections(*, session_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
+def list_selections(
+    *,
+    session_id: str | None = None,
+    strategy_id: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    limit: int = 200,
+) -> list[dict[str, Any]]:
     ensure_paper_tables()
     with session_scope() as db:
         q = db.query(PaperSelectionRow).order_by(PaperSelectionRow.selected_at.desc())
         if session_id:
             q = q.filter(PaperSelectionRow.session_id == session_id)
-        rows = q.limit(limit).all()
-        return [
-            {
-                "id": r.id,
-                "session_id": r.session_id,
-                "strategy_id": r.strategy_id,
-                "instance_id": r.instance_id,
-                "symbol": r.symbol,
-                "mode": r.mode,
-                "pct_change": r.pct_change,
-                "open": r.open_px,
-                "high": r.high_px,
-                "low": r.low_px,
-                "close": r.close_px,
-                "prev_close": r.prev_close,
-                "selected_at": r.selected_at.isoformat() if r.selected_at else None,
-            }
-            for r in rows
+        if strategy_id:
+            q = q.filter(PaperSelectionRow.strategy_id == strategy_id)
+        rows = q.limit(max(limit, 5000) if (from_date or to_date) else limit).all()
+        out = []
+        for r in rows:
+            day = None
+            if r.selected_at:
+                day = _as_ist(r.selected_at).strftime("%Y-%m-%d") if _as_ist(r.selected_at) else None
+            if from_date and day and day < from_date:
+                continue
+            if to_date and day and day > to_date:
+                continue
+            out.append(
+                {
+                    "id": r.id,
+                    "session_id": r.session_id,
+                    "strategy_id": r.strategy_id,
+                    "instance_id": r.instance_id,
+                    "symbol": r.symbol,
+                    "mode": r.mode,
+                    "pct_change": r.pct_change,
+                    "open": r.open_px,
+                    "high": r.high_px,
+                    "low": r.low_px,
+                    "close": r.close_px,
+                    "prev_close": r.prev_close,
+                    "selected_at": r.selected_at.isoformat() if r.selected_at else None,
+                }
+            )
+            if len(out) >= limit:
+                break
+        return out
+
+
+def selections_csv(
+    *,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    strategy_id: str | None = None,
+) -> str:
+    import csv
+    import io
+
+    rows = list_selections(
+        strategy_id=strategy_id,
+        from_date=from_date,
+        to_date=to_date,
+        limit=5000,
+    )
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["BASKET SELECTIONS REPORT"])
+    w.writerow(["Generated (IST)", datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")])
+    w.writerow(["From", from_date or "all"])
+    w.writerow(["To", to_date or "all"])
+    w.writerow(["Strategy filter", strategy_id or "all"])
+    w.writerow([])
+    w.writerow(
+        [
+            "selected_at_ist",
+            "strategy_id",
+            "instance_id",
+            "symbol",
+            "mode",
+            "pct_change",
+            "open",
+            "high",
+            "low",
+            "close",
+            "prev_close",
         ]
+    )
+    for r in rows:
+        w.writerow(
+            [
+                _fmt_ist(_parse_iso_dt(r.get("selected_at"))) or (r.get("selected_at") or ""),
+                r.get("strategy_id"),
+                r.get("instance_id"),
+                r.get("symbol"),
+                r.get("mode"),
+                r.get("pct_change"),
+                r.get("open"),
+                r.get("high"),
+                r.get("low"),
+                r.get("close"),
+                r.get("prev_close"),
+            ]
+        )
+    return out.getvalue()
 
 
 def report_summary(
@@ -301,38 +378,51 @@ def report_summary(
     pnls = [float(t["realized_pnl"] or 0) for t in closed]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
-    by_strategy: dict[str, list[float]] = {}
+    by_strategy: dict[str, list[dict[str, Any]]] = {}
     for t in closed:
-        by_strategy.setdefault(t["strategy_id"], []).append(float(t["realized_pnl"] or 0))
-    strat_rows = []
-    for sid, vals in by_strategy.items():
+        by_strategy.setdefault(t["strategy_id"], []).append(t)
+
+    def _stats(vals: list[float]) -> dict[str, Any]:
         w = [v for v in vals if v > 0]
         l = [v for v in vals if v < 0]
-        strat_rows.append(
-            {
-                "strategy_id": sid,
-                "trades": len(vals),
-                "wins": len(w),
-                "losses": len(l),
-                "win_rate": round(len(w) / len(vals) * 100, 2) if vals else None,
-                "avg_win": round(sum(w) / len(w), 2) if w else None,
-                "avg_loss": round(sum(l) / len(l), 2) if l else None,
-                "net_pnl": round(sum(vals), 2),
-            }
-        )
+        n = len(vals)
+        return {
+            "trades": n,
+            "wins": len(w),
+            "losses": len(l),
+            "breakeven": n - len(w) - len(l),
+            "win_rate": round(len(w) / n * 100, 2) if n else None,
+            "avg_win": round(sum(w) / len(w), 2) if w else None,
+            "avg_loss": round(sum(l) / len(l), 2) if l else None,
+            "net_pnl": round(sum(vals), 2) if vals else 0.0,
+            "avg_trade": round(sum(vals) / n, 2) if n else None,
+            "expectancy": round(sum(vals) / n, 2) if n else None,
+            "profit_factor": (
+                round(abs(sum(w) / sum(l)), 2) if w and l and sum(l) != 0 else None
+            ),
+            "largest_win": round(max(w), 2) if w else None,
+            "largest_loss": round(min(l), 2) if l else None,
+        }
+
+    strat_rows = []
+    for sid, rows in by_strategy.items():
+        vals = [float(t.get("realized_pnl") or 0) for t in rows]
+        stats = _stats(vals)
+        symbols = sorted({str(t.get("symbol") or "") for t in rows if t.get("symbol")})
+        strat_rows.append({"strategy_id": sid, "symbols": symbols, **stats})
+    strat_rows.sort(key=lambda r: float(r.get("net_pnl") or 0), reverse=True)
+
+    overall = _stats(pnls)
     return {
         "trades": len(trades),
         "open": sum(1 for t in trades if t["status"] == "open"),
         "closed": len(closed),
-        "wins": len(wins),
-        "losses": len(losses),
-        "win_rate": round(len(wins) / len(closed) * 100, 2) if closed else None,
-        "avg_win": round(sum(wins) / len(wins), 2) if wins else None,
-        "avg_loss": round(sum(losses) / len(losses), 2) if losses else None,
-        "net_pnl": round(sum(pnls), 2) if pnls else 0.0,
+        **{k: overall[k] for k in overall if k != "trades"},
+        "closed_trades": overall["trades"],
         "by_strategy": strat_rows,
         "from_date": from_date,
         "to_date": to_date,
+        "strategy_id": strategy_id,
     }
 
 
@@ -397,10 +487,24 @@ def daily_report(
             continue
         bucket = by_day.setdefault(
             day,
-            {"date": day, "trades": 0, "closed": 0, "open": 0, "wins": 0, "losses": 0, "net_pnl": 0.0, "symbols": set()},
+            {
+                "date": day,
+                "trades": 0,
+                "closed": 0,
+                "open": 0,
+                "wins": 0,
+                "losses": 0,
+                "net_pnl": 0.0,
+                "win_pnls": [],
+                "loss_pnls": [],
+                "symbols": set(),
+                "strategies": set(),
+            },
         )
         bucket["trades"] += 1
         bucket["symbols"].add(t["symbol"])
+        if t.get("strategy_id"):
+            bucket["strategies"].add(t["strategy_id"])
         if t["status"] == "open":
             bucket["open"] += 1
             continue
@@ -409,12 +513,16 @@ def daily_report(
         bucket["net_pnl"] += pnl
         if pnl > 0:
             bucket["wins"] += 1
+            bucket["win_pnls"].append(pnl)
         elif pnl < 0:
             bucket["losses"] += 1
+            bucket["loss_pnls"].append(pnl)
     rows = []
     for day in sorted(by_day.keys(), reverse=True):
         b = by_day[day]
         closed = b["closed"]
+        w = b["win_pnls"]
+        l = b["loss_pnls"]
         rows.append(
             {
                 "date": day,
@@ -424,23 +532,34 @@ def daily_report(
                 "wins": b["wins"],
                 "losses": b["losses"],
                 "win_rate": round(b["wins"] / closed * 100, 2) if closed else None,
+                "avg_win": round(sum(w) / len(w), 2) if w else None,
+                "avg_loss": round(sum(l) / len(l), 2) if l else None,
                 "net_pnl": round(b["net_pnl"], 2),
                 "symbols": sorted(b["symbols"]),
+                "strategies": sorted(b["strategies"]),
             }
         )
     return {"days": rows, "count": len(rows)}
 
 
-def calendar_pnl(*, year: int, month: int) -> dict[str, Any]:
+def calendar_pnl(
+    *,
+    year: int,
+    month: int,
+    strategy_id: str | None = None,
+) -> dict[str, Any]:
     """Month grid of daily net PnL for closed trades."""
     from calendar import monthrange
 
     prefix = f"{year:04d}-{month:02d}"
-    daily = daily_report(from_date=f"{prefix}-01", to_date=f"{prefix}-{monthrange(year, month)[1]:02d}")
+    daily = daily_report(
+        from_date=f"{prefix}-01",
+        to_date=f"{prefix}-{monthrange(year, month)[1]:02d}",
+        strategy_id=strategy_id,
+    )
     by = {d["date"]: d["net_pnl"] for d in daily["days"]}
     first_weekday, n_days = monthrange(year, month)  # Mon=0
     cells = []
-    # Pad leading blanks (convert to Sun=0 style optional — use Mon-start)
     for _ in range(first_weekday):
         cells.append({"date": None, "pnl": None})
     for day in range(1, n_days + 1):
@@ -452,7 +571,83 @@ def calendar_pnl(*, year: int, month: int) -> dict[str, Any]:
         "cells": cells,
         "month_pnl": round(sum(v for v in by.values()), 2),
         "days_traded": len(by),
+        "strategy_id": strategy_id,
     }
+
+
+def strategy_report_csv(
+    *,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    strategy_id: str | None = None,
+) -> str:
+    import csv
+    import io
+
+    summary = report_summary(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["STRATEGY REPORT"])
+    w.writerow(["Generated (IST)", datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")])
+    w.writerow(["From", from_date or "all"])
+    w.writerow(["To", to_date or "all"])
+    w.writerow(["Strategy filter", strategy_id or "all"])
+    w.writerow([])
+    w.writerow(["strategy_id", "trades", "wins", "losses", "win_rate %", "avg_win", "avg_loss", "profit_factor", "net_pnl"])
+    for row in summary.get("by_strategy") or []:
+        w.writerow(
+            [
+                row.get("strategy_id"),
+                row.get("trades"),
+                row.get("wins"),
+                row.get("losses"),
+                row.get("win_rate"),
+                row.get("avg_win"),
+                row.get("avg_loss"),
+                row.get("profit_factor"),
+                row.get("net_pnl"),
+            ]
+        )
+    return out.getvalue()
+
+
+def daily_report_csv(
+    *,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    strategy_id: str | None = None,
+) -> str:
+    import csv
+    import io
+
+    daily = daily_report(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+    out = io.StringIO()
+    w = csv.writer(out)
+    w.writerow(["DAILY REPORT"])
+    w.writerow(["Generated (IST)", datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")])
+    w.writerow(["From", from_date or "all"])
+    w.writerow(["To", to_date or "all"])
+    w.writerow(["Strategy filter", strategy_id or "all"])
+    w.writerow([])
+    w.writerow(["date", "trades", "closed", "open", "wins", "losses", "win_rate %", "avg_win", "avg_loss", "net_pnl", "symbols", "strategies"])
+    for d in daily.get("days") or []:
+        w.writerow(
+            [
+                d.get("date"),
+                d.get("trades"),
+                d.get("closed"),
+                d.get("open"),
+                d.get("wins"),
+                d.get("losses"),
+                d.get("win_rate"),
+                d.get("avg_win"),
+                d.get("avg_loss"),
+                d.get("net_pnl"),
+                ", ".join(d.get("symbols") or []),
+                ", ".join(d.get("strategies") or []),
+            ]
+        )
+    return out.getvalue()
 
 
 def trades_csv(

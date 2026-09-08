@@ -5,9 +5,19 @@
 #   RENDER_APP_URL  = https://algo-paper-desk.onrender.com
 #   CRON_SECRET     = same value as Render env CRON_SECRET
 #
+# Render env (for email digests — Gmail App Password recommended):
+#   REPORT_EMAIL_TO = dharmikvalani57@gmail.com
+#   SMTP_USER       = your Gmail address
+#   SMTP_PASSWORD   = Gmail App Password (not account password)
+#   SMTP_HOST       = smtp.gmail.com   (optional)
+#   SMTP_PORT       = 587              (optional)
+#   SMTP_FROM       = same as SMTP_USER (optional)
+#
 # IST ↔ UTC (no DST): IST = UTC+5:30
 #   08:20 / 08:40 / 08:50 / 09:05 IST wake → 02:50 / 03:10 / 03:20 / 03:35 UTC
+#   08:55 IST pre-market email → 03:25 UTC (after wake + deep health)
 #   market keep-alive → ~02:30–10:20 UTC (08:00–15:50 IST)
+#   15:40 IST post-market email → 10:10 UTC
 #   15:45 IST sleep → 10:15 UTC
 #
 # Note: GitHub schedule can skip or delay under load. Multiple wake pings
@@ -25,12 +35,17 @@ on:
     - cron: "10 3 * * 1-5"   # ~08:40 IST
     - cron: "20 3 * * 1-5"   # ~08:50 IST
     - cron: "35 3 * * 1-5"   # ~09:05 IST
-    # Post-market: stop live ~15:45 IST
-    - cron: "15 10 * * 1-5"
+    # Pre-market deep health + email (~08:55 IST) — after wake, before cash open
+    - cron: "25 3 * * 1-5"   # ~08:55 IST
+    # Post-market deep health + email (~15:40 IST), then sleep at 15:45
+    - cron: "10 10 * * 1-5"  # ~15:40 IST
+    - cron: "15 10 * * 1-5"  # ~15:45 IST sleep
+    # Dhan SELF RenewToken (~every 6h IST daytime + evening) → persists to Postgres
+    - cron: "20 4,10,16,22 * * *"  # ~09:50 / 15:50 / 21:50 / 03:50 IST
   workflow_dispatch:
     inputs:
       action:
-        description: "health | wake | sleep"
+        description: "health | wake | sleep | report_open | report_close | dhan_renew"
         required: true
         default: health
         type: choice
@@ -38,6 +53,9 @@ on:
           - health
           - wake
           - sleep
+          - report_open
+          - report_close
+          - dhan_renew
 
 concurrency:
   group: render-paper-cron
@@ -46,7 +64,7 @@ concurrency:
 jobs:
   ping:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 8
     steps:
       - name: Resolve action
         id: pick
@@ -62,8 +80,17 @@ jobs:
             "50 2 * * 1-5"|"10 3 * * 1-5"|"20 3 * * 1-5"|"35 3 * * 1-5")
               echo "action=wake" >> "$GITHUB_OUTPUT"
               ;;
+            "25 3 * * 1-5")
+              echo "action=report_open" >> "$GITHUB_OUTPUT"
+              ;;
+            "10 10 * * 1-5")
+              echo "action=report_close" >> "$GITHUB_OUTPUT"
+              ;;
             "15 10 * * 1-5")
               echo "action=sleep" >> "$GITHUB_OUTPUT"
+              ;;
+            "20 4,10,16,22 * * *")
+              echo "action=dhan_renew" >> "$GITHUB_OUTPUT"
               ;;
             *)
               echo "action=health" >> "$GITHUB_OUTPUT"
@@ -85,6 +112,8 @@ jobs:
           fi
 
           echo "action=${ACTION} base=${BASE} event=${{ github.event_name }}"
+          date -u +"utc=%Y-%m-%dT%H:%M:%SZ"
+          TZ=Asia/Kolkata date +"ist=%Y-%m-%dT%H:%M:%S%z"
 
           # Free Render may cold-start 30–60s — retry a few times
           attempt() {
@@ -95,10 +124,10 @@ jobs:
               if [ "$method" = "GET" ]; then
                 body=$(curl -sS -m 90 -w "\n%{http_code}" "${HDR[@]}" "${BASE}${path}" || true)
               else
-                body=$(curl -sS -m 90 -w "\n%{http_code}" -X "$method" "${HDR[@]}" -d '{}' "${BASE}${path}" || true)
+                body=$(curl -sS -m 120 -w "\n%{http_code}" -X "$method" "${HDR[@]}" -d '{}' "${BASE}${path}" || true)
               fi
               code=$(echo "$body" | tail -n1)
-              echo "$body" | sed '$d' | head -c 500
+              echo "$body" | sed '$d' | head -c 1200
               echo
               echo "http=${code}"
               if [ "$code" = "200" ]; then
@@ -109,7 +138,7 @@ jobs:
             return 1
           }
 
-          # Warm the free instance before wake/sleep so cold-start does not fail the action.
+          # Warm the free instance before wake/sleep/report so cold-start does not fail.
           case "$ACTION" in
             health) attempt GET  /api/health ;;
             wake)
@@ -119,6 +148,24 @@ jobs:
             sleep)
               attempt GET /api/health || true
               attempt POST /api/session/sleep
+              ;;
+            report_open)
+              # Wake first, wait for WS/REST, then deep health + email
+              attempt GET /api/health || true
+              attempt POST "/api/session/wake?poll_seconds=15" || true
+              sleep 20
+              attempt GET /api/health/deep || true
+              attempt POST "/api/report/open?send_email=true"
+              ;;
+            report_close)
+              # Status email while still live, then optional sleep is separate cron
+              attempt GET /api/health || true
+              attempt GET /api/health/deep || true
+              attempt POST "/api/report/close?send_email=true"
+              ;;
+            dhan_renew)
+              attempt GET /api/health || true
+              attempt POST "/api/cron/dhan-renew?force=false"
               ;;
             *) echo "unknown action"; exit 1 ;;
           esac

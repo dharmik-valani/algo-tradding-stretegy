@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime
+from datetime import datetime, time as time_cls
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -1088,9 +1088,14 @@ class PaperSession:
                 continue
             try:
                 fill_px = None
-                ts = utcnow()
+                p = {**getattr(runner.strategy, "default_params", lambda: {})(), **(runner.strategy.params or {})}
+                flat_raw = str(p.get("flatten_at") or "15:00").strip() or "15:00"
+                try:
+                    hh, mm = [int(x) for x in flat_raw.split(":")[:2]]
+                except Exception:
+                    hh, mm = 15, 0
+                exit_ts = datetime.combine(datetime.now(IST).date(), time_cls(hh, mm), tzinfo=IST)
                 if runner.asset_kind == "option":
-                    p = runner.strategy.params
                     bar, st = quotes.option_premium_bar(
                         runner.symbol,
                         option_type=str(p.get("option_type", "CE")),
@@ -1100,9 +1105,8 @@ class PaperSession:
                     )
                     runner.option_state = st
                     fill_px = float(bar.close)
-                    ts = bar.timestamp
                 else:
-                    fill_px, ts, _ = quotes.get_ltp(
+                    fill_px, _ts, _ = quotes.get_ltp(
                         runner.symbol, allow_rest=True, wait_ws_sec=0.5, max_stale_sec=600
                     )
                 if fill_px is None:
@@ -1115,12 +1119,14 @@ class PaperSession:
                     side=side,
                     quantity=abs(pos_qty),
                     last_price=float(fill_px),
-                    ts=ts,
+                    ts=exit_ts,
                 )
                 if hasattr(runner.strategy, "_in_trade"):
                     runner.strategy._in_trade = False  # type: ignore[attr-defined]
                 runner.last_signal = "EOD_FLAT"
-                runner._log(f"EOD flatten @ session sleep @ {float(fill_px):.2f}")
+                runner._log(
+                    f"EOD flatten @ session sleep ({flat_raw} IST) @ {float(fill_px):.2f}"
+                )
             except Exception:
                 continue
 

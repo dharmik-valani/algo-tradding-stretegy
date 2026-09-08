@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=desk18" />
+  <link rel="stylesheet" href="/static/styles.css?v=desk31" />
 </head>
 <body>
   <div class="app">
@@ -24,7 +24,11 @@
         </div>
       </div>
       <nav class="nav" id="nav">
-        <button type="button" class="nav-item active" data-view="execute">
+        <button type="button" class="nav-item active" data-view="analytics">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V5"/><path d="M4 19h16"/><path d="M8 16v-5"/><path d="M12 16V8"/><path d="M16 16v-3"/></svg>
+          <span>Analytics</span>
+        </button>
+        <button type="button" class="nav-item" data-view="execute">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="m10 8 6 4-6 4z"/></svg>
           <span>Execute</span>
         </button>
@@ -45,8 +49,8 @@
 
     <header class="topbar">
       <div class="topbar-copy">
-        <h1 id="viewTitle">Execute</h1>
-        <p class="subtitle" id="viewSubtitle">Day capital, live strategies, and paper fills</p>
+        <h1 id="viewTitle">Analytics</h1>
+        <p class="subtitle" id="viewSubtitle">Day / week / month and strategy performance</p>
       </div>
       <div class="top-actions">
         <button id="btnStart" class="primary">Start</button>
@@ -57,9 +61,134 @@
     <div class="main">
       <p class="msg" id="sessionMsg">Loading…</p>
 
-      <section class="view" id="view-analytics" data-view="analytics" hidden aria-hidden="true"></section>
+      <section class="view active" id="view-analytics" data-view="analytics">
+        <div class="panel filter-bar compact-panel">
+          <div class="panel-head">
+            <h2>Filters</h2>
+            <div class="actions">
+              <button type="button" id="btnRefreshAnalytics" class="ghost">Refresh</button>
+            </div>
+          </div>
+          <div class="filter-toolbar">
+            <div class="row filter-dates">
+              <label>From
+                <input id="anFrom" type="date" />
+              </label>
+              <label>To
+                <input id="anTo" type="date" />
+              </label>
+              <label>Strategy
+                <select id="anStrategy">
+                  <option value="">All strategies</option>
+                </select>
+              </label>
+            </div>
+            <div class="report-presets" role="group" aria-label="Analytics range presets">
+              <button type="button" class="ghost" data-an-range="today">Today</button>
+              <button type="button" class="ghost" data-an-range="week">Week</button>
+              <button type="button" class="ghost" data-an-range="7d">7d</button>
+              <button type="button" class="ghost" data-an-range="month">Month</button>
+              <button type="button" class="ghost" data-an-range="all">All</button>
+            </div>
+          </div>
+          <p class="hint tight">Journal stats · strategy ranked by net PnL · capital = desk starting cash</p>
+        </div>
 
-      <section class="view active" id="view-execute" data-view="execute">
+        <div class="kpi-board compact-kpis dense-kpis" id="analyticsKpiBoard">
+          <div class="metric hero"><span>Invested capital</span><strong id="anInvested">—</strong></div>
+          <div class="metric hero"><span>Generated (equity)</span><strong id="anGenerated">—</strong></div>
+          <div class="metric hero"><span>Net PnL</span><strong id="anNet">—</strong></div>
+          <div class="metric"><span>Win rate</span><strong id="anWinRate">—</strong></div>
+          <div class="metric"><span>Profit factor</span><strong id="anPf">—</strong></div>
+          <div class="metric"><span>Expectancy</span><strong id="anExpectancy">—</strong></div>
+          <div class="metric"><span>Avg win</span><strong id="anAvgWin" class="pos">—</strong></div>
+          <div class="metric"><span>Avg loss</span><strong id="anAvgLoss" class="neg">—</strong></div>
+          <div class="metric"><span>Avg trade</span><strong id="anAvgTrade">—</strong></div>
+          <div class="metric"><span>Largest win</span><strong id="anMaxWin" class="pos">—</strong></div>
+          <div class="metric"><span>Largest loss</span><strong id="anMaxLoss" class="neg">—</strong></div>
+          <div class="metric"><span>Stored trades</span><strong id="anStored">0</strong></div>
+          <div class="metric"><span>Closed / open</span><strong id="anClosedOpen">0 / 0</strong></div>
+          <div class="metric"><span>Wins / losses</span><strong id="anWinLoss">0 / 0</strong></div>
+          <div class="metric"><span>Live session WR</span><strong id="anLiveWr">—</strong><em class="metric-note">in-memory</em></div>
+        </div>
+
+        <div class="panel compact-panel">
+          <div class="panel-head">
+            <h2>Strategy-wise (top → down)</h2>
+            <span class="count-pill" id="anStratCount">0</span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table dense cards-on-mobile">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Strategy</th>
+                  <th>Trades</th>
+                  <th>Win rate</th>
+                  <th>Avg win</th>
+                  <th>Avg loss</th>
+                  <th>PF</th>
+                  <th>Net PnL</th>
+                </tr>
+              </thead>
+              <tbody id="anStrategyBody">
+                <tr><td colspan="8" class="empty-cell">No closed trades in this range.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel compact-panel">
+          <div class="panel-head">
+            <h2>Daily report</h2>
+            <span class="count-pill" id="anDayCount">0</span>
+          </div>
+          <div class="table-wrap">
+            <table class="data-table dense cards-on-mobile">
+              <thead>
+                <tr>
+                  <th>Date</th>
+                  <th>Trades</th>
+                  <th>Closed</th>
+                  <th>Win rate</th>
+                  <th>Avg win</th>
+                  <th>Avg loss</th>
+                  <th>Net PnL</th>
+                  <th>Symbols</th>
+                </tr>
+              </thead>
+              <tbody id="anDailyBody">
+                <tr><td colspan="8" class="empty-cell">No daily data yet.</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        <div class="panel accent-panel compact-panel">
+          <div class="panel-head">
+            <h2>Quick add</h2>
+            <button id="btnOrbPair" class="primary">Add Call + Put ORB</button>
+          </div>
+        </div>
+
+        <div class="panel compact-panel">
+          <div class="panel-head">
+            <h2>P&amp;L calendar</h2>
+            <div class="actions cal-nav">
+              <button type="button" id="calPrev" class="ghost" aria-label="Previous month">←</button>
+              <strong id="calLabel">—</strong>
+              <button type="button" id="calNext" class="ghost" aria-label="Next month">→</button>
+            </div>
+          </div>
+          <div class="cal-weekdays">
+            <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+          </div>
+          <div id="calGrid" class="cal-grid"></div>
+          <p class="hint tight">Month net: <strong id="calMonthPnl">—</strong></p>
+        </div>
+      </section>
+
+      <section class="view" id="view-execute" data-view="execute">
         <div class="kpi-board compact-kpis" id="execDayKpis">
           <div class="metric hero">
             <span>Invested today</span>
@@ -83,16 +212,16 @@
             <em class="metric-note">enabled / on desk</em>
           </div>
         </div>
-        <div class="panel exec-panel">
+        <div class="panel exec-panel compact-panel">
           <div class="panel-head">
             <h2>On desk</h2>
             <span class="count-pill" id="deskCount">0</span>
           </div>
-          <p class="hint">Market day ~09:15–15:30 IST. Baskets REST-scan at <strong>09:30</strong> (or on Start if later), then WebSocket tracks selected names only. All intraday strategies flatten by <strong>15:00 IST</strong>. History → Reports (times in IST).</p>
+          <p class="hint tight">09:15–15:30 IST · scan 09:30 · flatten 15:00 · history in Reports</p>
           <div id="execDeskList" class="exec-desk-list"></div>
         </div>
 
-        <div class="panel registry-panel">
+        <div class="panel registry-panel compact-panel">
           <div class="panel-head">
             <h2>Add strategy</h2>
             <div class="panel-head-actions">
@@ -100,7 +229,7 @@
               <button type="button" id="btnOrbPair2" class="ghost">Add Call + Put ORB</button>
             </div>
           </div>
-          <p class="hint">Use opens configure. Quick add puts defaults on the desk immediately.</p>
+          <p class="hint tight">Open = configure · Quick add = defaults on desk</p>
           <div id="registryCards" class="registry-grid"></div>
         </div>
       </section>
@@ -115,59 +244,82 @@
           <div class="metric"><span>Net PnL</span><strong id="rpNet">—</strong></div>
         </div>
 
-        <div class="panel">
+        <div class="panel filter-bar compact-panel">
           <div class="panel-head">
             <h2>Filters &amp; export</h2>
             <div class="actions export-actions">
-              <button id="btnRefreshReports" class="ghost">Refresh</button>
-              <a id="btnExportCsv" class="button-link ghost" href="/api/reports/export.csv">CSV trades</a>
-              <a id="btnExportCsvFull" class="button-link primary" href="/api/reports/export.csv?kind=full">CSV full report</a>
-              <a id="btnExportPdf" class="button-link primary" href="/api/reports/export.pdf" target="_blank" rel="noopener">PDF / Print</a>
+              <button type="button" id="btnRefreshReports" class="ghost">Refresh</button>
+              <a id="btnExportCsv" class="button-link primary" href="/api/reports/export.csv">Download CSV</a>
+              <a id="btnExportPdf" class="button-link ghost" href="/api/reports/export.pdf" target="_blank" rel="noopener">PDF</a>
             </div>
           </div>
-          <div class="row">
-            <label>From
-              <input id="rpFrom" type="date" />
-            </label>
-            <label>To
-              <input id="rpTo" type="date" />
-            </label>
-            <label>Strategy id
-              <input id="rpStrategy" type="text" placeholder="e.g. nifty500_gainer_orb" />
-            </label>
+          <div class="filter-toolbar">
+            <div class="row filter-dates filter-dates-4">
+              <label>From
+                <input id="rpFrom" type="date" />
+              </label>
+              <label>To
+                <input id="rpTo" type="date" />
+              </label>
+              <label>Strategy
+                <select id="rpStrategy">
+                  <option value="">All strategies</option>
+                </select>
+              </label>
+              <label>Report type
+                <select id="rpReportType">
+                  <option value="trades">Trade journal</option>
+                  <option value="strategy">Strategy report</option>
+                  <option value="daily">Daily report</option>
+                  <option value="basket">Basket selections</option>
+                  <option value="full">Full report</option>
+                </select>
+              </label>
+            </div>
+            <div class="report-presets" role="group" aria-label="Date range presets">
+              <button type="button" class="ghost" data-range="today">Today</button>
+              <button type="button" class="ghost" data-range="week">Week</button>
+              <button type="button" class="ghost" data-range="7d">7d</button>
+              <button type="button" class="ghost" data-range="month">Month</button>
+              <button type="button" class="ghost" data-range="all">All</button>
+            </div>
           </div>
-          <div class="report-presets" role="group" aria-label="Date range presets">
-            <button type="button" class="ghost" data-range="today">Today</button>
-            <button type="button" class="ghost" data-range="week">This week</button>
-            <button type="button" class="ghost" data-range="7d">Last 7 days</button>
-            <button type="button" class="ghost" data-range="month">This month</button>
-            <button type="button" class="ghost" data-range="all">All time</button>
-          </div>
-          <p class="hint">Day flow: wake → wait for <strong>scan_at 09:30</strong> (or Start later) → REST basket → WebSocket selected only → flatten <strong>15:00 IST</strong> → sleep ~15:45. Next day Execute resets; Reports keep history (all clocks IST).</p>
-          <p class="hint">Exports respect From / To / Strategy filters. <strong>CSV full</strong> = summary + by strategy + day-wise + trades. <strong>PDF / Print</strong> = printable day/strategy report.</p>
-          <p class="hint">Use Supabase Postgres on Render so day / week / month reports survive free-tier sleeps.</p>
+          <p class="hint tight">CSV / PDF follow Strategy + Report type · times IST</p>
         </div>
 
-        <div class="panel">
+        <div class="panel compact-panel" id="rpPanelStrategy" hidden>
           <div class="panel-head">
-            <h2>P&amp;L calendar</h2>
-            <div class="actions cal-nav">
-              <button id="calPrev" class="ghost" aria-label="Previous month">←</button>
-              <strong id="calLabel">—</strong>
-              <button id="calNext" class="ghost" aria-label="Next month">→</button>
-            </div>
+            <h2>Strategy report</h2>
+            <span class="count-pill" id="rpStratCount">0</span>
           </div>
-          <div class="cal-weekdays">
-            <span>Mon</span><span>Tue</span><span>Wed</span><span>Thu</span><span>Fri</span><span>Sat</span><span>Sun</span>
+          <div class="table-wrap">
+            <table class="data-table dense cards-on-mobile">
+              <thead>
+                <tr>
+                  <th>#</th>
+                  <th>Strategy</th>
+                  <th>Trades</th>
+                  <th>Win rate</th>
+                  <th>Avg win</th>
+                  <th>Avg loss</th>
+                  <th>PF</th>
+                  <th>Net PnL</th>
+                </tr>
+              </thead>
+              <tbody id="reportStrategyBody">
+                <tr><td colspan="8" class="empty-cell">No strategy data yet.</td></tr>
+              </tbody>
+            </table>
           </div>
-          <div id="calGrid" class="cal-grid"></div>
-          <p class="hint">Month net: <strong id="calMonthPnl">—</strong></p>
         </div>
 
-        <div class="panel">
-          <h2>Daily report</h2>
+        <div class="panel compact-panel" id="rpPanelDaily" hidden>
+          <div class="panel-head">
+            <h2>Daily report</h2>
+            <span class="count-pill" id="rpDayCount">0</span>
+          </div>
           <div class="table-wrap">
-            <table class="data-table cards-on-mobile">
+            <table class="data-table dense cards-on-mobile">
               <thead>
                 <tr>
                   <th>Date</th>
@@ -185,10 +337,16 @@
           </div>
         </div>
 
-        <div class="panel">
-          <h2>Trade journal</h2>
+        <div class="panel compact-panel" id="rpPanelTrades">
+          <div class="panel-head">
+            <h2>Trade journal</h2>
+            <div class="panel-head-meta">
+              <span class="count-pill" id="rpTradeCount" title="Total trades in filter">0</span>
+              <span class="meta" id="rpTradeBreakdown">0 trades</span>
+            </div>
+          </div>
           <div class="table-wrap">
-            <table class="data-table cards-on-mobile">
+            <table class="data-table dense cards-on-mobile">
               <thead>
                 <tr>
                   <th>Entry</th>
@@ -196,6 +354,7 @@
                   <th>Strategy</th>
                   <th>Symbol</th>
                   <th>Side</th>
+                  <th>Qty</th>
                   <th>Entry ₹</th>
                   <th>Exit ₹</th>
                   <th>SL / TP</th>
@@ -210,10 +369,14 @@
           </div>
         </div>
 
-        <div class="panel">
-          <h2>Basket selections</h2>
+        <div class="panel compact-panel" id="rpPanelBasket">
+          <div class="panel-head">
+            <h2>Basket selections</h2>
+            <span class="count-pill" id="rpSelCount">0</span>
+          </div>
+          <p class="hint tight">Scan audit — which symbols each basket picked (optional for debugging)</p>
           <div class="table-wrap">
-            <table class="data-table cards-on-mobile">
+            <table class="data-table dense cards-on-mobile">
               <thead>
                 <tr>
                   <th>When</th>
@@ -261,13 +424,25 @@
           <p class="hint" id="dhanStatus">Checking…</p>
           <div class="row">
             <label class="field" style="grid-column:1/-1">Access token
-              <input id="dhanToken" type="password" autocomplete="off" placeholder="Paste fresh token from web.dhan.co" />
+              <input id="dhanToken" type="password" autocomplete="off" placeholder="Paste fresh token from web.dhan.co or Developer Portal" />
+            </label>
+            <label class="field">PIN (6 digit)
+              <input id="dhanPin" type="password" inputmode="numeric" maxlength="6" autocomplete="off" placeholder="DHAN_PIN" />
+            </label>
+            <label class="field">TOTP secret
+              <input id="dhanTotp" type="password" autocomplete="off" placeholder="Base32 from Setup TOTP" />
             </label>
           </div>
-          <p class="hint">Tokens last ~24h. <strong>RenewToken</strong> only works for SELF tokens from web.dhan.co — Developer Portal (PARTNER) tokens must be pasted again each day. Stored in <code>data/dhan_token.json</code> + <code>.env</code>.</p>
+          <p class="hint">
+            <strong>RenewToken</strong> only works for active <strong>SELF</strong> tokens from web.dhan.co — it cannot revive an expired JWT.
+            Developer Portal (<strong>PARTNER</strong>) tokens need a daily paste <em>or</em> PIN + TOTP so we can call <code>generateAccessToken</code> automatically.
+            Secrets are written to <code>.env</code> / <code>data/dhan_token.json</code>.
+          </p>
           <div class="actions">
             <button type="button" id="btnDhanSave" class="primary">Save token</button>
-            <button type="button" id="btnDhanRenew" class="ghost">Renew now</button>
+            <button type="button" id="btnDhanCreds" class="ghost">Save PIN/TOTP</button>
+            <button type="button" id="btnDhanGenerate" class="ghost">Generate via TOTP</button>
+            <button type="button" id="btnDhanRenew" class="ghost">Refresh if near expiry</button>
             <button type="button" id="btnDhanRefresh" class="ghost">Refresh status</button>
           </div>
         </div>
@@ -347,6 +522,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=desk18"></script>
+  <script src="/static/app.js?v=desk31"></script>
 </body>
 </html>

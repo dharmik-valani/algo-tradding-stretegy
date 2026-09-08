@@ -89,6 +89,41 @@ def health() -> dict:
     return out
 
 
+@app.get("/api/health/deep")
+def health_deep(
+    x_cron_secret: str | None = Header(default=None, alias="X-Cron-Secret"),
+) -> dict:
+    """Detailed pre-market / ops check: session, Dhan REST LTP, WebSocket, journal."""
+    _require_cron_secret(x_cron_secret)
+    from algo.paper.health_report import build_deep_health
+
+    return build_deep_health(probe_ltp=True)
+
+
+@app.post("/api/report/open")
+def report_open(
+    send_email: bool = Query(True, description="Send email digest when SMTP is configured"),
+    x_cron_secret: str | None = Header(default=None, alias="X-Cron-Secret"),
+) -> dict:
+    """Pre-market digest: deep health + email to REPORT_EMAIL_TO (default Gmail)."""
+    _require_cron_secret(x_cron_secret)
+    from algo.paper.health_report import run_market_report
+
+    return run_market_report("open", send=send_email)
+
+
+@app.post("/api/report/close")
+def report_close(
+    send_email: bool = Query(True, description="Send email digest when SMTP is configured"),
+    x_cron_secret: str | None = Header(default=None, alias="X-Cron-Secret"),
+) -> dict:
+    """Post-market digest: deep health + email, then caller may sleep the session."""
+    _require_cron_secret(x_cron_secret)
+    from algo.paper.health_report import run_market_report
+
+    return run_market_report("close", send=send_email)
+
+
 @app.post("/api/session/wake")
 def wake_live(
     poll_seconds: float = Query(15.0, ge=5.0, le=120.0),
@@ -100,6 +135,16 @@ def wake_live(
     - If strategies exist and idle: start live paper
     """
     _require_cron_secret(x_cron_secret)
+    renew_info: dict[str, Any] = {}
+    try:
+        from algo.config import get_settings
+        from algo.providers.dhan.auth import TokenRotator, ensure_fresh_token
+
+        ensure_fresh_token(get_settings(), force_renew=False)
+        TokenRotator.instance().start()
+        renew_info = {"token_refresh": "ok"}
+    except Exception as exc:
+        renew_info = {"token_refresh": "skipped", "token_error": str(exc)}
     session = get_session()
     if session.running and session.mode == "live":
         return {
@@ -108,6 +153,7 @@ def wake_live(
             "running": True,
             "strategies": len(session.runners),
             "message": session.message,
+            **renew_info,
         }
     if not session.runners:
         raise HTTPException(
@@ -125,6 +171,39 @@ def wake_live(
         "running": True,
         "strategies": len(session.runners),
         "message": session.message,
+        **renew_info,
+    }
+
+
+@app.post("/api/cron/dhan-renew")
+def cron_dhan_renew(
+    force: bool = Query(False, description="Force RenewToken even if not near expiry"),
+    x_cron_secret: str | None = Header(default=None, alias="X-Cron-Secret"),
+) -> dict:
+    """Server cron: refresh SELF token via RenewToken and persist to Postgres."""
+    _require_cron_secret(x_cron_secret)
+    from algo.config import get_settings
+    from algo.providers.dhan.auth import TokenRotator, dhan_connection_status, ensure_fresh_token
+    from algo.providers.dhan.token_store import resolve_access_token
+
+    settings = get_settings()
+    before = resolve_access_token(settings.dhan_access_token)
+    try:
+        after = ensure_fresh_token(settings, force_renew=force)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    get_settings.cache_clear()
+    TokenRotator.instance().start()
+    status = dhan_connection_status(get_settings())
+    return {
+        "ok": True,
+        "rotated": bool(after and after != before),
+        "storage": status.get("storage"),
+        "consumer_type": status.get("consumer_type"),
+        "seconds_left": status.get("seconds_left"),
+        "renewable": status.get("renewable"),
+        "profile_ok": status.get("ok"),
+        "error": status.get("error"),
     }
 
 
@@ -201,12 +280,17 @@ class DhanTokenBody(BaseModel):
     client_id: str | None = None
 
 
+class DhanCredsBody(BaseModel):
+    pin: str | None = None
+    totp_secret: str | None = None
+
+
 @app.get("/api/dhan/status")
 def dhan_status() -> dict:
     from algo.config import get_settings
     from algo.providers.dhan.auth import TokenRotator, dhan_connection_status
 
-    # Keep RenewToken cycling while the desk UI is open (even before Start live).
+    # Keep RenewToken / TOTP remint cycling while the desk UI is open.
     TokenRotator.instance().start()
     return dhan_connection_status(get_settings())
 
@@ -214,45 +298,132 @@ def dhan_status() -> dict:
 @app.post("/api/dhan/token")
 def dhan_set_token(body: DhanTokenBody) -> dict:
     from algo.config import get_settings
-    from algo.providers.dhan.auth import dhan_connection_status, fetch_profile
-    from algo.providers.dhan.token_store import save_token
+    from algo.providers.dhan.auth import TokenRotator, dhan_connection_status, fetch_profile
+    from algo.providers.dhan.env_sync import upsert_dotenv
+    from algo.providers.dhan.token_store import (
+        jwt_claims,
+        jwt_consumer_type,
+        jwt_expiry,
+        save_token,
+    )
+    import time
 
     settings = get_settings()
     token = body.access_token.strip()
     if not token:
         raise HTTPException(status_code=400, detail="access_token required")
     client_id = (body.client_id or settings.dhan_client_id or "").strip()
+    claims_cid = str(jwt_claims(token).get("dhanClientId") or "").strip()
+    client_id = client_id or claims_cid
     if not client_id:
         raise HTTPException(status_code=400, detail="DHAN_CLIENT_ID missing in .env")
+
+    profile: dict | None = None
+    profile_error: str | None = None
     try:
         profile = fetch_profile(client_id=client_id, access_token=token)
     except Exception as exc:
-        raise HTTPException(status_code=400, detail=f"Token rejected by Dhan: {exc}") from exc
+        profile_error = str(exc)
+        exp = jwt_expiry(token)
+        consumer = jwt_consumer_type(token)
+        # Allow save when JWT looks usable — Dhan sometimes returns DH-906 overnight.
+        if not exp or exp.timestamp() <= time.time():
+            raise HTTPException(status_code=400, detail=f"Token rejected by Dhan: {exc}") from exc
+        if consumer not in {"", "SELF", "PARTNER"}:
+            raise HTTPException(status_code=400, detail=f"Token rejected by Dhan: {exc}") from exc
+
+    cid = str((profile or {}).get("dhanClientId") or client_id)
     save_token(
         access_token=token,
-        client_id=str(profile.get("dhanClientId") or client_id),
-        expiry_time=str(profile.get("tokenValidity") or "") or None,
-        source="ui",
+        client_id=cid,
+        expiry_time=str((profile or {}).get("tokenValidity") or "") or None,
+        source="ui" if profile else "ui-unverified",
     )
     settings.dhan_access_token = token
+    settings.dhan_client_id = cid
+    try:
+        upsert_dotenv({"DHAN_ACCESS_TOKEN": token, "DHAN_CLIENT_ID": cid})
+    except Exception:
+        pass
     get_settings.cache_clear()
-    from algo.providers.dhan.auth import TokenRotator
-
     TokenRotator.instance().start()
-    return dhan_connection_status(get_settings())
+    status = dhan_connection_status(get_settings())
+    if profile_error:
+        status["warning"] = (
+            f"Saved to DB anyway (storage={status.get('storage')}), but Dhan profile failed: {profile_error}"
+        )
+    return status
+
+
+@app.post("/api/dhan/credentials")
+def dhan_set_credentials(body: DhanCredsBody) -> dict:
+    """Store PIN + TOTP secret for generateAccessToken auto-remint."""
+    from algo.config import get_settings
+    from algo.providers.dhan.auth import TokenRotator, dhan_connection_status, totp_configured
+    from algo.providers.dhan.env_sync import upsert_dotenv
+
+    settings = get_settings()
+    updates: dict[str, str] = {}
+    if body.pin is not None:
+        pin = body.pin.strip()
+        if pin and (not pin.isdigit() or len(pin) != 6):
+            raise HTTPException(status_code=400, detail="PIN must be a 6-digit numeric code")
+        updates["DHAN_PIN"] = pin
+        settings.dhan_pin = pin
+    if body.totp_secret is not None:
+        secret = body.totp_secret.replace(" ", "").strip().upper()
+        updates["DHAN_TOTP_SECRET"] = secret
+        settings.dhan_totp_secret = secret
+    if not updates:
+        raise HTTPException(status_code=400, detail="Provide pin and/or totp_secret")
+    try:
+        upsert_dotenv(updates)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not write .env: {exc}") from exc
+    get_settings.cache_clear()
+    TokenRotator.instance().start()
+    status = dhan_connection_status(get_settings())
+    status["saved_keys"] = list(updates.keys())
+    status["totp_configured"] = totp_configured(get_settings())
+    return status
 
 
 @app.post("/api/dhan/renew")
 def dhan_renew() -> dict:
+    """Refresh when near expiry (safe). Early RenewToken is refused — it burns the JWT."""
     from algo.config import get_settings
-    from algo.providers.dhan.auth import dhan_connection_status, ensure_fresh_token
+    from algo.providers.dhan.auth import TokenRotator, dhan_connection_status, ensure_fresh_token
 
     settings = get_settings()
     try:
+        # force_renew=True still refuses if >12h remain (see ensure_fresh_token).
         ensure_fresh_token(settings, force_renew=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     get_settings.cache_clear()
+    TokenRotator.instance().start()
+    return dhan_connection_status(get_settings())
+
+
+@app.post("/api/dhan/generate")
+def dhan_generate() -> dict:
+    """Always mint via PIN+TOTP (generateAccessToken), ignoring RenewToken."""
+    from algo.config import get_settings
+    from algo.providers.dhan.auth import (
+        TokenRotator,
+        apply_auth_payload,
+        dhan_connection_status,
+        regenerate_via_totp,
+    )
+
+    settings = get_settings()
+    try:
+        payload = regenerate_via_totp(settings)
+        apply_auth_payload(settings, payload, source="totp")
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    get_settings.cache_clear()
+    TokenRotator.instance().start()
     return dhan_connection_status(get_settings())
 
 
@@ -274,6 +445,70 @@ def session_state() -> dict:
 @app.get("/api/analytics")
 def analytics() -> dict:
     return get_session().analytics()
+
+
+@app.get("/api/analytics/board")
+def analytics_board(
+    from_date: str | None = None,
+    to_date: str | None = None,
+    strategy_id: str | None = None,
+) -> dict:
+    """Journal-backed analytics for day/week/month + strategy filters."""
+    from algo.paper.journal import daily_report, report_summary
+
+    summary = report_summary(
+        from_date=from_date or None,
+        to_date=to_date or None,
+        strategy_id=strategy_id or None,
+    )
+    daily = daily_report(
+        from_date=from_date or None,
+        to_date=to_date or None,
+        strategy_id=strategy_id or None,
+    )
+    # Ranked list for the date range (all strategies) so the dropdown stays top→down
+    # even while a single strategy filter is active.
+    strategy_rank = (
+        summary.get("by_strategy")
+        if not strategy_id
+        else report_summary(
+            from_date=from_date or None,
+            to_date=to_date or None,
+            strategy_id=None,
+        ).get("by_strategy")
+    )
+    session = get_session()
+    snap = session.snapshot()
+    strategies = list(snap.strategies or [])
+    if strategy_id:
+        strategies = [s for s in strategies if s.strategy_id == strategy_id]
+    invested = round(sum(float(s.starting_cash or 0) for s in strategies), 2)
+    generated = round(invested + float(summary.get("net_pnl") or 0), 2)
+    live = session.analytics()
+    overall = live.get("overall") or {}
+    return {
+        "ok": True,
+        "summary": summary,
+        "daily": daily,
+        "strategy_rank": strategy_rank or [],
+        "capital": {
+            "invested": invested,
+            "generated": generated,
+            "net_pnl": float(summary.get("net_pnl") or 0),
+            "strategies_in_filter": len(strategies),
+        },
+        "live": {
+            "running": live.get("running"),
+            "closed_trades": overall.get("trades") or overall.get("closed_trades"),
+            "realized_pnl": overall.get("net_pnl") or overall.get("realized_pnl"),
+            "win_rate": overall.get("win_rate"),
+            "profit_factor": overall.get("profit_factor"),
+            "desk_strategies": len(live.get("strategies") or []),
+        },
+        "from_date": from_date,
+        "to_date": to_date,
+        "strategy_id": strategy_id,
+    }
 
 
 @app.get("/api/feed")
@@ -437,8 +672,19 @@ def reports_trades(
 
 
 @app.get("/api/reports/selections")
-def reports_selections(session_id: str | None = None) -> dict:
-    rows = list_selections(session_id=session_id, limit=500)
+def reports_selections(
+    session_id: str | None = None,
+    strategy_id: str | None = None,
+    from_date: str | None = None,
+    to_date: str | None = None,
+) -> dict:
+    rows = list_selections(
+        session_id=session_id,
+        strategy_id=strategy_id or None,
+        from_date=from_date or None,
+        to_date=to_date or None,
+        limit=500,
+    )
     return {"selections": rows, "count": len(rows)}
 
 
@@ -464,9 +710,14 @@ def reports_daily(
 def reports_calendar(
     year: int | None = None,
     month: int | None = None,
+    strategy_id: str | None = None,
 ) -> dict:
     now = datetime.now()
-    return calendar_pnl(year=year or now.year, month=month or now.month)
+    return calendar_pnl(
+        year=year or now.year,
+        month=month or now.month,
+        strategy_id=strategy_id or None,
+    )
 
 
 @app.get("/api/reports/export.csv")
@@ -476,10 +727,22 @@ def reports_export_csv(
     strategy_id: str | None = Query(None),
     kind: str | None = Query("trades"),
 ) -> Response:
-    """CSV export. kind=trades (default) or full (summary + day + strategy + trades)."""
-    if (kind or "trades").lower() == "full":
+    """CSV export. kind=trades|strategy|daily|basket|full."""
+    from algo.paper.journal import daily_report_csv, selections_csv, strategy_report_csv
+
+    k = (kind or "trades").lower().strip()
+    if k in {"full", "all"}:
         csv_text = full_report_csv(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
         filename = "paper_report_full.csv"
+    elif k in {"strategy", "strategies"}:
+        csv_text = strategy_report_csv(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+        filename = "paper_strategy_report.csv"
+    elif k in {"daily", "day"}:
+        csv_text = daily_report_csv(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+        filename = "paper_daily_report.csv"
+    elif k in {"basket", "selections", "selection"}:
+        csv_text = selections_csv(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+        filename = "paper_basket_selections.csv"
     else:
         csv_text = trades_csv(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
         filename = "paper_trades.csv"

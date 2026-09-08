@@ -95,6 +95,8 @@ class BasketRunner:
         orders = []
         legs = []
         cash = self.cash_pool
+        n_sel = max(len(self.selected) or len(self.brokers) or 1, 1)
+        per_leg_cash = float(self.starting_cash) / n_sel
         for sym, broker in self.brokers.items():
             hist = self.histories.get(sym) or []
             px = hist[-1].close if hist else None
@@ -107,26 +109,42 @@ class BasketRunner:
             pos = broker.position
             leg = (getattr(self.strategy, "_legs", {}) or {}).get(sym, {})
             status = self._leg_status(sym, leg, px)
+            closed = list(getattr(broker, "closed_trades", []) or [])
+            last_closed = closed[-1] if closed else None
+            in_trade = bool(leg.get("in_trade")) and not self._desk_settled
+            # After settle / when flat: do not surface stale LTPs on the desk.
+            show_px = None if (self._desk_settled or not in_trade) else px
             legs.append(
                 {
                     "symbol": sym,
-                    "qty": pos.quantity,
-                    "avg": pos.avg_price,
-                    "last": px,
-                    "realized": broker.realized_pnl,
-                    "unrealized": broker.unrealized_pnl(px),
-                    "stop": leg.get("stop"),
-                    "target": leg.get("target"),
-                    "in_trade": bool(leg.get("in_trade")),
+                    "qty": 0 if self._desk_settled else pos.quantity,
+                    "avg": pos.avg_price if in_trade else None,
+                    "last": show_px,
+                    "realized": 0.0 if self._desk_settled else broker.realized_pnl,
+                    "unrealized": 0.0 if self._desk_settled else broker.unrealized_pnl(px),
+                    "stop": leg.get("stop") if in_trade else None,
+                    "target": leg.get("target") if in_trade else None,
+                    "in_trade": in_trade,
                     "range_high": leg.get("range_high"),
                     "range_low": leg.get("range_low"),
                     "range_done": bool(leg.get("range_done")),
                     "trades_today": int(leg.get("trades_today") or 0),
                     "side": leg.get("side"),
                     "reject_reason": leg.get("reject_reason"),
-                    "status": status,
+                    "status": "settled" if self._desk_settled else status,
+                    "capital": round(per_leg_cash, 2),
+                    "entry": (pos.avg_price if in_trade else (last_closed or {}).get("entry")),
+                    "exit": None if in_trade else (last_closed or {}).get("exit"),
+                    "leg_pnl": (
+                        float(broker.unrealized_pnl(px))
+                        if in_trade
+                        else (0.0 if self._desk_settled else float((last_closed or {}).get("pnl") or broker.realized_pnl or 0))
+                    ),
+                    "last_closed": last_closed,
                 }
             )
+        if self._desk_settled:
+            last_px = None
         # Aggregate cash = starting − deployed notionals approx: sum of broker cashes / n
         if self.brokers:
             cash = sum(b.cash for b in self.brokers.values())
@@ -186,6 +204,10 @@ class BasketRunner:
         if self._desk_settled:
             st.note = f"settled · day PnL ₹{float(self._day_pnl or 0):,.0f}"
             st.legs_in_trade = 0
+            st.last_price = None
+            st.entry_price = None
+            st.stop_price = None
+            st.target_price = None
         closed_all: list[dict] = []
         for b in self.brokers.values():
             closed_all.extend(getattr(b, "closed_trades", []) or [])
@@ -418,6 +440,15 @@ class BasketRunner:
             f"Execute row PnL cleared to 0 (journal kept)"
         )
 
+    def _eod_exit_ts(self, flat_raw: str) -> datetime:
+        """Use flatten clock (IST) for journal exit_at — not wall clock if we ran late."""
+        now = datetime.now(IST)
+        try:
+            hh, mm = [int(x) for x in str(flat_raw).split(":")[:2]]
+        except Exception:
+            hh, mm = 15, 0
+        return datetime.combine(now.date(), time_cls(hh, mm), tzinfo=IST)
+
     def _maybe_eod_flatten(self, quotes: LiveQuoteProvider) -> None:
         """Force-close open intraday legs at flatten_at (default 15:00 IST)."""
         p = {**self.strategy.default_params(), **self.strategy.params}
@@ -439,13 +470,18 @@ class BasketRunner:
             for sym, broker in self.brokers.items()
             if broker.position.quantity
         ]
+        # Late wake/sleep must not stamp exits at 17:xx — journal uses flatten clock.
+        exit_ts = self._eod_exit_ts(flat_raw)
         if open_syms:
-            self._log(f"EOD flatten @ {flat_raw} IST — closing {len(open_syms)} open leg(s)")
+            self._log(
+                f"EOD flatten @ {flat_raw} IST — closing {len(open_syms)} open leg(s) "
+                f"(exit_at={exit_ts.strftime('%H:%M:%S')} IST)"
+            )
             from algo.paper.models import Signal
 
             for sym in open_syms:
                 try:
-                    price, ts, _src = quotes.get_ltp(
+                    price, _ts, _src = quotes.get_ltp(
                         sym, allow_rest=True, wait_ws_sec=0.5, max_stale_sec=600
                     )
                 except Exception:
@@ -454,9 +490,14 @@ class BasketRunner:
                 sig = Signal(
                     action=SignalAction.FLAT,
                     reason=f"EOD flatten @ {flat_raw} IST",
-                    meta={"structure": "eod", "fill_price": float(price), "symbol": sym},
+                    meta={
+                        "structure": "eod",
+                        "fill_price": float(price),
+                        "symbol": sym,
+                        "exit_at_policy": exit_ts.isoformat(),
+                    },
                 )
-                self._apply(sym, broker, sig, float(price), ts)
+                self._apply(sym, broker, sig, float(price), exit_ts)
                 leg = (getattr(self.strategy, "_legs", {}) or {}).get(sym)
                 if isinstance(leg, dict):
                     leg["in_trade"] = False
