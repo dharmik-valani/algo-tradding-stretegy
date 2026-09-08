@@ -179,8 +179,8 @@ class NiftyOptionOrbStrategy(Strategy):
             "strike_step": 50,
             "one_trade_per_day": True,
             "entry_start": "",  # optional HH:MM override (default = open + range)
-            "entry_end": "15:15",
-            "flatten_at": "15:20",
+            "entry_end": "15:00",
+            "flatten_at": "15:00",
         }
 
     def param_schema(self) -> list[dict[str, Any]]:
@@ -274,14 +274,14 @@ class NiftyOptionOrbStrategy(Strategy):
                     "label": "No new entries after",
                     "type": "time",
                     "help": "Do not open a new ORB trade after this IST time (still manage open trades).",
-                    "example": "Example: 15:15 — no fresh breakout buys in the last stretch of the day.",
+                    "example": "Example: 15:00 — no fresh breakout buys after square-off time.",
                 },
                 {
                     "key": "flatten_at",
                     "label": "EOD flatten",
                     "type": "time",
                     "help": "Force-close an open premium trade at this IST clock if still held.",
-                    "example": "Example: 15:20 — square off before close.",
+                    "example": "Example: 15:00 — square off by 3:00 PM IST.",
                 },
                 {
                     "key": "one_trade_per_day",

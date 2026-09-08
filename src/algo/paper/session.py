@@ -43,6 +43,17 @@ BASKET_IDS = {
 }
 
 
+def _normalize_strategy_params(params: dict[str, Any] | None) -> dict[str, Any]:
+    """Keep intraday square-off at 15:00 IST (migrate older 15:20 desk saves)."""
+    p = dict(params or {})
+    flat = str(p.get("flatten_at") or "").strip()
+    if flat in {"15:20", "15:25", "15:30"}:
+        p["flatten_at"] = "15:00"
+    if str(p.get("entry_end") or "").strip() == "15:15":
+        p["entry_end"] = "15:00"
+    return p
+
+
 def _parse_iso(value: Any) -> datetime | None:
     if value is None or value == "":
         return None
@@ -335,7 +346,9 @@ class PaperSession:
         instance_id: str | None = None,
     ) -> StrategyState:
         with self._lock:
-            strategy = create_strategy(strategy_id, params=params)
+            strategy = create_strategy(strategy_id, params=_normalize_strategy_params(params))
+            params = dict(strategy.params)
+            strategy.params = _normalize_strategy_params(params)
             params = dict(strategy.params)
             if strategy_id in BASKET_IDS:
                 timeframe = "1m"
@@ -572,7 +585,7 @@ class PaperSession:
                         timeframe=row.get("timeframe") or "5m",
                         quantity=int(row.get("quantity") or 1),
                         starting_cash=float(row.get("starting_cash") or 100_000),
-                        params=row.get("params") or {},
+                        params=_normalize_strategy_params(row.get("params") or {}),
                         enabled=bool(row.get("enabled", True)),
                         asset_kind=row.get("asset_kind"),
                         instance_id=key,
@@ -1064,7 +1077,7 @@ class PaperSession:
                 runner._eod_done_day = None
                 p = {**runner.strategy.default_params(), **runner.strategy.params}
                 if not str(p.get("flatten_at") or "").strip():
-                    runner.strategy.params = {**runner.strategy.params, "flatten_at": "15:20"}
+                    runner.strategy.params = {**runner.strategy.params, "flatten_at": "15:00"}
                 runner._maybe_eod_flatten(quotes)
                 continue
             if getattr(runner.strategy, "id", "") == "zen_credit_spread":
@@ -1477,7 +1490,7 @@ def reset_session() -> PaperSession:
                         timeframe=row.get("timeframe") or "5m",
                         quantity=int(row.get("quantity") or 1),
                         starting_cash=float(row.get("starting_cash") or 100_000),
-                        params=row.get("params") or {},
+                        params=_normalize_strategy_params(row.get("params") or {}),
                         enabled=bool(row.get("enabled", True)),
                         asset_kind=row.get("asset_kind"),
                         instance_id=row.get("instance_id"),

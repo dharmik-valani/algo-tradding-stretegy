@@ -351,6 +351,10 @@ class BasketRunner:
         self._apply(symbol, broker, signal, fill_px, bar.timestamp)
 
     def tick_live(self, quotes: LiveQuoteProvider) -> list[str]:
+        # Migrate older saved flatten_at=15:20 → 15:00 IST
+        flat = str(self.strategy.params.get("flatten_at") or "").strip()
+        if flat in {"15:20", "15:25", "15:30"}:
+            self.strategy.params["flatten_at"] = "15:00"
         self._maybe_roll_trading_day()
         self._maybe_eod_flatten(quotes)
         self.ensure_selection(quotes)
@@ -415,7 +419,7 @@ class BasketRunner:
         )
 
     def _maybe_eod_flatten(self, quotes: LiveQuoteProvider) -> None:
-        """Force-close open intraday legs at flatten_at (default 15:20 IST)."""
+        """Force-close open intraday legs at flatten_at (default 15:00 IST)."""
         p = {**self.strategy.default_params(), **self.strategy.params}
         flat_raw = str(p.get("flatten_at") or "").strip()
         if not flat_raw:

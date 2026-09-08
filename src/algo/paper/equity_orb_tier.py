@@ -83,7 +83,7 @@ class _EquityOrbTierBase(Strategy):
             "risk_reward_2": 3.0,
             "partial_at_r1_pct": 50.0,
             "entry_end": "15:00",
-            "flatten_at": "15:20",
+            "flatten_at": "15:00",
             "scan_size": 120,
             "universe": "",
             "max_price": 1500.0,
@@ -235,7 +235,7 @@ class _EquityOrbTierBase(Strategy):
                 "label": "EOD flatten",
                 "type": "time",
                 "help": "Force-close open legs at this IST clock (journal kept; desk resets next day).",
-                "example": "15:20",
+                "example": "15:00",
             },
             {
                 "key": "one_trade_per_symbol",

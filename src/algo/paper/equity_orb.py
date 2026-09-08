@@ -32,7 +32,7 @@ class _EquityOrbBase(Strategy):
             "risk_reward": 3.0,
             "open_eq_tol_pct": 0.05,
             "entry_end": "15:00",
-            "flatten_at": "15:20",
+            "flatten_at": "15:00",
             "scan_size": 80,
             "universe": "",
             "one_trade_per_symbol": True,
@@ -137,7 +137,7 @@ class _EquityOrbBase(Strategy):
                 "label": "EOD flatten",
                 "type": "time",
                 "help": "Force-close any still-open paper legs at this IST clock (journal history kept).",
-                "example": "Example: 15:20 — square off before close; desk PnL resets next morning.",
+                "example": "Example: 15:00 — square off by 3:00 PM IST; desk PnL resets next morning.",
             },
             {
                 "key": "scan_size",

@@ -4,6 +4,7 @@ import json
 import logging
 import uuid
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any
 
 from algo.config import Settings, get_settings
@@ -335,12 +336,47 @@ def report_summary(
     }
 
 
-def _trade_day(t: dict[str, Any]) -> str | None:
-    """Prefer exit day for closed PnL; else entry day (IST-ish from ISO)."""
-    raw = t.get("exit_at") or t.get("entry_at")
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def _as_ist(dt: datetime | None) -> datetime | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST)
+
+
+def _fmt_ist(dt: datetime | None) -> str:
+    local = _as_ist(dt)
+    if local is None:
+        return ""
+    return local.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _parse_iso_dt(raw: str | None) -> datetime | None:
     if not raw:
         return None
-    return str(raw)[:10]
+    try:
+        text = str(raw).strip().replace("Z", "+00:00")
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except Exception:
+        return None
+
+
+def _trade_day(t: dict[str, Any]) -> str | None:
+    """Prefer exit day for closed PnL; else entry day — always Asia/Kolkata."""
+    raw = t.get("exit_at") or t.get("entry_at")
+    dt = _parse_iso_dt(raw) if isinstance(raw, str) else None
+    if dt is None and hasattr(raw, "tzinfo"):
+        dt = raw  # type: ignore[assignment]
+    local = _as_ist(dt) if isinstance(dt, datetime) else None
+    if local is None:
+        return str(raw)[:10] if raw else None
+    return local.strftime("%Y-%m-%d")
 
 
 def daily_report(
@@ -459,6 +495,8 @@ def trades_csv(
             continue
         row = dict(t)
         row["trade_day"] = day or ""
+        row["entry_at"] = _fmt_ist(_parse_iso_dt(t.get("entry_at"))) or (t.get("entry_at") or "")
+        row["exit_at"] = _fmt_ist(_parse_iso_dt(t.get("exit_at"))) or (t.get("exit_at") or "")
         w.writerow(row)
     return out.getvalue()
 
@@ -489,7 +527,7 @@ def full_report_csv(
     w = csv.writer(out)
 
     w.writerow(["PAPER DESK REPORT"])
-    w.writerow(["Generated (UTC)", datetime.now(timezone.utc).isoformat()])
+    w.writerow(["Generated (IST)", datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")])
     w.writerow(["From", from_date or "all"])
     w.writerow(["To", to_date or "all"])
     w.writerow(["Strategy filter", strategy_id or "all"])
@@ -582,8 +620,8 @@ def full_report_csv(
                 t.get("exit_price"),
                 t.get("stop_price"),
                 t.get("target_price"),
-                t.get("entry_at"),
-                t.get("exit_at"),
+                _fmt_ist(_parse_iso_dt(t.get("entry_at"))) or (t.get("entry_at") or ""),
+                _fmt_ist(_parse_iso_dt(t.get("exit_at"))) or (t.get("exit_at") or ""),
                 t.get("realized_pnl"),
                 t.get("fees"),
                 t.get("exit_reason"),
@@ -686,7 +724,7 @@ def full_report_html(
     <button type="button" onclick="window.print()">Print / Save as PDF</button>
   </div>
   <h1>Paper Desk — Trading Report</h1>
-  <p class="meta">Period: {escape(period)} · Filter: {escape(filt)} · Generated: {escape(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))}</p>
+  <p class="meta">Period: {escape(period)} · Filter: {escape(filt)} · Generated: {escape(datetime.now(IST).strftime("%Y-%m-%d %H:%M IST"))} · Times Asia/Kolkata</p>
   <div class="kpis">
     <div class="kpi"><span>Trades</span><strong>{summary.get("trades", 0)}</strong></div>
     <div class="kpi"><span>Closed</span><strong>{summary.get("closed", 0)}</strong></div>

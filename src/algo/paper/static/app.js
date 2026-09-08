@@ -22,6 +22,33 @@ function money(n) {
   return Number(n).toLocaleString("en-IN", { maximumFractionDigits: 2 });
 }
 
+/** Format ISO timestamps as Asia/Kolkata (IST) for the whole UI. */
+function formatIst(iso, withSeconds = true) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) {
+    return String(iso).replace("T", " ").replace(/\+.*$/, "").slice(0, 19);
+  }
+  const opts = {
+    timeZone: "Asia/Kolkata",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  };
+  if (withSeconds) opts.second = "2-digit";
+  // en-GB → DD/MM/YYYY; rebuild as YYYY-MM-DD HH:mm:ss for journal readability
+  const parts = new Intl.DateTimeFormat("en-GB", opts).formatToParts(d);
+  const get = (t) => parts.find((p) => p.type === t)?.value || "";
+  const date = `${get("year")}-${get("month")}-${get("day")}`;
+  const time = withSeconds
+    ? `${get("hour")}:${get("minute")}:${get("second")}`
+    : `${get("hour")}:${get("minute")}`;
+  return `${date} ${time}`;
+}
+
 function pct(n) {
   if (n == null || Number.isNaN(n)) return "—";
   return `${Number(n).toFixed(1)}%`;
@@ -533,7 +560,7 @@ function renderExecStats(session) {
     <p class="hint desk-legend">
       <strong>Capital</strong> = paper cash assigned (e.g. ₹5L).
       <strong>Generated</strong> = capital + day PnL.
-      After <strong>15:20</strong> settle, row PnL shows day result then clears to 0; Reports keep history.
+      After <strong>15:00 IST</strong> settle, row PnL shows day result then clears to 0; Reports keep history.
     </p>
     <div class="table-wrap desk-table-wrap">
       <table class="data-table dense cards-on-mobile" id="execStatsTable">
@@ -943,8 +970,8 @@ async function refreshReports() {
     const list = trades.trades || [];
     tbody.innerHTML = list.length
       ? list.slice(0, 150).map((t) => {
-          const entry = (t.entry_at || "").replace("T", " ").slice(0, 19);
-          const exit = (t.exit_at || "").replace("T", " ").slice(0, 19) || "—";
+          const entry = formatIst(t.entry_at);
+          const exit = t.exit_at ? formatIst(t.exit_at) : "—";
           return `<tr>
             <td data-label="Entry">${entry}</td>
             <td data-label="Exit">${exit}</td>
@@ -962,7 +989,7 @@ async function refreshReports() {
     const selsList = sels.selections || [];
     sbody.innerHTML = selsList.length
       ? selsList.slice(0, 100).map((r) => {
-          const when = (r.selected_at || "").replace("T", " ").slice(0, 19);
+          const when = formatIst(r.selected_at);
           return `<tr>
             <td data-label="When">${when}</td>
             <td data-label="Strategy">${r.strategy_id}</td>
