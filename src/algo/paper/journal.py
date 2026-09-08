@@ -22,6 +22,17 @@ def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _sync_serial_pk(db, *, table: str, seq: str) -> None:
+    """Keep Postgres serial sequences ahead of MAX(id) (SQLite→PG drift)."""
+    from sqlalchemy import text
+
+    try:
+        mx = int(db.execute(text(f"select coalesce(max(id), 0) from {table}")).scalar() or 0)
+        db.execute(text("select setval(:s, :m, true)"), {"s": seq, "m": max(mx, 1)})
+    except Exception as exc:
+        logger.warning("serial sync failed for %s/%s: %s", table, seq, exc)
+
+
 def ensure_paper_tables(settings: Settings | None = None) -> None:
     get_engine(settings or get_settings())
 
@@ -66,6 +77,7 @@ def record_selections(
     now = _utcnow()
     try:
         with session_scope() as db:
+            _sync_serial_pk(db, table="paper_selections", seq="paper_selections_id_seq")
             for r in rows:
                 db.add(
                     PaperSelectionRow(
@@ -107,41 +119,45 @@ def open_trade(
 ) -> str:
     ensure_paper_tables()
     trade_id = str(uuid.uuid4())
-    with session_scope() as db:
-        db.add(
-            PaperTradeRow(
-                id=trade_id,
-                session_id=session_id,
-                strategy_id=strategy_id,
-                instance_id=instance_id,
-                symbol=symbol.upper(),
-                side=side.upper(),
-                status="open",
-                quantity=quantity,
-                entry_price=entry_price,
-                stop_price=stop_price,
-                target_price=target_price,
-                entry_at=entry_at,
-                fees=fee,
-                meta_json=json.dumps(meta or {}),
+    try:
+        with session_scope() as db:
+            _sync_serial_pk(db, table="paper_fill_journal", seq="paper_fill_journal_id_seq")
+            db.add(
+                PaperTradeRow(
+                    id=trade_id,
+                    session_id=session_id,
+                    strategy_id=strategy_id,
+                    instance_id=instance_id,
+                    symbol=symbol.upper(),
+                    side=side.upper(),
+                    status="open",
+                    quantity=quantity,
+                    entry_price=entry_price,
+                    stop_price=stop_price,
+                    target_price=target_price,
+                    entry_at=entry_at,
+                    fees=fee,
+                    meta_json=json.dumps(meta or {}),
+                )
             )
-        )
-        db.add(
-            PaperFillJournalRow(
-                trade_id=trade_id,
-                session_id=session_id,
-                strategy_id=strategy_id,
-                instance_id=instance_id,
-                symbol=symbol.upper(),
-                side="BUY" if side.upper() == "LONG" else "SELL",
-                quantity=quantity,
-                price=entry_price,
-                fee=fee,
-                reason=reason or "entry",
-                filled_at=entry_at,
-                meta_json=json.dumps(meta or {}),
+            db.add(
+                PaperFillJournalRow(
+                    trade_id=trade_id,
+                    session_id=session_id,
+                    strategy_id=strategy_id,
+                    instance_id=instance_id,
+                    symbol=symbol.upper(),
+                    side="BUY" if side.upper() == "LONG" else "SELL",
+                    quantity=quantity,
+                    price=entry_price,
+                    fee=fee,
+                    reason=reason or "entry",
+                    filled_at=entry_at,
+                    meta_json=json.dumps(meta or {}),
+                )
             )
-        )
+    except Exception as exc:
+        logger.warning("open_trade journal failed (%s %s): %s", strategy_id, symbol, exc)
     return trade_id
 
 
@@ -164,31 +180,35 @@ def close_trade(
     if not trade_id:
         return
     ensure_paper_tables()
-    with session_scope() as db:
-        row = db.get(PaperTradeRow, trade_id)
-        if row is not None:
-            row.status = "closed"
-            row.exit_price = exit_price
-            row.exit_at = exit_at
-            row.realized_pnl = realized_pnl
-            row.exit_reason = reason
-            row.fees = float(row.fees or 0) + fee
-        db.add(
-            PaperFillJournalRow(
-                trade_id=trade_id,
-                session_id=session_id,
-                strategy_id=strategy_id,
-                instance_id=instance_id,
-                symbol=symbol.upper(),
-                side="SELL" if side.upper() == "LONG" else "BUY",
-                quantity=quantity,
-                price=exit_price,
-                fee=fee,
-                reason=reason or "exit",
-                filled_at=exit_at,
-                meta_json=json.dumps(meta or {}),
+    try:
+        with session_scope() as db:
+            _sync_serial_pk(db, table="paper_fill_journal", seq="paper_fill_journal_id_seq")
+            row = db.get(PaperTradeRow, trade_id)
+            if row is not None:
+                row.status = "closed"
+                row.exit_price = exit_price
+                row.exit_at = exit_at
+                row.realized_pnl = realized_pnl
+                row.exit_reason = reason
+                row.fees = float(row.fees or 0) + fee
+            db.add(
+                PaperFillJournalRow(
+                    trade_id=trade_id,
+                    session_id=session_id,
+                    strategy_id=strategy_id,
+                    instance_id=instance_id,
+                    symbol=symbol.upper(),
+                    side="SELL" if side.upper() == "LONG" else "BUY",
+                    quantity=quantity,
+                    price=exit_price,
+                    fee=fee,
+                    reason=reason or "exit",
+                    filled_at=exit_at,
+                    meta_json=json.dumps(meta or {}),
+                )
             )
-        )
+    except Exception as exc:
+        logger.warning("close_trade journal failed (%s %s): %s", strategy_id, symbol, exc)
 
 
 def list_trades(
