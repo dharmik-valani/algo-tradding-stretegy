@@ -1233,18 +1233,37 @@ class PaperSession:
 
 _SESSION: PaperSession | None = None
 _SESSION_LOCK = threading.Lock()
+_SESSION_READY = threading.Event()
 
 
 def get_session() -> PaperSession:
+    """Return the singleton paper session.
+
+    Heavy restore / auto-resume must NOT hold ``_SESSION_LOCK`` — otherwise
+    every HTTP handler (including ``/api/health``) deadlocks while Dhan/Yahoo
+    network calls run inside ``start_live``.
+    """
     global _SESSION
+    starter = False
     with _SESSION_LOCK:
         if _SESSION is None:
             _SESSION = PaperSession()
             _SESSION.install_signal_handlers()
-            _SESSION.restore_desk()
-            _SESSION.restore_runtime()
-            _SESSION.maybe_auto_resume()
-        return _SESSION
+            starter = True
+        sess = _SESSION
+
+    if starter:
+        try:
+            sess.restore_desk()
+            sess.restore_runtime()
+            sess.maybe_auto_resume()
+        finally:
+            _SESSION_READY.set()
+    else:
+        # Another thread may still be restoring — wait briefly so callers see a
+        # consistent desk, but never block forever (health / UI must stay up).
+        _SESSION_READY.wait(timeout=90.0)
+    return sess
 
 
 def reset_session() -> PaperSession:
@@ -1258,6 +1277,7 @@ def reset_session() -> PaperSession:
         saved = _SESSION.desk_configs() if _SESSION else []
         prefs = {"mode": "live", "poll_seconds": 15, "was_running": False}
         clear_runtime()
+        _SESSION_READY.clear()
         _SESSION = PaperSession()
         _SESSION.install_signal_handlers()
         _SESSION._restoring = True
@@ -1280,6 +1300,7 @@ def reset_session() -> PaperSession:
         finally:
             _SESSION._restoring = False
             save_strategies(saved, prefs=prefs)
+            _SESSION_READY.set()
         _SESSION.message = "Session runtime reset — desk strategies kept"
         return _SESSION
 
@@ -1294,11 +1315,14 @@ def reload_session_from_disk() -> PaperSession:
 
         reset_engine()
         get_engine()
+        _SESSION_READY.clear()
         _SESSION = PaperSession()
         _SESSION.install_signal_handlers()
-        _SESSION.restore_desk()
-        _SESSION.restore_runtime()
-        _SESSION.message = (
-            f"Restored from disk — {len(_SESSION.runners)} strategies on desk"
-        )
-        return _SESSION
+        sess = _SESSION
+    try:
+        sess.restore_desk()
+        sess.restore_runtime()
+        sess.message = f"Restored from disk — {len(sess.runners)} strategies on desk"
+    finally:
+        _SESSION_READY.set()
+    return sess

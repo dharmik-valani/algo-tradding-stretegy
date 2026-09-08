@@ -6,18 +6,25 @@
 #   CRON_SECRET     = same value as Render env CRON_SECRET
 #
 # IST ↔ UTC (no DST): IST = UTC+5:30
-#   08:50 IST wake  → 03:20 UTC
-#   market hours    → ~03:30–10:00 UTC
+#   08:20 / 08:40 / 08:50 / 09:05 IST wake → 02:50 / 03:10 / 03:20 / 03:35 UTC
+#   market keep-alive → ~02:30–10:20 UTC (08:00–15:50 IST)
 #   15:45 IST sleep → 10:15 UTC
+#
+# Note: GitHub schedule can skip or delay under load. Multiple wake pings
+# make a missed single cron less likely. Check Actions → this workflow
+# for event=schedule (not only workflow_dispatch).
 
 name: Render paper desk cron
 
 on:
   schedule:
-    # Keep free instance awake Mon–Fri during NSE window (+ buffer)
-    - cron: "*/10 3-10 * * 1-5"
-    # Pre-market: start live ~08:50 IST
-    - cron: "20 3 * * 1-5"
+    # Keep free instance warm Mon–Fri from ~08:00 IST through post-close buffer
+    - cron: "*/10 2-10 * * 1-5"
+    # Redundant pre-market wakes (GitHub cron is often late or skipped)
+    - cron: "50 2 * * 1-5"   # ~08:20 IST
+    - cron: "10 3 * * 1-5"   # ~08:40 IST
+    - cron: "20 3 * * 1-5"   # ~08:50 IST
+    - cron: "35 3 * * 1-5"   # ~09:05 IST
     # Post-market: stop live ~15:45 IST
     - cron: "15 10 * * 1-5"
   workflow_dispatch:
@@ -52,9 +59,15 @@ jobs:
           # schedule: github.event.schedule is the cron expression that fired
           CRON='${{ github.event.schedule }}'
           case "$CRON" in
-            "20 3 * * 1-5")   echo "action=wake"   >> "$GITHUB_OUTPUT" ;;
-            "15 10 * * 1-5")  echo "action=sleep"  >> "$GITHUB_OUTPUT" ;;
-            *)                echo "action=health" >> "$GITHUB_OUTPUT" ;;
+            "50 2 * * 1-5"|"10 3 * * 1-5"|"20 3 * * 1-5"|"35 3 * * 1-5")
+              echo "action=wake" >> "$GITHUB_OUTPUT"
+              ;;
+            "15 10 * * 1-5")
+              echo "action=sleep" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "action=health" >> "$GITHUB_OUTPUT"
+              ;;
           esac
 
       - name: Call Paper Desk
@@ -71,7 +84,7 @@ jobs:
             HDR+=(-H "X-Cron-Secret: ${CRON_SECRET}")
           fi
 
-          echo "action=${ACTION} base=${BASE}"
+          echo "action=${ACTION} base=${BASE} event=${{ github.event_name }}"
 
           # Free Render may cold-start 30–60s — retry a few times
           attempt() {

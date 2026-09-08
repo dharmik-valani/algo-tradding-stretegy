@@ -68,10 +68,19 @@ def health() -> dict:
     """Liveness probe + free-tier keep-alive target (must stay cheap/fast)."""
     out: dict[str, Any] = {"ok": True, "service": "paper-desk"}
     try:
-        session = get_session()
-        out["running"] = bool(session.running)
-        out["mode"] = session.mode
-        out["strategies"] = len(session.runners)
+        # Avoid get_session() — first call can restore desk + auto-resume (network).
+        # Probe must answer even while that is still in progress.
+        from algo.paper import session as session_mod
+
+        sess = session_mod._SESSION
+        if sess is None:
+            out["running"] = None
+            out["booting"] = True
+        else:
+            out["running"] = bool(sess.running)
+            out["mode"] = sess.mode
+            out["strategies"] = len(sess.runners)
+            out["ready"] = session_mod._SESSION_READY.is_set()
     except Exception:
         # Never fail the probe — Render / cron only need ok=true.
         out["running"] = None
