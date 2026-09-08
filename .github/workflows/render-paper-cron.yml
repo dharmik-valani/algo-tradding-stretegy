@@ -131,28 +131,16 @@ jobs:
               echo "$payload" | head -c 1200
               echo
               # Compact digest for report/deep responses (email field is past the 1200-char cut)
-              echo "$payload" | python3 -c '
-import sys, json
-raw = sys.stdin.read().strip()
-if not raw:
-    raise SystemExit(0)
-try:
-    d = json.loads(raw)
-except Exception:
-    raise SystemExit(0)
-email = d.get("email") if isinstance(d, dict) else None
-health = d.get("health") if isinstance(d, dict) else d
-if isinstance(health, dict):
-    print(
-        "digest",
-        "summary=", health.get("summary"),
-        "smtp=", health.get("smtp_configured"),
-        "to=", health.get("report_email_to"),
-        "issues=", (health.get("issues") or [])[:3],
-    )
-if isinstance(email, dict):
-    print("email", email)
+              echo "$payload" | python3 -c 'import sys,json; raw=sys.stdin.read().strip();\
+import sys as _s;\
+\
 ' 2>/dev/null || true
+              printf '%s' "$payload" | python3 -c "import sys,json; raw=sys.stdin.read().strip();
+d=json.loads(raw) if raw else {};
+email=d.get('email') if isinstance(d,dict) else None;
+health=d.get('health') if isinstance(d,dict) else d;
+print('digest summary=', (health or {}).get('summary'), 'smtp=', (health or {}).get('smtp_configured'), 'to=', (health or {}).get('report_email_to'), 'issues=', ((health or {}).get('issues') or [])[:3]) if isinstance(health,dict) else None;
+print('email', email) if isinstance(email, dict) else None" 2>/dev/null || true
               echo "http=${code}"
               if [ "$code" = "200" ]; then
                 return 0
