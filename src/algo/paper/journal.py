@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -13,6 +14,8 @@ from algo.storage.models import (
     PaperSessionRow,
     PaperTradeRow,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _utcnow() -> datetime:
@@ -61,25 +64,29 @@ def record_selections(
         return
     ensure_paper_tables()
     now = _utcnow()
-    with session_scope() as db:
-        for r in rows:
-            db.add(
-                PaperSelectionRow(
-                    session_id=session_id,
-                    strategy_id=strategy_id,
-                    instance_id=instance_id,
-                    symbol=str(r.get("symbol", "")).upper(),
-                    mode=str(r.get("mode", "")),
-                    pct_change=r.get("pct_change"),
-                    open_px=r.get("open"),
-                    high_px=r.get("high"),
-                    low_px=r.get("low"),
-                    close_px=r.get("close"),
-                    prev_close=r.get("prev_close"),
-                    meta_json=json.dumps(r),
-                    selected_at=now,
+    try:
+        with session_scope() as db:
+            for r in rows:
+                db.add(
+                    PaperSelectionRow(
+                        session_id=session_id,
+                        strategy_id=strategy_id,
+                        instance_id=instance_id,
+                        symbol=str(r.get("symbol", "")).upper(),
+                        mode=str(r.get("mode", "")),
+                        pct_change=r.get("pct_change"),
+                        open_px=r.get("open"),
+                        high_px=r.get("high"),
+                        low_px=r.get("low"),
+                        close_px=r.get("close"),
+                        prev_close=r.get("prev_close"),
+                        meta_json=json.dumps(r),
+                        selected_at=now,
+                    )
                 )
-            )
+    except Exception as exc:
+        # Never block live trading if journal PK/sequence drifts.
+        logger.warning("record_selections failed (%s/%s): %s", strategy_id, instance_id, exc)
 
 
 def open_trade(
