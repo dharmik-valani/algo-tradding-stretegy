@@ -185,6 +185,7 @@
             <button type="button" class="ghost" data-range="month">This month</button>
             <button type="button" class="ghost" data-range="all">All time</button>
           </div>
+          <p class="hint">Day flow: timed REST scan (e.g. 09:16 / 09:18) → WebSocket only selected names → trade until <strong>flatten_at ~15:20</strong> → cron sleep ~15:45. Next IST day desk PnL resets to 0; entry/exit history stays in Reports.</p>
           <p class="hint">Exports respect From / To / Strategy filters. <strong>CSV trades</strong> = trade lines only. <strong>CSV full</strong> = summary + by strategy + day-wise + trades. <strong>PDF / Print</strong> opens a printable report — use your browser’s Print → Save as PDF.</p>
           <p class="hint">Trades live in SQLite (<code>data/algo.db</code>). On <strong>free Render</strong> that file is wiped when the service sleeps or redeploys — weekly reports will not survive unless you use Supabase Postgres. Local laptop DB is separate and is <strong>not</strong> auto-synced.</p>
         </div>

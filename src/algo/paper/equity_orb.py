@@ -25,12 +25,14 @@ class _EquityOrbBase(Strategy):
     def default_params(self) -> dict[str, Any]:
         return {
             "session_open": "09:15",
+            "scan_at": "09:16",
             "range_minutes": 5,
             "top_n": 5,
             "buffer_pct": 0.5,
             "risk_reward": 3.0,
             "open_eq_tol_pct": 0.05,
             "entry_end": "15:00",
+            "flatten_at": "15:20",
             "scan_size": 80,
             "universe": "",
             "one_trade_per_symbol": True,
@@ -46,6 +48,13 @@ class _EquityOrbBase(Strategy):
                 "type": "time",
                 "help": "NSE open used to start the first-range candle (IST).",
                 "example": "Example: 09:15 → first range is 09:15–09:20 when range=5.",
+            },
+            {
+                "key": "scan_at",
+                "label": "Scan time",
+                "type": "time",
+                "help": "Clock to REST-scan the universe once, then WS-subscribe only the selected names.",
+                "example": "Example: 09:16 — after open, rank gainers/losers from day OHLC.",
             },
             {
                 "key": "range_minutes",
@@ -122,6 +131,13 @@ class _EquityOrbBase(Strategy):
                 "type": "time",
                 "help": "Stop opening new breakouts after this IST time; still manage open trades.",
                 "example": "Example: 15:00 — no fresh ORB entries in the last hour.",
+            },
+            {
+                "key": "flatten_at",
+                "label": "EOD flatten",
+                "type": "time",
+                "help": "Force-close any still-open paper legs at this IST clock (journal history kept).",
+                "example": "Example: 15:20 — square off before close; desk PnL resets next morning.",
             },
             {
                 "key": "scan_size",
@@ -303,6 +319,19 @@ class _EquityOrbBase(Strategy):
             stop = float(leg["stop"])
             target = float(leg["target"])
             meta.update({"entry": entry, "stop": stop, "target": target, "fill_price": float(bar.close)})
+            flat_raw = str(p.get("flatten_at") or "").strip()
+            if flat_raw:
+                try:
+                    flat_t = _parse_hhmm(flat_raw)
+                    if clock >= flat_t:
+                        leg["in_trade"] = False
+                        return Signal(
+                            action=SignalAction.FLAT,
+                            reason=f"{symbol} EOD flatten @ {flat_raw} IST",
+                            meta=meta,
+                        )
+                except Exception:
+                    pass
             if self.mode == "gainer":
                 if bar.low <= stop or bar.close <= stop:
                     leg["in_trade"] = False

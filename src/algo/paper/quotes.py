@@ -271,7 +271,7 @@ class LiveQuoteProvider:
         return bool(self._ws.connected)
 
     def ensure_subscribed(self, symbols: list[str]) -> None:
-        """Subscribe WebSocket instruments for active paper symbols."""
+        """Add WebSocket instruments (additive). Prefer set_subscriptions after scan."""
         if self._ws is None:
             return
         cleaned = [s.upper() for s in symbols if s]
@@ -290,6 +290,28 @@ class LiveQuoteProvider:
                 continue
         if instruments:
             self._ws.subscribe(instruments)
+
+    def set_subscriptions(self, symbols: list[str]) -> None:
+        """Replace WS want-set with exactly these symbols (colleague Kite pattern).
+
+        After a timed REST/OHLC scan, call this with selected + open legs only —
+        not the full NIFTY500 scan universe.
+        """
+        if self._ws is None:
+            return
+        cleaned = [s.upper() for s in symbols if s]
+        self._last_want_syms = list(dict.fromkeys(cleaned))
+        if self._ws.rate_limited():
+            return
+        if not self._ws._thread or not self._ws._thread.is_alive():
+            self._ws.start()
+        instruments: list[tuple[str, str]] = []
+        for sym in self._last_want_syms:
+            try:
+                instruments.append(self._resolve_dhan_key(sym))
+            except Exception:
+                continue
+        self._ws.set_wanted(instruments)
 
     def _ws_quote(self, symbol: str) -> dict | None:
         if self._ws is None:
@@ -318,16 +340,33 @@ class LiveQuoteProvider:
         snaps = self.equity_day_snapshots([symbol])
         return snaps.get(symbol.upper())
 
-    def equity_day_snapshots(self, symbols: list[str]) -> dict[str, dict[str, float | str]]:
-        """Batch day snapshots — WS cache, then one Dhan OHLC REST. No Yahoo.
+    def equity_day_snapshots(
+        self,
+        symbols: list[str],
+        *,
+        prefer_rest: bool = False,
+    ) -> dict[str, dict[str, float | str]]:
+        """Batch day snapshots for scanners.
 
-        On REST 429 returns whatever WS already has (partial) instead of raising,
-        so scanners can back off without hammering LTP one symbol at a time.
+        prefer_rest=True (colleague / Kite-style pre-open scan):
+          one Quote OHLC REST for the universe — does NOT WS-subscribe the scan list.
+        Default: WS cache first, then soft REST fill when coverage is thin.
         """
         wanted = [s.upper() for s in symbols if s]
         out: dict[str, dict[str, float | str]] = {}
         if not wanted:
             return out
+
+        if prefer_rest and self._dhan is not None and not self._rest_cooling():
+            try:
+                out.update(self._dhan_equity_snapshots(wanted))
+                if out:
+                    self._dhan_feed_ok = True
+                    self._clear_rate_limit_on_success()
+                return out
+            except Exception:
+                # Fall through to WS path if REST fails / 429.
+                pass
 
         self.ensure_subscribed(wanted)
         # Give quote packets a moment to land before REST.
@@ -358,7 +397,7 @@ class LiveQuoteProvider:
             missing
             and self._dhan is not None
             and not self._rest_cooling()
-            and len(out) < max(5, len(wanted) // 5)
+            and (prefer_rest or len(out) < max(5, len(wanted) // 5))
         ):
             try:
                 out.update(self._dhan_equity_snapshots(missing))

@@ -180,6 +180,7 @@ class NiftyOptionOrbStrategy(Strategy):
             "one_trade_per_day": True,
             "entry_start": "",  # optional HH:MM override (default = open + range)
             "entry_end": "15:15",
+            "flatten_at": "15:20",
         }
 
     def param_schema(self) -> list[dict[str, Any]]:
@@ -276,6 +277,13 @@ class NiftyOptionOrbStrategy(Strategy):
                     "example": "Example: 15:15 — no fresh breakout buys in the last stretch of the day.",
                 },
                 {
+                    "key": "flatten_at",
+                    "label": "EOD flatten",
+                    "type": "time",
+                    "help": "Force-close an open premium trade at this IST clock if still held.",
+                    "example": "Example: 15:20 — square off before close.",
+                },
+                {
                     "key": "one_trade_per_day",
                     "label": "One trade / day",
                     "type": "select",
@@ -360,11 +368,24 @@ class NiftyOptionOrbStrategy(Strategy):
             if self._range_high is None:
                 self._range_high = bar.high
 
-        # Manage open trade: SL / target / time
+        # Manage open trade: SL / target / time / EOD
         if self._in_trade and self._entry_price is not None and self._entry_time is not None:
             sl = self._entry_price - stop_pts
             tp = self._entry_price + target_pts
             meta.update({"entry": self._entry_price, "sl": round(sl, 2), "tp": round(tp, 2)})
+            flat_raw = str(p.get("flatten_at") or "").strip()
+            if flat_raw:
+                try:
+                    flat_t = _parse_hhmm(flat_raw)
+                    if clock >= flat_t:
+                        self._in_trade = False
+                        return Signal(
+                            action=SignalAction.FLAT,
+                            reason=f"EOD flatten @ {flat_raw} IST",
+                            meta=meta,
+                        )
+                except Exception:
+                    pass
             if bar.low <= sl or bar.close <= sl:
                 self._in_trade = False
                 return Signal(action=SignalAction.FLAT, reason=f"stop hit ≤ {sl:.1f}", meta=meta)

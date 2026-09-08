@@ -83,6 +83,7 @@ class _EquityOrbTierBase(Strategy):
             "risk_reward_2": 3.0,
             "partial_at_r1_pct": 50.0,
             "entry_end": "15:00",
+            "flatten_at": "15:20",
             "scan_size": 120,
             "universe": "",
             "max_price": 1500.0,
@@ -228,6 +229,13 @@ class _EquityOrbTierBase(Strategy):
                 "type": "time",
                 "help": "Stop new breakouts after this IST time.",
                 "example": "15:00",
+            },
+            {
+                "key": "flatten_at",
+                "label": "EOD flatten",
+                "type": "time",
+                "help": "Force-close open legs at this IST clock (journal kept; desk resets next day).",
+                "example": "15:20",
             },
             {
                 "key": "one_trade_per_symbol",
@@ -412,6 +420,19 @@ class _EquityOrbTierBase(Strategy):
                     "fill_price": float(bar.close),
                 }
             )
+            flat_raw = str(p.get("flatten_at") or "").strip()
+            if flat_raw:
+                try:
+                    flat_t = _parse_hhmm(flat_raw)
+                    if clock >= flat_t:
+                        leg["in_trade"] = False
+                        return Signal(
+                            action=SignalAction.FLAT,
+                            reason=f"{symbol} EOD flatten @ {flat_raw} IST",
+                            meta=meta,
+                        )
+                except Exception:
+                    pass
             if self.mode == "gainer":
                 if bar.low <= stop or bar.close <= stop:
                     leg["in_trade"] = False

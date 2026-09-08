@@ -38,6 +38,8 @@ class BasketRunner:
         self.starting_cash = starting_cash
         self.settings = settings
         self.journal_session_id = journal_session_id
+        self._desk_day = datetime.now(IST).date()
+        self._eod_done_day = None
         self.enabled = True
         self.logs: list[str] = []
         self.last_signal = "HOLD"
@@ -223,13 +225,13 @@ class BasketRunner:
         universe = resolve_universe(self.strategy.params)
         snaps: list[dict[str, Any]] = []
         try:
-            # Subscribe once for the scan, wait for WS, then optional single OHLC REST.
-            quotes.ensure_subscribed(universe)
-            quotes.prefetch_ltps(universe[:30], wait_ws_sec=2.0)
-            batch = quotes.equity_day_snapshots(universe)
+            # Colleague / Kite pattern: timed REST OHLC for the universe once,
+            # then WS only the selected names (session.set_subscriptions).
+            batch = quotes.equity_day_snapshots(universe, prefer_rest=True)
             snaps = list(batch.values())
+            src = "rest" if any(s.get("source") == "dhan" for s in snaps) else quotes.feed_status
             self._log(
-                f"Scan via {quotes.feed_status}: {len(snaps)}/{len(universe)} snapshots"
+                f"Scan via {src} (REST-first): {len(snaps)}/{len(universe)} snapshots"
             )
         except Exception as exc:
             err = str(exc)
@@ -240,9 +242,9 @@ class BasketRunner:
             self._log(f"batch scan failed ({exc}) — will retry next poll (no per-symbol REST)")
             return
         if len(snaps) < max(5, len(universe) // 10):
-            # Too thin to trust rankings — wait for more WS ticks instead of REST spam.
+            # Too thin to trust rankings — cool briefly, then retry REST.
             self._scan_cool_until = time.time() + 60.0
-            self._log(f"Scan incomplete ({len(snaps)} snaps) — waiting for more dhan-ws ticks")
+            self._log(f"Scan incomplete ({len(snaps)} snaps) — waiting before re-scan")
             return
         picked = self.strategy.select_symbols(snaps)
         self.selected = list(picked)
@@ -263,7 +265,7 @@ class BasketRunner:
             )
         self._log(
             f"Selected {len(self.selected)}: {', '.join(self.selected) or 'none'} "
-            f"(from {len(snaps)} scanned)"
+            f"(from {len(snaps)} scanned) — WS will track selected only"
         )
 
     def _seed_opening_ranges(self, quotes: LiveQuoteProvider, params: dict[str, Any]) -> None:
@@ -333,6 +335,8 @@ class BasketRunner:
         self._apply(symbol, broker, signal, fill_px, bar.timestamp)
 
     def tick_live(self, quotes: LiveQuoteProvider) -> list[str]:
+        self._maybe_roll_trading_day()
+        self._maybe_eod_flatten(quotes)
         self.ensure_selection(quotes)
         labels = []
         # Prefer WS ticks already warmed by session.prefetch_ltps — no long waits here.
@@ -351,6 +355,73 @@ class BasketRunner:
                 else:
                     self._log(f"LTP {sym}: {exc}")
         return labels
+
+    def _maybe_roll_trading_day(self) -> None:
+        """New IST day → clear selection + desk PnL counters (journal history kept)."""
+        today = datetime.now(IST).date()
+        if self._desk_day == today:
+            return
+        self._log(
+            f"New trading day {today.isoformat()} — resetting desk selection/PnL "
+            f"(prior day journal kept)"
+        )
+        keep_params = dict(self.strategy.params)
+        self.strategy.reset()
+        self.strategy.params = keep_params
+        self.selected = []
+        self.brokers = {}
+        self.histories = {}
+        self.open_trade_ids = {}
+        self._scanned = False
+        self._eod_done_day = None
+        self._desk_day = today
+
+    def _maybe_eod_flatten(self, quotes: LiveQuoteProvider) -> None:
+        """Force-close open intraday legs at flatten_at (default 15:20 IST)."""
+        p = {**self.strategy.default_params(), **self.strategy.params}
+        flat_raw = str(p.get("flatten_at") or "").strip()
+        if not flat_raw:
+            return
+        today = datetime.now(IST).date()
+        if self._eod_done_day == today:
+            return
+        try:
+            hh, mm = [int(x) for x in flat_raw.split(":")[:2]]
+            now = datetime.now(IST).time().replace(tzinfo=None)
+            if now < time_cls(hh, mm):
+                return
+        except Exception:
+            return
+        open_syms = [
+            sym
+            for sym, broker in self.brokers.items()
+            if broker.position.quantity
+        ]
+        if not open_syms:
+            self._eod_done_day = today
+            return
+        self._log(f"EOD flatten @ {flat_raw} IST — closing {len(open_syms)} open leg(s)")
+        from algo.paper.models import Signal
+
+        for sym in open_syms:
+            try:
+                price, ts, _src = quotes.get_ltp(
+                    sym, allow_rest=True, wait_ws_sec=0.5, max_stale_sec=600
+                )
+            except Exception:
+                continue
+            broker = self.brokers[sym]
+            sig = Signal(
+                action=SignalAction.FLAT,
+                reason=f"EOD flatten @ {flat_raw} IST",
+                meta={"structure": "eod", "fill_price": float(price), "symbol": sym},
+            )
+            self._apply(sym, broker, sig, float(price), ts)
+            leg = (getattr(self.strategy, "_legs", {}) or {}).get(sym)
+            if isinstance(leg, dict):
+                leg["in_trade"] = False
+        self._eod_done_day = today
+        self.last_signal = "EOD_FLAT"
 
     def run_replay(self, quotes: LiveQuoteProvider, max_bars: int | None = 500) -> None:
         self.ensure_selection(quotes)

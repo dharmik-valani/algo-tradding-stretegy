@@ -113,6 +113,7 @@ class StrategyRunner:
         self.option_state: dict[str, float] = {}
         self.mark_price: float | None = None
         self._forming_bar: Bar | None = None
+        self._desk_day = datetime.now(IST).date()
 
     def state(self) -> StrategyState:
         last = self.mark_price
@@ -205,6 +206,21 @@ class StrategyRunner:
     def on_bar(self, bar: Bar) -> None:
         if not self.enabled:
             return
+        today = bar.timestamp.astimezone(IST).date()
+        if self._desk_day != today:
+            # New IST day — reset desk counters; journal history stays in DB.
+            if self.broker.position.quantity == 0:
+                self.strategy.reset()
+                self.broker = PaperBroker(
+                    starting_cash=self.broker.starting_cash,
+                    fee_bps=self.broker.fee_bps,
+                    slippage_bps=self.broker.slippage_bps,
+                )
+                self.broker.bind(self.strategy.id, self.instrument_id, self.symbol)
+                self.history = []
+                self.last_signal = "HOLD"
+                self._log(f"New trading day {today.isoformat()} — desk PnL reset")
+            self._desk_day = today
         # Same 5m bucket updates (live Zen): replace last bar instead of duplicating.
         if self.history and self.history[-1].timestamp == bar.timestamp:
             hist = self.history[:-1]
@@ -994,6 +1010,10 @@ class PaperSession:
         self._thread.start()
 
     def stop(self) -> None:
+        try:
+            self.flatten_intraday_for_close()
+        except Exception:
+            pass
         self._stop.set()
         self.running = False
         end_journal_session(self.journal_session_id, message="Stopped")
@@ -1016,6 +1036,68 @@ class PaperSession:
             },
         )
         self.persist_runtime()
+
+    def flatten_intraday_for_close(self) -> None:
+        """Square off open intraday paper legs before sleep (Zen overnight kept)."""
+        quotes = self._quotes
+        if quotes is None:
+            return
+        with self._lock:
+            runners = list(self.runners.values())
+        for runner in runners:
+            if not runner.enabled:
+                continue
+            if isinstance(runner, BasketRunner):
+                # Force EOD path even if flatten_at already passed earlier.
+                runner._eod_done_day = None
+                p = {**runner.strategy.default_params(), **runner.strategy.params}
+                if not str(p.get("flatten_at") or "").strip():
+                    runner.strategy.params = {**runner.strategy.params, "flatten_at": "15:20"}
+                runner._maybe_eod_flatten(quotes)
+                continue
+            if getattr(runner.strategy, "id", "") == "zen_credit_spread":
+                # Designed to hold overnight unless hold_overnight=false.
+                continue
+            pos_qty = runner.broker.position.quantity
+            if pos_qty == 0:
+                continue
+            try:
+                fill_px = None
+                ts = utcnow()
+                if runner.asset_kind == "option":
+                    p = runner.strategy.params
+                    bar, st = quotes.option_premium_bar(
+                        runner.symbol,
+                        option_type=str(p.get("option_type", "CE")),
+                        strike_mode=str(p.get("strike_mode", "ATM")),
+                        strike_step=int(p.get("strike_step", 50)),
+                        state=runner.option_state,
+                    )
+                    runner.option_state = st
+                    fill_px = float(bar.close)
+                    ts = bar.timestamp
+                else:
+                    fill_px, ts, _ = quotes.get_ltp(
+                        runner.symbol, allow_rest=True, wait_ws_sec=0.5, max_stale_sec=600
+                    )
+                if fill_px is None:
+                    continue
+                side = Side.SELL if pos_qty > 0 else Side.BUY
+                runner.broker.submit_market(
+                    strategy_id=runner.strategy.id,
+                    instrument_id=runner.instrument_id,
+                    symbol=runner.symbol,
+                    side=side,
+                    quantity=abs(pos_qty),
+                    last_price=float(fill_px),
+                    ts=ts,
+                )
+                if hasattr(runner.strategy, "_in_trade"):
+                    runner.strategy._in_trade = False  # type: ignore[attr-defined]
+                runner.last_signal = "EOD_FLAT"
+                runner._log(f"EOD flatten @ session sleep @ {float(fill_px):.2f}")
+            except Exception:
+                continue
 
     def run_replay_sync(self, *, max_bars: int | None = None) -> SessionSnapshot:
         """Blocking replay for CLI."""
@@ -1153,7 +1235,8 @@ class PaperSession:
                         want_syms.append(getattr(runner, "symbol", "") or "")
                 want_syms = [s for s in dict.fromkeys(want_syms) if s]
                 try:
-                    quotes.ensure_subscribed(want_syms)
+                    # Replace want-set (not additive) so scan universe is dropped after pick.
+                    quotes.set_subscriptions(want_syms)
                     ws_down = bool(
                         quotes._ws is not None
                         and (quotes._ws.rate_limited() or not quotes._ws.connected)

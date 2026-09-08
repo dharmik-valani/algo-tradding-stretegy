@@ -220,6 +220,25 @@ class DhanLiveFeed:
         if changed:
             self._signal_wake()
 
+    def set_wanted(self, instruments: list[tuple[str, str]]) -> None:
+        """Replace the subscribe set (scan universe → selected only).
+
+        Adds are flushed on the open socket. Removals force a reconnect so the
+        server stops streaming names we no longer trade (Dhan has no reliable
+        partial-unsubscribe in this feed path).
+        """
+        new = {(str(seg), str(sid)) for seg, sid in instruments}
+        with self._lock:
+            if new == self._wanted:
+                return
+            removed = bool(self._wanted - new)
+            self._wanted = set(new)
+            self._subscribed = {k for k in self._subscribed if k in self._wanted}
+        if removed:
+            self.force_reconnect()
+        else:
+            self._signal_wake()
+
     def get(self, segment: str, security_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._cache.get((str(segment), str(security_id)))
