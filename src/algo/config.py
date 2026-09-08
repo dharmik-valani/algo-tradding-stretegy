@@ -37,8 +37,8 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     paper_ui_host: str = "127.0.0.1"
     paper_ui_port: int = 8787
-    # public = Yahoo. dhan = Data API LTP/OHLC. auto = Dhan then Yahoo fallback.
-    paper_price_source: str = "auto"
+    # Dhan-only paper prices: dhan-ws (WS + REST). Legacy auto/public map to dhan-ws.
+    paper_price_source: str = "dhan-ws"
     yaml_config: dict = Field(default_factory=load_yaml)
 
     @property
@@ -83,9 +83,15 @@ class Settings(BaseSettings):
 
     @property
     def requests_per_second(self) -> float:
-        return float(
-            self.yaml_config.get("dhan", {}).get("rate_limit", {}).get("requests_per_second", 5)
-        )
+        """Data API budget (charts). Prefer data_requests_per_second when set."""
+        rl = self.yaml_config.get("dhan", {}).get("rate_limit", {})
+        return float(rl.get("data_requests_per_second", rl.get("requests_per_second", 4)))
+
+    @property
+    def quote_requests_per_second(self) -> float:
+        """Quote API budget (marketfeed ltp/ohlc/quote) — official max 1/s."""
+        rl = self.yaml_config.get("dhan", {}).get("rate_limit", {})
+        return float(rl.get("quote_requests_per_second", 0.95))
 
     @property
     def requests_per_day(self) -> int:

@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=desk14" />
+  <link rel="stylesheet" href="/static/styles.css?v=desk15" />
 </head>
 <body>
   <div class="app">
@@ -131,7 +131,7 @@
             <h2>On desk</h2>
             <span class="count-pill" id="deskCount">0</span>
           </div>
-          <p class="hint">Tap a card for settings. Pause one strategy without stopping the whole session.</p>
+          <p class="hint">Tap a row for settings. Pause one strategy without stopping the whole session. PnL can be from closed trades even when Entry/Stop show flat.</p>
           <div id="execDeskList" class="exec-desk-list"></div>
         </div>
 
@@ -161,9 +161,11 @@
         <div class="panel">
           <div class="panel-head">
             <h2>Filters &amp; export</h2>
-            <div class="actions">
+            <div class="actions export-actions">
               <button id="btnRefreshReports" class="ghost">Refresh</button>
-              <a id="btnExportCsv" class="button-link primary" href="/api/reports/export.csv">CSV</a>
+              <a id="btnExportCsv" class="button-link ghost" href="/api/reports/export.csv">CSV trades</a>
+              <a id="btnExportCsvFull" class="button-link primary" href="/api/reports/export.csv?kind=full">CSV full report</a>
+              <a id="btnExportPdf" class="button-link primary" href="/api/reports/export.pdf" target="_blank" rel="noopener">PDF / Print</a>
             </div>
           </div>
           <div class="row">
@@ -183,6 +185,7 @@
             <button type="button" class="ghost" data-range="month">This month</button>
             <button type="button" class="ghost" data-range="all">All time</button>
           </div>
+          <p class="hint">Exports respect From / To / Strategy filters. <strong>CSV trades</strong> = trade lines only. <strong>CSV full</strong> = summary + by strategy + day-wise + trades. <strong>PDF / Print</strong> opens a printable report — use your browser’s Print → Save as PDF.</p>
           <p class="hint">Trades live in SQLite (<code>data/algo.db</code>). On <strong>free Render</strong> that file is wiped when the service sleeps or redeploys — weekly reports will not survive unless you use Supabase Postgres. Local laptop DB is separate and is <strong>not</strong> auto-synced.</p>
         </div>
 
@@ -385,6 +388,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=desk14"></script>
+  <script src="/static/app.js?v=desk15"></script>
 </body>
 </html>

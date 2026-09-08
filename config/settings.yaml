@@ -22,8 +22,15 @@ historical_data:
 dhan:
   base_url: https://api.dhan.co/v2
   instrument_master_url: https://images.dhan.co/api-data/api-scrip-master.csv
+  # Official DhanHQ limits (https://dhan.co/support/.../what-are-the-api-rate-limits-for-dhan/)
+  #   Quote APIs (/marketfeed/*): 1 req/sec, up to 1000 instruments / call
+  #   Data APIs (/charts/*): 5 req/sec, 100000 / day
+  #   Order APIs: 10/sec | Non-Trading: 20/sec
+  #   WebSocket: ≤5 connections, ≤5000 instruments each, ≤100 per subscribe msg
   rate_limit:
-    requests_per_second: 5
+    quote_requests_per_second: 0.95
+    data_requests_per_second: 4
+    requests_per_second: 4
     requests_per_day: 100000
   timeout_seconds: 30
 

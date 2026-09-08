@@ -14,6 +14,8 @@ from algo.paper.instruments import instrument_catalog
 from algo.paper.journal import (
     calendar_pnl,
     daily_report,
+    full_report_csv,
+    full_report_html,
     list_selections,
     list_trades,
     report_summary,
@@ -274,6 +276,22 @@ def analytics() -> dict:
     return get_session().analytics()
 
 
+@app.get("/api/feed")
+def feed_diagnostics() -> dict:
+    """Live feed + rate-limit diagnostics (why a 429 happened)."""
+    from algo.paper import session as session_mod
+
+    sess = session_mod._SESSION
+    if sess is None or sess._quotes is None:
+        return {"ok": True, "booting": sess is None, "running": bool(sess and sess.running)}
+    out = sess._quotes.diagnostics()
+    out["ok"] = True
+    out["running"] = bool(sess.running)
+    out["poll_seconds_base"] = sess.poll_seconds
+    out["enabled_strategies"] = sum(1 for r in sess.runners.values() if r.enabled)
+    return out
+
+
 @app.post("/api/session/reset")
 def session_reset() -> dict:
     return reset_session().snapshot().model_dump(mode="json")
@@ -434,8 +452,12 @@ def reports_summary(
 
 
 @app.get("/api/reports/daily")
-def reports_daily(from_date: str | None = None, to_date: str | None = None) -> dict:
-    return daily_report(from_date=from_date, to_date=to_date)
+def reports_daily(
+    from_date: str | None = None,
+    to_date: str | None = None,
+    strategy_id: str | None = None,
+) -> dict:
+    return daily_report(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
 
 
 @app.get("/api/reports/calendar")
@@ -452,13 +474,31 @@ def reports_export_csv(
     from_date: str | None = Query(None),
     to_date: str | None = Query(None),
     strategy_id: str | None = Query(None),
+    kind: str | None = Query("trades"),
 ) -> Response:
-    csv_text = trades_csv(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
-    filename = "paper_trades.csv"
+    """CSV export. kind=trades (default) or full (summary + day + strategy + trades)."""
+    if (kind or "trades").lower() == "full":
+        csv_text = full_report_csv(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+        filename = "paper_report_full.csv"
+    else:
+        csv_text = trades_csv(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+        filename = "paper_trades.csv"
     if from_date or to_date:
-        filename = f"paper_trades_{from_date or 'start'}_{to_date or 'end'}.csv"
+        stem = filename.replace(".csv", "")
+        filename = f"{stem}_{from_date or 'start'}_{to_date or 'end'}.csv"
     return Response(
         content=csv_text,
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@app.get("/api/reports/export.pdf")
+def reports_export_pdf(
+    from_date: str | None = Query(None),
+    to_date: str | None = Query(None),
+    strategy_id: str | None = Query(None),
+) -> Response:
+    """Printable HTML report — open and use Print → Save as PDF."""
+    html = full_report_html(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+    return Response(content=html, media_type="text/html; charset=utf-8")

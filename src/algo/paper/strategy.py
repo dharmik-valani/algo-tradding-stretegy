@@ -159,7 +159,7 @@ class NiftyOptionOrbStrategy(Strategy):
     name = "NIFTY Opt ORB (15m)"
     description = (
         "After first-range high on option premium, buy breakout; "
-        "exit on stop / 1:2 target / hold window."
+        "exit on stop / 1:2 target / hold window. Prices are option premium ₹."
     )
     asset_kinds = ["option"]
     # Subclasses lock this; base allows CE|PE via params.
@@ -416,7 +416,10 @@ class NiftyOptionOrbCallStrategy(NiftyOptionOrbStrategy):
     id = "nifty_opt_orb_ce"
     name = "NIFTY Opt ORB Call (15m)"
     description = (
-        "CE side: first-range premium high breakout → buy; SL / 1:2 target / hold window."
+        "Call (CE) ORB: from 09:15, measure the CE premium high for 15 minutes. "
+        "If premium breaks above that high, buy. "
+        "Exit when premium hits stop (entry − stop pts), target (entry + target pts), or hold time ends. "
+        "Paper uses synthetic ATM CE premium from NIFTY spot — not a live option-chain quote."
     )
     locked_option_type = "CE"
 
@@ -427,7 +430,11 @@ class NiftyOptionOrbPutStrategy(NiftyOptionOrbStrategy):
     id = "nifty_opt_orb_pe"
     name = "NIFTY Opt ORB Put (15m)"
     description = (
-        "PE side: first-range premium high breakout → buy; SL / 1:2 target / hold window."
+        "Put (PE) ORB: from 09:15, measure the PE premium high for 15 minutes. "
+        "If premium breaks above that high, buy the put. "
+        "Exit when premium hits stop (entry − stop pts), target (entry + target pts), or hold time ends. "
+        "All prices on the desk are put premium ₹ (not NIFTY index). "
+        "Paper uses synthetic ATM PE premium from NIFTY spot — not a live option-chain quote."
     )
     locked_option_type = "PE"
 

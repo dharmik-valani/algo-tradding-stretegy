@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, time as time_cls
 from typing import Any
 from zoneinfo import ZoneInfo
+import time
 
 from algo.config import Settings
 from algo.paper.broker import PaperBroker, utcnow
@@ -178,11 +179,35 @@ class BasketRunner:
             st.note = f"{waiting} waiting breakout" if waiting else (self.last_signal or "HOLD")
         else:
             st.note = self.last_signal or "HOLD"
+        closed_all: list[dict] = []
+        for b in self.brokers.values():
+            closed_all.extend(getattr(b, "closed_trades", []) or [])
+        last_closed = closed_all[-1] if closed_all else None
+        st.trade_view = {
+            "market": st.last_price,
+            "entry": st.entry_price,
+            "stop": st.stop_price,
+            "target": st.target_price,
+            "in_trade": bool(active),
+            "realized_pnl": float(realized or 0),
+            "unrealized_pnl": float(unreal or 0),
+            "last_closed": last_closed,
+            "closed_count": len(closed_all),
+            "open_count": len(active),
+        }
+        if not active and abs(float(realized or 0)) > 1e-9 and "realized" not in (st.note or "").lower():
+            st.note = f"{st.note} · flat (realized)" if st.note else "flat (realized)"
         return st
 
     def ensure_selection(self, quotes: LiveQuoteProvider) -> None:
         if self._scanned and self.strategy.selected:
             self.selected = list(self.strategy.selected)
+            return
+        # Back off after a rate-limit — do not re-hammer the universe every poll.
+        cool_until = float(getattr(self, "_scan_cool_until", 0.0) or 0.0)
+        if cool_until and time.time() < cool_until:
+            wait = int(cool_until - time.time())
+            self._log(f"Scan cooling {wait}s after Dhan 429")
             return
         p = {**self.strategy.default_params(), **self.strategy.params}
         scan_at_raw = str(p.get("scan_at") or "").strip()
@@ -198,20 +223,27 @@ class BasketRunner:
         universe = resolve_universe(self.strategy.params)
         snaps: list[dict[str, Any]] = []
         try:
+            # Subscribe once for the scan, wait for WS, then optional single OHLC REST.
+            quotes.ensure_subscribed(universe)
+            quotes.prefetch_ltps(universe[:30], wait_ws_sec=2.0)
             batch = quotes.equity_day_snapshots(universe)
             snaps = list(batch.values())
             self._log(
                 f"Scan via {quotes.feed_status}: {len(snaps)}/{len(universe)} snapshots"
             )
         except Exception as exc:
-            self._log(f"batch scan failed ({exc}); falling back per-symbol")
-            for sym in universe:
-                try:
-                    snap = quotes.equity_day_snapshot(sym)
-                    if snap:
-                        snaps.append(snap)
-                except Exception as skip_exc:
-                    self._log(f"scan skip {sym}: {skip_exc}")
+            err = str(exc)
+            if "429" in err or "too many" in err.lower():
+                self._scan_cool_until = time.time() + 300.0
+                self._log(f"batch scan rate-limited — cooling 300s ({exc})")
+                return
+            self._log(f"batch scan failed ({exc}) — will retry next poll (no per-symbol REST)")
+            return
+        if len(snaps) < max(5, len(universe) // 10):
+            # Too thin to trust rankings — wait for more WS ticks instead of REST spam.
+            self._scan_cool_until = time.time() + 60.0
+            self._log(f"Scan incomplete ({len(snaps)} snaps) — waiting for more dhan-ws ticks")
+            return
         picked = self.strategy.select_symbols(snaps)
         self.selected = list(picked)
         self._scanned = True
@@ -303,14 +335,21 @@ class BasketRunner:
     def tick_live(self, quotes: LiveQuoteProvider) -> list[str]:
         self.ensure_selection(quotes)
         labels = []
+        # Prefer WS ticks already warmed by session.prefetch_ltps — no long waits here.
         for sym in list(self.selected):
             try:
-                price, ts, src = quotes.get_ltp(sym)
+                price, ts, src = quotes.get_ltp(
+                    sym, allow_rest=False, wait_ws_sec=0.4, max_stale_sec=180
+                )
                 bar = Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=0)
                 self.on_symbol_bar(sym, bar)
                 labels.append(f"{sym}={price:.2f}")
             except Exception as exc:
-                self._log(f"LTP {sym}: {exc}")
+                err = str(exc)
+                if "429" in err or "too many" in err.lower() or "rate limited" in err.lower():
+                    self._log(f"LTP {sym}: waiting for dhan-ws (429 cool-down)")
+                else:
+                    self._log(f"LTP {sym}: {exc}")
         return labels
 
     def run_replay(self, quotes: LiveQuoteProvider, max_bars: int | None = 500) -> None:

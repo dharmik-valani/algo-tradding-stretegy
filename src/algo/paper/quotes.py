@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 import time
-
-import httpx
 
 from algo.config import Settings
 from algo.ingest.rate_limiter import RateLimiter
@@ -14,6 +12,7 @@ from algo.paper.models import Bar
 from algo.providers.base import ProviderError
 from algo.providers.dhan.client import DhanClient
 from algo.providers.dhan.live_feed import DhanLiveFeed
+from algo.providers.dhan.parser import parse_columnar_candles
 
 IST = ZoneInfo("Asia/Kolkata")
 
@@ -25,35 +24,33 @@ INDEX_LTP_KEYS = {
     "SENSEX": ("IDX_I", "51"),
 }
 
-# Public Yahoo symbols for paper prices when Dhan Data API is not subscribed.
-YAHOO_SYMBOLS = {
-    "NIFTY": "^NSEI",
-    "BANKNIFTY": "^NSEBANK",
-    "FINNIFTY": "NIFTY_FIN_SERVICE.NS",
-    "MIDCPNIFTY": "NIFTY_MID_SELECT.NS",
-    "SENSEX": "^BSESN",
-    "RELIANCE": "RELIANCE.NS",
-    "HDFCBANK": "HDFCBANK.NS",
-    "ICICIBANK": "ICICIBANK.NS",
-    "INFY": "INFY.NS",
-    "TCS": "TCS.NS",
-    "SBIN": "SBIN.NS",
-    "ITC": "ITC.NS",
-    "BHARTIARTL": "BHARTIARTL.NS",
-    "LT": "LT.NS",
-    "AXISBANK": "AXISBANK.NS",
-}
-
 # Dhan marketfeed allows up to 1000 ids / request.
 _DHAN_BATCH = 900
 
+# Accept legacy env values; all map to Dhan-only behaviour.
+_DHAN_SOURCES = {"dhan", "dhan-ws", "auto", "public"}
+
+
+def suggested_poll_seconds(want_count: int, *, base: float = 15.0) -> float:
+    """Scale live poll interval with active symbol load (keeps WS healthy).
+
+    Official Quote REST is 1/s; we prefer WS, but denser books still need
+    slower poll loops so subscribe/reconnect storms stay rare.
+    """
+    n = max(0, int(want_count))
+    if n <= 20:
+        target = 15.0
+    elif n <= 50:
+        target = 25.0
+    elif n <= 100:
+        target = 40.0
+    else:
+        target = 60.0
+    return max(float(base), target)
+
 
 class LiveQuoteProvider:
-    """Paper price feed.
-
-    - public: Yahoo (no Dhan Data API)
-    - dhan / auto: prefer Dhan WebSocket live feed, REST LTP/OHLC fallback, then Yahoo (auto)
-    """
+    """Paper price feed — Dhan WebSocket first, REST LTP/OHLC fallback. No Yahoo."""
 
     def __init__(
         self,
@@ -63,16 +60,28 @@ class LiveQuoteProvider:
         enable_dhan_feed: bool = True,
     ) -> None:
         self.settings = settings
-        self.source = (getattr(settings, "paper_price_source", None) or "auto").lower()
+        raw = (getattr(settings, "paper_price_source", None) or "dhan-ws").lower()
+        self.source = "dhan-ws" if raw in _DHAN_SOURCES else raw
         live_url = settings.yaml_config.get("dhan", {}).get("base_url", "https://api.dhan.co/v2")
         self._dhan: DhanClient | None = None
         self._ws: DhanLiveFeed | None = None
-        self._http = httpx.Client(timeout=20.0, headers={"User-Agent": "algo-paper-desk/0.1"})
-        self._dhan_feed_ok: bool | None = None  # None=unknown, False=disable REST for session
+        self._dhan_feed_ok: bool | None = None  # None=unknown
         self._last_dhan_error: str | None = None
         self._token: str = ""
         self._rest_cooldown_until = 0.0
-        self._enable_dhan_feed = enable_dhan_feed and self.source in {"dhan", "auto", "dhan-ws"}
+        # Short-lived REST LTP memo so one poll doesn't fire N identical calls.
+        self._rest_ltp_memo: dict[str, tuple[float, float]] = {}
+        # Last-known marks for risk checks when the socket briefly drops (keep trading).
+        # symbol -> (price, monotonic_ts, source)
+        self._mark_cache: dict[str, tuple[float, float, str]] = {}
+        self._enable_dhan_feed = enable_dhan_feed
+        self._429_strikes = 0
+        # Diagnostics for rate-limit monitoring (ring buffer).
+        self._rl_events: list[dict[str, Any]] = []
+        self._rest_calls: dict[str, int] = {"quote": 0, "data": 0, "other": 0}
+        self._rest_ok: dict[str, int] = {"quote": 0, "data": 0, "other": 0}
+        self._last_want_syms: list[str] = []
+
 
         if self._enable_dhan_feed:
             try:
@@ -89,15 +98,16 @@ class LiveQuoteProvider:
                         access_token=self._token,
                         base_url=live_url,
                         timeout=settings.timeout_seconds,
-                        # Paper live poll is slow; keep REST gentle to avoid 429.
-                        limiter=RateLimiter(min(settings.requests_per_second, 0.5), settings.requests_per_day),
+                        # Official DhanHQ: Quote=1/s, Data=5/s — stay under both.
+                        quote_limiter=RateLimiter(settings.quote_requests_per_second, settings.requests_per_day),
+                        data_limiter=RateLimiter(settings.requests_per_second, settings.requests_per_day),
                     )
                     self._ws = DhanLiveFeed(
                         client_id=settings.dhan_client_id,
                         token_provider=self._live_token,
                         prefer_quote=True,
                     )
-                    # Lazy-start on first subscribe — avoids opening sockets during Yahoo-only replay.
+                    # Lazy-start on first subscribe.
                     rotator = TokenRotator.instance()
                     rotator.on_renew(self._on_token_renewed)
                     rotator.start()
@@ -123,19 +133,111 @@ class LiveQuoteProvider:
         return self._token
 
     def _rest_cooling(self) -> bool:
+        # Self-heal legacy long cools (old builds used 300–1200s).
+        left = self._rest_cooldown_until - time.time()
+        if left > 120:
+            self._rest_cooldown_until = time.time() + 30.0
         return time.time() < self._rest_cooldown_until
 
-    def _mark_rate_limited(self, exc: Exception | str, *, seconds: float = 180.0) -> None:
+    def _mark_rate_limited(
+        self,
+        exc: Exception | str,
+        *,
+        seconds: float = 300.0,
+        kind: str = "quote",
+        context: str = "",
+    ) -> None:
+        """Pause REST only after 429. WebSocket keep running so live marks continue."""
         msg = str(exc)
         self._last_dhan_error = msg
-        self._dhan_feed_ok = False
-        if "429" in msg or "too many" in msg.lower():
-            self._rest_cooldown_until = max(self._rest_cooldown_until, time.time() + seconds)
-            if self._ws is not None:
-                self._ws._rate_limited_until = max(
-                    getattr(self._ws, "_rate_limited_until", 0.0),
-                    time.time() + seconds,
-                )
+        if "429" in msg or "too many" in msg.lower() or "805" in msg:
+            self._429_strikes += 1
+            # REST-only cool — WS marks keep trading. Keep this short (not 5–20 min).
+            cool = min(45.0 * min(self._429_strikes, 3), 120.0)
+            self._rest_cooldown_until = max(self._rest_cooldown_until, time.time() + cool)
+            event = {
+                "ts": datetime.now(tz=IST).isoformat(),
+                "kind": kind,
+                "context": context or "unknown",
+                "message": msg[:240],
+                "strikes": self._429_strikes,
+                "cool_seconds": int(cool),
+                "want_symbols": len(self._last_want_syms),
+                "mark_cache": len(self._mark_cache),
+                "ws_status": self._ws.status if self._ws is not None else "no-ws",
+            }
+            self._rl_events.append(event)
+            self._rl_events = self._rl_events[-40:]
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "dhan-rate-limit kind=%s ctx=%s cool=%ss strikes=%s want=%s msg=%s",
+                kind,
+                context,
+                int(cool),
+                self._429_strikes,
+                len(self._last_want_syms),
+                msg[:160],
+            )
+        else:
+            self._dhan_feed_ok = False
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Snapshot for /api/feed — used to diagnose rate limits without guessing."""
+        ws = self._ws
+        return {
+            "feed_status": self.feed_status,
+            "source": self.source,
+            "want_symbols": list(self._last_want_syms),
+            "want_count": len(self._last_want_syms),
+            "mark_cache_count": len(self._mark_cache),
+            "rest_cooling": self._rest_cooling(),
+            "rest_cool_seconds_left": int(max(0, self._rest_cooldown_until - time.time()))
+            if self._rest_cooling()
+            else 0,
+            "strikes_429": self._429_strikes,
+            "rest_calls": dict(self._rest_calls),
+            "rest_ok": dict(self._rest_ok),
+            "ws": {
+                "connected": bool(ws and ws.connected),
+                "rate_limited": bool(ws and ws.rate_limited()),
+                "status": ws.status if ws else None,
+                "cache_ticks": len(ws._cache) if ws else 0,
+                "wanted": len(ws._wanted) if ws else 0,
+                "last_error": ws.last_error if ws else None,
+                "cool_seconds_left": int(max(0, (ws._rate_limited_until - time.time())))
+                if ws and ws.rate_limited()
+                else 0,
+            },
+            "recent_rate_limits": list(self._rl_events[-10:]),
+            "suggested_poll_seconds": suggested_poll_seconds(len(self._last_want_syms)),
+            "adaptive_poll_table": {
+                "<=20": 15,
+                "21-50": 25,
+                "51-100": 40,
+                ">100": 60,
+            },
+        }
+
+    def _clear_rate_limit_on_success(self) -> None:
+        if not self._rest_cooling():
+            self._429_strikes = 0
+
+    def _remember_mark(self, symbol: str, price: float, source: str) -> None:
+        self._mark_cache[symbol.upper()] = (float(price), time.monotonic(), source)
+
+    def _cached_mark(
+        self, symbol: str, *, max_stale_sec: float
+    ) -> tuple[float, datetime, str] | None:
+        row = self._mark_cache.get(symbol.upper())
+        if not row:
+            return None
+        price, mono, source = row
+        age = time.monotonic() - mono
+        if age > max_stale_sec:
+            return None
+        tag = source if age < 2.0 else f"{source}-stale:{int(age)}s"
+        return price, datetime.now(tz=IST), tag
 
     def close(self) -> None:
         try:
@@ -150,20 +252,40 @@ class LiveQuoteProvider:
         if self._dhan is not None:
             self._dhan.close()
             self._dhan = None
-        self._http.close()
+
+    def wait_for_ws(self, timeout: float = 8.0) -> bool:
+        """Start the feed and wait briefly for the socket to come up."""
+        if self._ws is None:
+            return False
+        if self._ws.rate_limited():
+            return False
+        if not self._ws._thread or not self._ws._thread.is_alive():
+            self._ws.start()
+        deadline = time.time() + max(timeout, 0.5)
+        while time.time() < deadline:
+            if self._ws.connected:
+                return True
+            if self._ws.rate_limited():
+                return False
+            time.sleep(0.2)
+        return bool(self._ws.connected)
 
     def ensure_subscribed(self, symbols: list[str]) -> None:
         """Subscribe WebSocket instruments for active paper symbols."""
         if self._ws is None:
             return
+        cleaned = [s.upper() for s in symbols if s]
+        self._last_want_syms = list(dict.fromkeys(cleaned))
+        # Only skip while the *socket* itself is rate-limited (reconnect cool).
+        # REST cool must NOT stop websocket subscribe/trade marks.
         if self._ws.rate_limited():
             return
         if not self._ws._thread or not self._ws._thread.is_alive():
             self._ws.start()
         instruments: list[tuple[str, str]] = []
-        for sym in symbols:
+        for sym in self._last_want_syms:
             try:
-                instruments.append(self._resolve_dhan_key(sym.upper()))
+                instruments.append(self._resolve_dhan_key(sym))
             except Exception:
                 continue
         if instruments:
@@ -178,19 +300,38 @@ class LiveQuoteProvider:
             return None
         return self._ws.get(segment, sid)
 
+    def _wait_ws_ltp(self, symbol: str, *, wait_sec: float = 2.5) -> float | None:
+        """Poll the WS cache briefly after subscribe — avoids needless REST."""
+        deadline = time.time() + max(wait_sec, 0.0)
+        while True:
+            q = self._ws_quote(symbol)
+            if q and q.get("ltp") is not None:
+                return float(q["ltp"])
+            if time.time() >= deadline:
+                return None
+            if self._ws is not None and self._ws.rate_limited() and not self._ws.connected:
+                return None
+            time.sleep(0.12)
+
     def equity_day_snapshot(self, symbol: str) -> dict[str, float | str] | None:
         """Today's OHLCV + prev close for scanner filters (gainers/losers)."""
         snaps = self.equity_day_snapshots([symbol])
         return snaps.get(symbol.upper())
 
     def equity_day_snapshots(self, symbols: list[str]) -> dict[str, dict[str, float | str]]:
-        """Batch day snapshots — prefers WS cache / Dhan OHLC, falls back to Yahoo."""
+        """Batch day snapshots — WS cache, then one Dhan OHLC REST. No Yahoo.
+
+        On REST 429 returns whatever WS already has (partial) instead of raising,
+        so scanners can back off without hammering LTP one symbol at a time.
+        """
         wanted = [s.upper() for s in symbols if s]
         out: dict[str, dict[str, float | str]] = {}
         if not wanted:
             return out
 
         self.ensure_subscribed(wanted)
+        # Give quote packets a moment to land before REST.
+        time.sleep(0.6)
         for sym in wanted:
             q = self._ws_quote(sym)
             if not q or q.get("ltp") is None:
@@ -215,93 +356,149 @@ class LiveQuoteProvider:
         missing = [s for s in wanted if s not in out]
         if (
             missing
-            and self.source in {"dhan", "auto", "dhan-ws"}
             and self._dhan is not None
-            and self._dhan_feed_ok is not False
             and not self._rest_cooling()
-            and not (self._ws is not None and self._ws.rate_limited())
+            and len(out) < max(5, len(wanted) // 5)
         ):
             try:
                 out.update(self._dhan_equity_snapshots(missing))
                 if out:
                     self._dhan_feed_ok = True
-            except Exception as exc:
-                self._mark_rate_limited(exc)
-                if self.source == "dhan":
+                    self._clear_rate_limit_on_success()
+            except Exception:
+                if not out:
                     raise
-
-        missing = [s for s in wanted if s not in out]
-        if missing and self.source != "dhan" and self.source != "dhan-ws":
-            for sym in missing:
-                try:
-                    snap = self._yahoo_equity_snapshot(sym)
-                    if snap:
-                        out[sym] = snap
-                except Exception:
-                    continue
         return out
 
-    def get_ltp(self, symbol: str) -> tuple[float, datetime, str]:
+    def prefetch_ltps(
+        self,
+        symbols: list[str],
+        *,
+        wait_ws_sec: float = 2.5,
+        allow_rest: bool = False,
+    ) -> None:
+        """Warm WebSocket ticks for active symbols. Live path keeps allow_rest=False."""
+        wanted = [s.upper() for s in symbols if s]
+        if not wanted:
+            return
+        self.ensure_subscribed(wanted)
+        deadline = time.time() + max(wait_ws_sec, 0.0)
+        missing = list(wanted)
+        while missing and time.time() < deadline:
+            still: list[str] = []
+            for sym in missing:
+                q = self._ws_quote(sym)
+                if q and q.get("ltp") is not None:
+                    self._remember_mark(sym, float(q["ltp"]), "dhan-ws")
+                    continue
+                still.append(sym)
+            missing = still
+            if missing:
+                time.sleep(0.12)
+        if not missing or not allow_rest or self._dhan is None or self._rest_cooling():
+            return
+        try:
+            prices = self._dhan_ltp_batch(missing)
+            now = time.monotonic()
+            for sym, price in prices.items():
+                self._rest_ltp_memo[sym] = (price, now)
+                self._remember_mark(sym, price, "dhan")
+            self._dhan_feed_ok = True
+            self._clear_rate_limit_on_success()
+        except Exception:
+            return
+
+    def _stale_budget(self, max_stale_sec: float) -> float:
+        """While WS is reconnecting / 429-cooling, keep last marks longer for SL/TP."""
+        if self._ws is not None and (self._ws.rate_limited() or not self._ws.connected):
+            return max(float(max_stale_sec), 600.0)
+        return float(max_stale_sec)
+
+    def get_ltp(
+        self,
+        symbol: str,
+        *,
+        allow_rest: bool = False,
+        wait_ws_sec: float = 1.5,
+        max_stale_sec: float = 180.0,
+    ) -> tuple[float, datetime, str]:
+        """Live marks: WebSocket first, then last-known mark (keeps SL/TP alive)."""
         symbol = symbol.upper()
+        if self._dhan is None and self._ws is None:
+            raise ProviderError(
+                self._last_dhan_error or "Dhan feed not configured (token / client id)",
+                code="NO_DHAN",
+            )
+
         self.ensure_subscribed([symbol])
+        stale_budget = self._stale_budget(max_stale_sec)
+        # Don't block the live loop while WS is cooling — use cache immediately.
+        if self._ws is not None and self._ws.rate_limited():
+            wait_ws_sec = min(wait_ws_sec, 0.05)
+
         q = self._ws_quote(symbol)
         if q and q.get("ltp") is not None:
-            return float(q["ltp"]), datetime.now(tz=IST), "dhan-ws"
+            px = float(q["ltp"])
+            self._remember_mark(symbol, px, "dhan-ws")
+            return px, datetime.now(tz=IST), "dhan-ws"
 
-        if self.source in {"dhan", "dhan-ws"}:
-            if self._rest_cooling() or (self._ws is not None and self._ws.rate_limited()):
-                raise ProviderError(self._last_dhan_error or "Dhan rate limited", code="429")
+        price = self._wait_ws_ltp(symbol, wait_sec=wait_ws_sec)
+        if price is not None:
+            self._remember_mark(symbol, price, "dhan-ws")
+            return price, datetime.now(tz=IST), "dhan-ws"
+
+        cached = self._cached_mark(symbol, max_stale_sec=stale_budget)
+        if cached is not None:
+            return cached
+
+        if allow_rest and not self._rest_cooling() and self._dhan is not None:
             try:
-                return (*self._dhan_ltp(symbol), "dhan")
-            except Exception as exc:
-                self._mark_rate_limited(exc)
-                raise
-        if self.source == "public":
-            return (*self._yahoo_ltp(symbol), "public")
-        # auto — skip REST while cooling; use Yahoo quietly
+                px, ts = self._dhan_ltp(symbol)
+                self._rest_ltp_memo[symbol] = (px, time.monotonic())
+                self._remember_mark(symbol, px, "dhan")
+                self._dhan_feed_ok = True
+                self._clear_rate_limit_on_success()
+                return px, ts, "dhan"
+            except Exception:
+                pass
+
+        # Index underlyings: one REST seed if WS is down and we have no mark yet
+        # (keeps option SL/TP alive without waiting for a long reconnect).
         if (
-            self._dhan is not None
-            and self._dhan_feed_ok is not False
+            symbol in INDEX_LTP_KEYS
+            and self._dhan is not None
             and not self._rest_cooling()
-            and not (self._ws is not None and self._ws.rate_limited())
+            and (self._ws is None or not self._ws.connected)
         ):
             try:
-                price, ts = self._dhan_ltp(symbol)
+                px, ts = self._dhan_ltp(symbol)
+                self._rest_ltp_memo[symbol] = (px, time.monotonic())
+                self._remember_mark(symbol, px, "dhan")
                 self._dhan_feed_ok = True
-                return price, ts, "dhan"
-            except Exception as exc:
-                self._mark_rate_limited(exc)
-        return (*self._yahoo_ltp(symbol), "public")
+                self._clear_rate_limit_on_success()
+                return px, ts, "dhan-seed"
+            except Exception:
+                pass
+
+        raise ProviderError(
+            "No Dhan websocket mark yet — subscribed; waiting for next tick",
+            code="NO_TICK",
+        )
 
     @property
     def feed_status(self) -> str:
-        if self.source == "public":
-            return "public (Yahoo)"
+        parts: list[str] = []
         if self._ws is not None and self._ws.connected:
-            return self._ws.status
-        if self._rest_cooling() or (self._ws is not None and self._ws.rate_limited()):
-            wait = 0
-            if self._rest_cooling():
-                wait = max(wait, int(self._rest_cooldown_until - time.time()))
-            if self._ws is not None and self._ws.rate_limited():
-                wait = max(wait, int(self._ws._rate_limited_until - time.time()))
-            return f"public (Yahoo; Dhan cooling {wait}s after 429)"
-        if self._dhan_feed_ok is True:
-            return "dhan-rest"
-        parts = []
-        if self._ws is not None:
             parts.append(self._ws.status)
-        if self._last_dhan_error and "429" not in (self._last_dhan_error or ""):
-            parts.append(self._last_dhan_error)
-        if self.source in {"auto"}:
-            return "public (Yahoo; " + ("; ".join(parts) or "probing Dhan") + ")"
-        return "; ".join(parts) or f"{self.source} (probing)"
-
-    def _yahoo_symbol(self, symbol: str) -> str:
-        symbol = symbol.upper()
-        if symbol in YAHOO_SYMBOLS:
-            return YAHOO_SYMBOLS[symbol]
-        return f"{symbol}.NS"
+        elif self._ws is not None and self._ws.rate_limited():
+            wait = int(max(0, self._ws._rate_limited_until - time.time()))
+            parts.append(f"dhan-ws reconnect in {wait}s")
+        elif self._ws is not None:
+            parts.append(self._ws.status)
+        if self._rest_cooling():
+            wait = int(max(0, self._rest_cooldown_until - time.time()))
+            parts.append(f"REST paused {wait}s (WS marks continue)")
+        return " · ".join(parts) if parts else "dhan (probing)"
 
     def as_bar(self, symbol: str) -> Bar:
         price, ts, _src = self.get_ltp(symbol)
@@ -317,7 +514,18 @@ class LiveQuoteProvider:
         state: dict[str, float] | None = None,
     ) -> tuple[Bar, dict[str, float]]:
         """Synthetic option premium from spot — for paper without option-chain Data API."""
-        spot, ts, _ = self.get_ltp(underlying)
+        st = state or {}
+        try:
+            spot, ts, _ = self.get_ltp(
+                underlying, allow_rest=False, wait_ws_sec=0.4, max_stale_sec=180
+            )
+        except Exception:
+            # Keep option SL/TP alive on last known spot while WS reconnects.
+            if st.get("spot") or st.get("prev_spot"):
+                spot = float(st.get("spot") or st.get("prev_spot") or 0)
+                ts = datetime.now(tz=IST)
+            else:
+                raise
         step = max(int(strike_step), 1)
         atm = int(round(spot / step) * step)
         if strike_mode == "ATM+1":
@@ -326,7 +534,8 @@ class LiveQuoteProvider:
             strike = atm - step
         else:
             strike = atm
-        st = state or {}
+        if st.get("strike"):
+            strike = int(st["strike"])
         prev_spot = float(st.get("prev_spot", spot))
         premium = float(st.get("premium", _seed_premium(spot, strike, option_type)))
         move = spot - prev_spot
@@ -383,43 +592,73 @@ class LiveQuoteProvider:
         return out
 
     def load_public_bars(self, symbol: str, *, interval: str = "5m", range_: str = "5d") -> list[Bar]:
-        """Historical-ish bars from Yahoo for Replay without Dhan Data API."""
-        ysym = self._yahoo_symbol(symbol)
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}"
-        response = self._http.get(url, params={"interval": interval, "range": range_})
-        response.raise_for_status()
-        payload = response.json()
-        result = (payload.get("chart") or {}).get("result") or []
-        if not result:
-            raise ValueError(f"No Yahoo chart data for {symbol}")
-        block = result[0]
-        ts_list = block.get("timestamp") or []
-        quote = ((block.get("indicators") or {}).get("quote") or [{}])[0]
-        opens = quote.get("open") or []
-        highs = quote.get("high") or []
-        lows = quote.get("low") or []
-        closes = quote.get("close") or []
-        volumes = quote.get("volume") or []
-        bars: list[Bar] = []
-        for i, ts in enumerate(ts_list):
-            close = closes[i] if i < len(closes) else None
-            if close is None:
-                continue
-            bars.append(
-                Bar(
-                    timestamp=datetime.fromtimestamp(int(ts), tz=IST),
-                    open=float(opens[i] if i < len(opens) and opens[i] is not None else close),
-                    high=float(highs[i] if i < len(highs) and highs[i] is not None else close),
-                    low=float(lows[i] if i < len(lows) and lows[i] is not None else close),
-                    close=float(close),
-                    volume=float(volumes[i] if i < len(volumes) and volumes[i] is not None else 0),
-                )
+        """Historical bars from Dhan charts (name kept for call-site compatibility)."""
+        if self._dhan is None:
+            raise ProviderError(
+                self._last_dhan_error or "Dhan client required for historical bars",
+                code="NO_DHAN",
             )
-        return bars
+        if self._rest_cooling():
+            wait = int(max(0, self._rest_cooldown_until - time.time()))
+            raise ProviderError(
+                f"Dhan charts deferred {wait}s after REST 429 (WS live marks continue)",
+                code="429",
+            )
+        segment, security_id = self._resolve_dhan_key(symbol.upper())
+        instrument = "INDEX" if segment == "IDX_I" else "EQUITY"
+        interval_key = {"1m": "1", "1": "1", "5m": "5", "5": "5", "15m": "15", "15": "15"}.get(
+            interval, "5"
+        )
+        days = _range_to_days(range_)
+        end = date.today()
+        start = end - timedelta(days=days)
+        self._rest_calls["data"] = self._rest_calls.get("data", 0) + 1
+        try:
+            payload = self._dhan.post_json(
+                "/charts/intraday",
+                {
+                    "securityId": str(security_id),
+                    "exchangeSegment": segment,
+                    "instrument": instrument,
+                    "interval": interval_key,
+                    "oi": False,
+                    "fromDate": start.isoformat(),
+                    "toDate": end.isoformat(),
+                },
+            )
+        except Exception as exc:
+            self._mark_rate_limited(exc, kind="data", context=f"charts:{symbol}:{interval}")
+            raise
+        self._rest_ok["data"] = self._rest_ok.get("data", 0) + 1
+        if not isinstance(payload, dict):
+            payload = {}
+        candles = parse_columnar_candles(
+            payload,
+            instrument_id=f"{segment}:{security_id}",
+            timeframe=interval if interval.endswith("m") else f"{interval}m",
+            source="dhan",
+        )
+        self._clear_rate_limit_on_success()
+        return [
+            Bar(
+                timestamp=c.timestamp.astimezone(IST)
+                if c.timestamp.tzinfo
+                else c.timestamp.replace(tzinfo=IST),
+                open=float(c.open),
+                high=float(c.high),
+                low=float(c.low),
+                close=float(c.close),
+                volume=float(c.volume or 0),
+            )
+            for c in candles
+        ]
 
     def synthetic_bars(self, symbol: str, *, n: int = 300, start: float | None = None) -> list[Bar]:
         """Deterministic walk for offline UI demos when no feed is available."""
-        price, _, _ = self.get_ltp(symbol) if start is None else (start, datetime.now(tz=IST), "manual")
+        if start is None:
+            price, _, _ = self.get_ltp(symbol)
+        else:
+            price = start
         now = datetime.now(tz=IST)
         bars: list[Bar] = []
         px = float(price)
@@ -442,9 +681,57 @@ class LiveQuoteProvider:
         if self._dhan is None:
             raise ProviderError("Dhan client not configured", code="NO_DHAN")
         segment, security_id = self._resolve_dhan_key(symbol)
-        payload = self._dhan.post_json("/marketfeed/ltp", {segment: [int(security_id)]})
+        self._rest_calls["quote"] = self._rest_calls.get("quote", 0) + 1
+        try:
+            payload = self._dhan.post_json("/marketfeed/ltp", {segment: [int(security_id)]})
+        except Exception as exc:
+            self._mark_rate_limited(exc, kind="quote", context=f"ltp:{symbol}")
+            raise
+        self._rest_ok["quote"] = self._rest_ok.get("quote", 0) + 1
         price = _extract_ltp(payload, segment, security_id)
         return price, datetime.now(tz=IST)
+
+    def _dhan_ltp_batch(self, symbols: list[str]) -> dict[str, float]:
+        """One marketfeed/ltp call for many symbols, grouped by segment."""
+        if self._dhan is None:
+            raise ProviderError("Dhan client not configured", code="NO_DHAN")
+        by_seg: dict[str, list[int]] = {}
+        sid_to_sym: dict[tuple[str, str], str] = {}
+        for sym in symbols:
+            try:
+                segment, security_id = self._resolve_dhan_key(sym.upper())
+            except Exception:
+                continue
+            by_seg.setdefault(segment, []).append(int(security_id))
+            sid_to_sym[(segment, str(security_id))] = sym.upper()
+        if not by_seg:
+            return {}
+        body = {seg: ids for seg, ids in by_seg.items()}
+        self._rest_calls["quote"] = self._rest_calls.get("quote", 0) + 1
+        try:
+            payload = self._dhan.post_json("/marketfeed/ltp", body)
+        except Exception as exc:
+            self._mark_rate_limited(
+                exc, kind="quote", context=f"ltp_batch:n={len(symbols)}"
+            )
+            raise
+        self._rest_ok["quote"] = self._rest_ok.get("quote", 0) + 1
+        out: dict[str, float] = {}
+        data = payload.get("data") if isinstance(payload, dict) else None
+        if not isinstance(data, dict):
+            raise ValueError(f"Unexpected LTP batch payload: {payload}")
+        for segment, rows in data.items():
+            if not isinstance(rows, dict):
+                continue
+            for sid, row in rows.items():
+                sym = sid_to_sym.get((str(segment), str(sid)))
+                if not sym:
+                    continue
+                try:
+                    out[sym] = _extract_ltp({"data": {segment: {str(sid): row}}}, str(segment), str(sid))
+                except Exception:
+                    continue
+        return out
 
     def _dhan_equity_snapshots(self, symbols: list[str]) -> dict[str, dict[str, float | str]]:
         if self._dhan is None:
@@ -464,61 +751,26 @@ class LiveQuoteProvider:
             chunk = ids[i : i + _DHAN_BATCH]
             if not chunk:
                 continue
-            payload = self._dhan.post_json("/marketfeed/ohlc", {"NSE_EQ": chunk})
+            self._rest_calls["quote"] = self._rest_calls.get("quote", 0) + 1
+            try:
+                payload = self._dhan.post_json("/marketfeed/ohlc", {"NSE_EQ": chunk})
+            except Exception as exc:
+                self._mark_rate_limited(
+                    exc, kind="quote", context=f"ohlc_batch:n={len(chunk)}"
+                )
+                raise
+            self._rest_ok["quote"] = self._rest_ok.get("quote", 0) + 1
             out.update(_extract_ohlc_batch(payload, "NSE_EQ", sid_to_sym))
         return out
 
-    def _yahoo_equity_snapshot(self, symbol: str) -> dict[str, float | str] | None:
-        ysym = self._yahoo_symbol(symbol)
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}"
-        response = self._http.get(url, params={"interval": "5m", "range": "1d"})
-        response.raise_for_status()
-        payload = response.json()
-        result = (payload.get("chart") or {}).get("result") or []
-        if not result:
-            return None
-        block = result[0]
-        meta = block.get("meta") or {}
-        quote = ((block.get("indicators") or {}).get("quote") or [{}])[0]
-        opens = [x for x in (quote.get("open") or []) if x is not None]
-        highs = [x for x in (quote.get("high") or []) if x is not None]
-        lows = [x for x in (quote.get("low") or []) if x is not None]
-        closes = [x for x in (quote.get("close") or []) if x is not None]
-        if not opens or not closes:
-            return None
-        day_open = float(opens[0])
-        day_high = float(max(highs)) if highs else day_open
-        day_low = float(min(lows)) if lows else day_open
-        last = float(closes[-1])
-        prev = meta.get("chartPreviousClose") or meta.get("previousClose") or day_open
-        return {
-            "symbol": symbol.upper(),
-            "open": day_open,
-            "high": day_high,
-            "low": day_low,
-            "close": last,
-            "prev_close": float(prev),
-            "source": "public",
-        }
 
-    def _yahoo_ltp(self, symbol: str) -> tuple[float, datetime]:
-        ysym = self._yahoo_symbol(symbol)
-        url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ysym}"
-        response = self._http.get(url, params={"interval": "1m", "range": "1d"})
-        response.raise_for_status()
-        payload = response.json()
-        result = (payload.get("chart") or {}).get("result") or []
-        if not result:
-            raise ValueError(f"No public quote for {symbol}")
-        meta = result[0].get("meta") or {}
-        price = meta.get("regularMarketPrice") or meta.get("postMarketPrice") or meta.get("previousClose")
-        if price is None:
-            closes = (((result[0].get("indicators") or {}).get("quote") or [{}])[0].get("close") or [])
-            closes = [c for c in closes if c is not None]
-            if not closes:
-                raise ValueError(f"Empty public quote for {symbol}")
-            price = closes[-1]
-        return float(price), datetime.now(tz=IST)
+def _range_to_days(range_: str) -> int:
+    raw = (range_ or "5d").strip().lower()
+    if raw.endswith("d") and raw[:-1].isdigit():
+        return max(1, int(raw[:-1]))
+    if raw.isdigit():
+        return max(1, int(raw))
+    return 5
 
 
 def _extract_ltp(payload: Any, segment: str, security_id: str) -> float:

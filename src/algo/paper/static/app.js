@@ -438,16 +438,20 @@ function renderExecStats(session) {
     root.innerHTML = `<div class="empty">Desk is empty. Add a strategy below to start paper trading.</div>`;
     return;
   }
-  root.innerHTML = strats
+  const rows = strats
     .map((s) => {
       const id = s.instance_id || s.strategy_id;
       const a = map[id] || {};
-      const total = (s.realized_pnl || 0) + (s.unrealized_pnl || 0);
+      const realized = s.realized_pnl || 0;
+      const unreal = s.unrealized_pnl || 0;
+      const total = realized + unreal;
+      const tv = s.trade_view || {};
       const basket = s.basket || [];
       const active = basket.filter((l) => l.in_trade);
       const selected = (s.params?.selected || []).length || basket.length || 0;
       const inTrade = s.legs_in_trade != null ? s.legs_in_trade : active.length;
       const posQty = s.position?.quantity || 0;
+      const isOpen = !!(inTrade || (posQty && !basket.length) || tv.in_trade);
 
       let stocks;
       if (basket.length || selected) {
@@ -455,28 +459,69 @@ function renderExecStats(session) {
       } else {
         stocks = posQty ? String(Math.abs(posQty)) : "0";
       }
+      const posLabel = basket.length ? "In trade" : "Pos";
 
-      let last = "—";
+      let market = "—";
+      let entry = "—";
       let sl = "—";
       let tp = "—";
+      let levelsHint = "";
       if (basket.length) {
         if (active.length === 1) {
-          last = money(active[0].last ?? s.last_price);
+          market = money(active[0].last ?? s.last_price);
+          entry = active[0].avg != null ? money(active[0].avg) : (s.entry_price != null ? money(s.entry_price) : "—");
           sl = active[0].stop != null ? money(active[0].stop) : "—";
           tp = active[0].target != null ? money(active[0].target) : "—";
+          levelsHint = "open";
         } else if (active.length > 1) {
-          last = `${active.length} open`;
+          market = `${active.length} open`;
+          entry = "multi";
           sl = "multi";
           tp = "multi";
-        } else if (s.last_price != null) {
-          last = money(s.last_price);
+          levelsHint = "open";
+        } else {
+          if (s.last_price != null) market = money(s.last_price);
+          const lc = tv.last_closed;
+          if (lc && lc.entry != null) {
+            entry = money(lc.entry);
+            levelsHint = "last closed";
+            sl = "flat";
+            tp = lc.exit != null ? money(lc.exit) : "flat";
+          } else {
+            entry = "flat";
+            sl = "flat";
+            tp = "flat";
+            levelsHint = "no open trade";
+          }
         }
-      } else {
-        last = s.last_price != null ? money(s.last_price) : "—";
+      } else if (isOpen && s.entry_price != null) {
+        market = s.last_price != null ? money(s.last_price) : "—";
+        entry = money(s.entry_price);
         sl = s.stop_price != null ? money(s.stop_price) : "—";
         tp = s.target_price != null ? money(s.target_price) : "—";
+        levelsHint = "open";
+      } else {
+        market = s.last_price != null ? money(s.last_price) : "—";
+        const lc = tv.last_closed;
+        if (lc && lc.entry != null) {
+          entry = money(lc.entry);
+          levelsHint = "last closed";
+          sl = "flat";
+          tp = lc.exit != null ? money(lc.exit) : "flat";
+        } else {
+          entry = "flat";
+          sl = "flat";
+          tp = "flat";
+          levelsHint = "no open trade";
+        }
       }
 
+      const pnlSub =
+        Math.abs(unreal) > 1e-9
+          ? `R ${money(realized)} · U ${money(unreal)}`
+          : Math.abs(realized) > 1e-9
+            ? `realized`
+            : `flat`;
       const note = escapeHtml(s.note || s.last_signal || "—");
       const nameSub = escapeHtml(
         [s.params?.option_type, s.timeframe, basket.length ? "basket" : s.instrument]
@@ -488,53 +533,78 @@ function renderExecStats(session) {
       const toggleAct = s.enabled ? "pause" : "start";
 
       return `
-      <article class="exec-card ${s.enabled ? "is-run" : "is-paused"}" data-id="${id}">
-        <button type="button" class="exec-card-main" data-act="open" aria-label="Open settings for ${escapeHtml(s.name)}">
-          <div class="exec-card-top">
-            <div class="exec-card-title">
-              <strong>${escapeHtml(s.name)}</strong>
-              <span class="badge ${s.enabled ? "on" : ""}">${status}</span>
-            </div>
-            <span class="exec-card-chevron" aria-hidden="true">›</span>
+      <tr class="click-row desk-row ${s.enabled ? "is-run" : "is-paused"} ${isOpen ? "has-open" : "is-flat"}" data-id="${escapeHtml(id)}" tabindex="0" role="button" aria-label="Open settings for ${escapeHtml(s.name)}">
+        <td data-label="Status"><span class="badge ${s.enabled ? "on" : ""}">${status}</span></td>
+        <td data-label="Strategy" class="col-strategy">
+          <div class="row-title">${escapeHtml(s.name)}</div>
+          <div class="meta">${nameSub}</div>
+        </td>
+        <td data-label="PnL" class="mono ${pnlClass(total)}" title="Total = realized (closed) + unrealized (open)">
+          <div>₹${money(total)}</div>
+          <div class="meta pnl-sub">${escapeHtml(pnlSub)}</div>
+        </td>
+        <td data-label="Signal" class="col-note">${note}</td>
+        <td data-label="Market" class="mono" title="Current market / premium mark">${market}</td>
+        <td data-label="Entry" class="mono" title="${levelsHint === "last closed" ? "Last closed entry (not an open trade)" : levelsHint === "open" ? "Open trade entry" : "No open trade"}">
+          <div>${entry}</div>
+          ${levelsHint && levelsHint !== "open" ? `<div class="meta pnl-sub">${escapeHtml(levelsHint)}</div>` : ""}
+        </td>
+        <td data-label="${posLabel}" class="mono">${stocks}</td>
+        <td data-label="Stop" class="mono" title="${levelsHint === "open" ? "Open stop-loss" : "Only set while in a trade"}">${sl}</td>
+        <td data-label="Target" class="mono" title="${levelsHint === "last closed" ? "Last closed exit" : levelsHint === "open" ? "Open take-profit" : "Only set while in a trade"}">${tp}</td>
+        <td data-label="Win" class="mono">${pct(a.win_rate)}</td>
+        <td data-label="Actions" class="desk-actions-cell">
+          <div class="desk-row-actions">
+            <button type="button" data-act="${toggleAct}" class="desk-btn ${s.enabled ? "" : "primary"}">${toggleLabel}</button>
+            <button type="button" data-act="remove" class="desk-btn ghost">Delete</button>
           </div>
-          <div class="meta exec-card-sub">${nameSub}</div>
-          <div class="exec-kpi">
-            <div class="exec-kpi-cell">
-              <span>PnL</span>
-              <strong class="${pnlClass(total)}">₹${money(total)}</strong>
-            </div>
-            <div class="exec-kpi-cell">
-              <span>Signal</span>
-              <strong>${note}</strong>
-            </div>
-            <div class="exec-kpi-cell">
-              <span>Last</span>
-              <strong class="mono">${last}</strong>
-            </div>
-            <div class="exec-kpi-cell">
-              <span>${basket.length ? "In trade" : "Pos"}</span>
-              <strong class="mono">${stocks}</strong>
-            </div>
-          </div>
-          <div class="exec-meta-row">
-            <span>SL <b class="mono">${sl}</b></span>
-            <span>TP <b class="mono">${tp}</b></span>
-            <span>Win <b>${pct(a.win_rate)}</b></span>
-          </div>
-        </button>
-        <div class="exec-card-actions">
-          <button type="button" data-act="${toggleAct}" class="${s.enabled ? "" : "primary"}">${toggleLabel}</button>
-          <button type="button" data-act="remove" class="ghost">Delete</button>
-        </div>
-      </article>`;
+        </td>
+      </tr>`;
     })
     .join("");
 
-  root.querySelectorAll(".exec-card").forEach((card) => {
-    const id = card.dataset.id;
-    card.querySelector("[data-act=open]")?.addEventListener("click", () => openStrategyModal(id));
-    card.querySelectorAll("button[data-act]").forEach((btn) => {
-      if (btn.dataset.act === "open") return;
+  root.innerHTML = `
+    <p class="hint desk-legend">
+      <strong>PnL</strong> = closed (realized) + open (unrealized).
+      <strong>Entry / Stop / Target</strong> apply only while a trade is open (Pos &gt; 0).
+      When flat, Entry shows the <em>last closed</em> fill if any — not a live position.
+    </p>
+    <div class="table-wrap desk-table-wrap">
+      <table class="data-table dense cards-on-mobile" id="execStatsTable">
+        <thead>
+          <tr>
+            <th>Status</th>
+            <th>Strategy</th>
+            <th title="Realized + unrealized">PnL</th>
+            <th>Signal</th>
+            <th title="Current mark">Market</th>
+            <th title="Open entry, or last closed when flat">Entry</th>
+            <th>Pos</th>
+            <th title="Stop-loss (open trades only)">Stop</th>
+            <th title="Target (open) or last exit when flat">Target</th>
+            <th>Win</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>`;
+
+  root.querySelectorAll(".desk-row").forEach((row) => {
+    const id = row.dataset.id;
+    const open = () => openStrategyModal(id);
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("button")) return;
+      open();
+    });
+    row.addEventListener("keydown", (e) => {
+      if (e.target !== row) return;
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        open();
+      }
+    });
+    row.querySelectorAll("button[data-act]").forEach((btn) => {
       btn.addEventListener("click", async (e) => {
         e.stopPropagation();
         const act = btn.dataset.act;
@@ -651,6 +721,101 @@ function renderDeskCards(rootId, session) {
 
 let modalInstanceId = null;
 
+function isOrbOptionId(id) {
+  return id === "nifty_opt_orb" || id === "nifty_opt_orb_ce" || id === "nifty_opt_orb_pe";
+}
+
+function strategyHowItWorks(s) {
+  const cat = catalog.find((c) => c.id === s.strategy_id);
+  const base = (cat?.description || s.description || "").trim();
+  if (!isOrbOptionId(s.strategy_id)) {
+    return base;
+  }
+  const tv = s.trade_view || {};
+  const p = s.params || {};
+  const opt = String(tv.option_type || p.option_type || (s.strategy_id.endsWith("_pe") ? "PE" : "CE")).toUpperCase();
+  const side = opt === "PE" ? "Put (PE)" : "Call (CE)";
+  const open = p.session_open || tv.session_open || "09:15";
+  const range = p.range_minutes ?? tv.range_minutes ?? 15;
+  const stopPts = p.stop_points ?? tv.stop_points ?? 17;
+  const targetPts = p.target_points ?? tv.target_points ?? 34;
+  const hold = p.hold_minutes ?? tv.hold_minutes ?? 15;
+  return (
+    `${base}\n\n` +
+    `Step by step: (1) From ${open} IST, watch ${side} premium for ${range} minutes and mark the high. ` +
+    `(2) When premium breaks above that high → buy (paper fill at that premium). ` +
+    `(3) While in trade: Stop = Entry − ${stopPts} pts, Target = Entry + ${targetPts} pts. ` +
+    `(4) Also force-exit after ${hold} minutes if still open. ` +
+    `Numbers on Market / Entry / Stop / Target are option premium ₹, not NIFTY index points.`
+  );
+}
+
+function tradeLevelsHtml(s) {
+  const tv = s.trade_view || {};
+  const market = s.last_price ?? tv.market;
+  const entry = s.entry_price ?? tv.entry;
+  const stop = s.stop_price ?? tv.stop;
+  const target = s.target_price ?? tv.target;
+  const inTrade = !!(tv.in_trade || s.legs_in_trade || (s.position && s.position.quantity));
+  const realized = s.realized_pnl ?? tv.realized_pnl ?? 0;
+  const unreal = s.unrealized_pnl ?? tv.unrealized_pnl ?? 0;
+  const lc = tv.last_closed;
+  const opt = tv.option_type || s.params?.option_type || "";
+  const strike = tv.strike || s.params?.strike;
+  const spot = tv.spot;
+  const rangeHigh = tv.range_high;
+  const metaBits = [
+    opt ? `${opt}` : null,
+    strike ? `Strike ${strike}` : null,
+    spot != null ? `Spot ₹${money(spot)}` : null,
+    rangeHigh != null ? `Range high ₹${money(rangeHigh)}` : null,
+  ].filter(Boolean);
+
+  const showEntry = inTrade ? entry : lc?.entry;
+  const showStop = inTrade ? stop : null;
+  const showTarget = inTrade ? target : lc?.exit;
+  const entryLabel = inTrade ? "Entry" : "Last entry";
+  const targetLabel = inTrade ? "Target" : "Last exit";
+  const stopLabel = inTrade ? "Stop-loss" : "Stop";
+
+  return `
+    <h3 class="modal-sec">Trade levels ${inTrade ? "(in trade)" : "(flat — no open position)"}</h3>
+    ${metaBits.length ? `<p class="hint trade-meta">${escapeHtml(metaBits.join(" · "))}</p>` : ""}
+    <div class="kv-grid" style="margin-bottom:0.55rem">
+      <div class="kv"><div class="kv-k">Realized PnL</div><div class="kv-v ${pnlClass(realized)}">₹${money(realized)}</div></div>
+      <div class="kv"><div class="kv-k">Unrealized PnL</div><div class="kv-v ${pnlClass(unreal)}">₹${money(unreal)}</div></div>
+      <div class="kv"><div class="kv-k">Closed trades</div><div class="kv-v">${tv.closed_count != null ? tv.closed_count : (lc ? "≥1" : "0")}</div></div>
+    </div>
+    <div class="levels-grid">
+      <div class="level-card">
+        <div class="kv-k">Market now</div>
+        <div class="kv-v level-val">₹${market != null ? money(market) : "—"}</div>
+        <div class="level-hint">Current mark</div>
+      </div>
+      <div class="level-card ${showEntry != null ? "is-active" : ""}">
+        <div class="kv-k">${entryLabel}</div>
+        <div class="kv-v level-val">₹${showEntry != null ? money(showEntry) : "—"}</div>
+        <div class="level-hint">${inTrade ? "Price you bought at" : "From last closed trade"}</div>
+      </div>
+      <div class="level-card level-stop">
+        <div class="kv-k">${stopLabel}</div>
+        <div class="kv-v level-val">${inTrade && showStop != null ? `₹${money(showStop)}` : "flat"}</div>
+        <div class="level-hint">${inTrade ? "Exit if price hits this" : "Only while a trade is open"}</div>
+      </div>
+      <div class="level-card level-target">
+        <div class="kv-k">${targetLabel}</div>
+        <div class="kv-v level-val">₹${showTarget != null ? money(showTarget) : "—"}</div>
+        <div class="level-hint">${inTrade ? "Take-profit level" : "Exit of last closed trade"}</div>
+      </div>
+    </div>
+    ${
+      inTrade && entry != null && stop != null && target != null
+        ? `<p class="hint levels-explain">Open from <strong>₹${money(entry)}</strong>. Target <strong>₹${money(target)}</strong>, stop <strong>₹${money(stop)}</strong>. Market <strong>₹${market != null ? money(market) : "—"}</strong>.</p>`
+        : `<p class="hint levels-explain">No open position (Pos = 0), so live Entry/Stop/Target are cleared. PnL above is from <strong>closed</strong> trades${lc ? ` (last: entry ₹${money(lc.entry)} → exit ₹${money(lc.exit)}, P&amp;L ₹${money(lc.pnl)})` : ""}.</p>`
+    }
+  `;
+}
+
 function openStrategyModal(instanceId) {
   const s = (lastSession.strategies || []).find((x) => (x.instance_id || x.strategy_id) === instanceId);
   if (!s) return;
@@ -698,23 +863,30 @@ function openStrategyModal(instanceId) {
       return `<tr class="${leg.in_trade ? "leg-active" : "leg-wait"}">
         <td data-label="Symbol">${escapeHtml(leg.symbol || "")}</td>
         <td data-label="Qty">${leg.qty}</td>
-        <td data-label="Last">${money(leg.last)}</td>
+        <td data-label="Market">${money(leg.last)}</td>
+        <td data-label="Entry">${leg.avg != null ? money(leg.avg) : "—"}</td>
         <td data-label="In trade">${leg.in_trade ? "yes" : "no"}</td>
         <td data-label="Range">${range}</td>
         <td data-label="Status" class="leg-status">${escapeHtml(status)}</td>
-        <td data-label="SL">${leg.stop != null ? money(leg.stop) : "—"}</td>
-        <td data-label="TP">${leg.target != null ? money(leg.target) : "—"}</td></tr>`;
+        <td data-label="Stop">${leg.stop != null ? money(leg.stop) : "—"}</td>
+        <td data-label="Target">${leg.target != null ? money(leg.target) : "—"}</td></tr>`;
     })
     .join("");
   const logs = (s.logs || []).slice(-15).join("\n") || "—";
   const total = (s.realized_pnl || 0) + (s.unrealized_pnl || 0);
+  const how = strategyHowItWorks(s);
   $("modalBody").innerHTML = `
+    <div class="how-box">
+      <div class="kv-k">How this strategy works</div>
+      <p class="how-text">${escapeHtml(how)}</p>
+    </div>
+    ${tradeLevelsHtml(s)}
     <div class="kv-grid">
       <div class="kv"><div class="kv-k">Asset</div><div class="kv-v">${s.asset_kind} · ${s.instrument} · ${s.timeframe}</div></div>
       <div class="kv"><div class="kv-k">Qty / Cash</div><div class="kv-v">${s.quantity} · ₹${money(s.cash)}</div></div>
       <div class="kv"><div class="kv-k">PnL</div><div class="kv-v ${pnlClass(total)}">₹${money(total)}</div></div>
     </div>
-    ${legs ? `<h3 class="modal-sec">Basket legs</h3><div class="table-wrap"><table class="data-table cards-on-mobile"><thead><tr><th>Symbol</th><th>Qty</th><th>Last</th><th>In trade</th><th>Range</th><th>Status</th><th>SL</th><th>TP</th></tr></thead><tbody>${legs}</tbody></table></div>` : ""}
+    ${legs ? `<h3 class="modal-sec">Basket legs</h3><div class="table-wrap"><table class="data-table cards-on-mobile"><thead><tr><th>Symbol</th><th>Qty</th><th>Market</th><th>Entry</th><th>In trade</th><th>Range</th><th>Status</th><th>Stop</th><th>Target</th></tr></thead><tbody>${legs}</tbody></table></div>` : ""}
     <h3 class="modal-sec">Configured options</h3>
     <div class="kv-grid options-grid">${rows || "<p class='hint'>No params</p>"}</div>
     <h3 class="modal-sec">Recent logs</h3>
@@ -747,7 +919,15 @@ async function refreshReports() {
   try {
     const q = reportQuery();
     const exportLink = $("btnExportCsv");
+    const exportFull = $("btnExportCsvFull");
+    const exportPdf = $("btnExportPdf");
     if (exportLink) exportLink.href = `/api/reports/export.csv${q ? `?${q}` : ""}`;
+    if (exportFull) {
+      const fullQ = new URLSearchParams(q);
+      fullQ.set("kind", "full");
+      exportFull.href = `/api/reports/export.csv?${fullQ.toString()}`;
+    }
+    if (exportPdf) exportPdf.href = `/api/reports/export.pdf${q ? `?${q}` : ""}`;
     const [summary, trades, sels, daily, cal] = await Promise.all([
       api(`/api/reports/summary${q ? `?${q}` : ""}`),
       api(`/api/reports/trades${q ? `?${q}` : ""}`),
@@ -842,9 +1022,16 @@ function render(session) {
 }
 
 async function refresh() {
-  const [session, analytics] = await Promise.all([api("/api/session"), api("/api/analytics")]);
-  lastAnalytics = analytics;
-  render(session);
+  try {
+    const [session, analytics] = await Promise.all([
+      api("/api/session"),
+      api("/api/analytics").catch(() => lastAnalytics || {}),
+    ]);
+    lastAnalytics = analytics;
+    render(session);
+  } catch (err) {
+    $("sessionMsg").textContent = err.message || String(err);
+  }
 }
 
 async function startSession() {

@@ -161,6 +161,7 @@ class DhanLiveFeed:
         self._ws_ref: Any = None
         self._rate_limited_until = 0.0
         self._backoff = 1.0
+        self._429_hits = 0
 
     @property
     def connected(self) -> bool:
@@ -255,21 +256,24 @@ class DhanLiveFeed:
         self._loop = asyncio.get_running_loop()
         self._wake = asyncio.Event()
         backoff = 1.0
+        # Escalate cool on repeated 429s so we don't stampede reconnects.
+        # Cap at 60s (never the old ~180s double-sleep).
+        max_429_cool = 60.0
         while not self._stop.is_set():
             now = time.time()
             if self._rate_limited_until > now:
                 wait = self._rate_limited_until - now
                 self._last_error = f"HTTP 429 — waiting {int(wait)}s"
                 self._connected = False
-                await asyncio.sleep(min(wait, 30.0))
+                await asyncio.sleep(min(wait, 5.0))
                 continue
             token = ""
             try:
                 token = (self._token_provider() or "").strip()
             except Exception as exc:
                 self._last_error = str(exc)
-                await asyncio.sleep(min(backoff, 60))
-                backoff = min(backoff * 2, 60)
+                await asyncio.sleep(min(backoff, 30))
+                backoff = min(backoff * 2, 30)
                 continue
             if not token or not self.client_id:
                 self._last_error = "missing token/client id"
@@ -279,6 +283,7 @@ class DhanLiveFeed:
                 f"{WS_URL}?version=2&token={token}"
                 f"&clientId={self.client_id}&authType=2"
             )
+            hit_429 = False
             try:
                 async with websockets.connect(
                     url,
@@ -292,12 +297,16 @@ class DhanLiveFeed:
                     self._connected = True
                     self._last_error = None
                     self._force_reconnect = False
+                    # Don't zero 429 hits on a flash connect — only after we stay up.
+                    connect_ok_at = time.time()
                     backoff = 1.0
                     self._backoff = 1.0
                     with self._lock:
                         self._subscribed.clear()
                     await self._flush_subscriptions(ws)
                     while not self._stop.is_set():
+                        if self._429_hits and (time.time() - connect_ok_at) >= 30.0:
+                            self._429_hits = 0
                         if self._force_reconnect:
                             self._force_reconnect = False
                             await ws.close()
@@ -321,19 +330,30 @@ class DhanLiveFeed:
                 err = str(exc)
                 self._last_error = err
                 if "429" in err or "Too many" in err.lower():
-                    # Dhan WS rate limit — cool down hard (do not reconnect every few seconds).
-                    cool = max(backoff, 120.0)
-                    cool = min(cool * 1.5, 600.0)
+                    self._429_hits = min(self._429_hits + 1, 6)
+                    # 15 → 25 → 35 → 45 → 55 → 60 (stop hammering; marks still serve)
+                    cool = min(15.0 + (self._429_hits - 1) * 10.0, max_429_cool)
                     self._rate_limited_until = time.time() + cool
-                    backoff = cool
-                    self._last_error = f"HTTP 429 — cooling {int(cool)}s"
-                    logger.warning("dhan-ws rate limited; cooling %.0fs", cool)
+                    hit_429 = True
+                    self._last_error = (
+                        f"HTTP 429 — reconnect in {int(cool)}s (hit {self._429_hits})"
+                    )
+                    logger.warning(
+                        "dhan-ws rate limited; reconnect in %.0fs (hit %s)",
+                        cool,
+                        self._429_hits,
+                    )
                 else:
                     logger.warning("dhan-ws reconnect: %s", exc)
             if self._stop.is_set():
                 break
-            await asyncio.sleep(min(backoff, 60))
-            backoff = min(backoff * 2, 60)
+            if hit_429:
+                # Cool loop above owns the wait; don't add another long sleep.
+                self._backoff = cool if hit_429 else backoff
+                backoff = float(self._backoff)
+                continue
+            await asyncio.sleep(min(backoff, 15))
+            backoff = min(backoff * 2, 15)
             self._backoff = backoff
 
     async def _flush_subscriptions(self, ws: Any) -> None:

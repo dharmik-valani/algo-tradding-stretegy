@@ -113,6 +113,8 @@ class StrategyState(BaseModel):
     legs_selected: int = 0
     legs_in_trade: int = 0
     note: str = ""
+    # Extra trade context for UI (strike, spot, range high, labels)
+    trade_view: dict[str, Any] = Field(default_factory=dict)
 
 
 class SessionSnapshot(BaseModel):

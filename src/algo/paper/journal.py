@@ -343,8 +343,13 @@ def _trade_day(t: dict[str, Any]) -> str | None:
     return str(raw)[:10]
 
 
-def daily_report(*, from_date: str | None = None, to_date: str | None = None) -> dict[str, Any]:
-    trades = list_trades(limit=5000)
+def daily_report(
+    *,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    strategy_id: str | None = None,
+) -> dict[str, Any]:
+    trades = list_trades(strategy_id=strategy_id, limit=5000)
     by_day: dict[str, dict[str, Any]] = {}
     for t in trades:
         day = _trade_day(t)
@@ -426,6 +431,7 @@ def trades_csv(
     trades = list_trades(strategy_id=strategy_id, limit=5000)
     out = io.StringIO()
     fields = [
+        "trade_day",
         "id",
         "strategy_id",
         "instance_id",
@@ -451,8 +457,263 @@ def trades_csv(
             continue
         if to_date and day and day > to_date:
             continue
-        w.writerow(t)
+        row = dict(t)
+        row["trade_day"] = day or ""
+        w.writerow(row)
     return out.getvalue()
+
+
+def full_report_csv(
+    *,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    strategy_id: str | None = None,
+) -> str:
+    """Multi-section CSV: summary, by strategy, by day, then trade lines."""
+    import csv
+    import io
+
+    summary = report_summary(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+    daily = daily_report(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+    trades = list_trades(strategy_id=strategy_id, limit=5000)
+    filtered = []
+    for t in trades:
+        day = _trade_day(t)
+        if from_date and day and day < from_date:
+            continue
+        if to_date and day and day > to_date:
+            continue
+        filtered.append(t)
+
+    out = io.StringIO()
+    w = csv.writer(out)
+
+    w.writerow(["PAPER DESK REPORT"])
+    w.writerow(["Generated (UTC)", datetime.now(timezone.utc).isoformat()])
+    w.writerow(["From", from_date or "all"])
+    w.writerow(["To", to_date or "all"])
+    w.writerow(["Strategy filter", strategy_id or "all"])
+    w.writerow([])
+
+    w.writerow(["SUMMARY"])
+    w.writerow(["Trades", "Open", "Closed", "Wins", "Losses", "Win rate %", "Avg win", "Avg loss", "Net PnL"])
+    w.writerow(
+        [
+            summary.get("trades"),
+            summary.get("open"),
+            summary.get("closed"),
+            summary.get("wins"),
+            summary.get("losses"),
+            summary.get("win_rate"),
+            summary.get("avg_win"),
+            summary.get("avg_loss"),
+            summary.get("net_pnl"),
+        ]
+    )
+    w.writerow([])
+
+    w.writerow(["BY STRATEGY"])
+    w.writerow(["strategy_id", "trades", "wins", "losses", "win_rate %", "avg_win", "avg_loss", "net_pnl"])
+    for row in summary.get("by_strategy") or []:
+        w.writerow(
+            [
+                row.get("strategy_id"),
+                row.get("trades"),
+                row.get("wins"),
+                row.get("losses"),
+                row.get("win_rate"),
+                row.get("avg_win"),
+                row.get("avg_loss"),
+                row.get("net_pnl"),
+            ]
+        )
+    w.writerow([])
+
+    w.writerow(["BY DAY"])
+    w.writerow(["date", "trades", "closed", "open", "wins", "losses", "win_rate %", "net_pnl", "symbols"])
+    for d in daily.get("days") or []:
+        w.writerow(
+            [
+                d.get("date"),
+                d.get("trades"),
+                d.get("closed"),
+                d.get("open"),
+                d.get("wins"),
+                d.get("losses"),
+                d.get("win_rate"),
+                d.get("net_pnl"),
+                ", ".join(d.get("symbols") or []),
+            ]
+        )
+    w.writerow([])
+
+    w.writerow(["TRADES"])
+    trade_fields = [
+        "trade_day",
+        "strategy_id",
+        "instance_id",
+        "symbol",
+        "side",
+        "status",
+        "quantity",
+        "entry_price",
+        "exit_price",
+        "stop_price",
+        "target_price",
+        "entry_at",
+        "exit_at",
+        "realized_pnl",
+        "fees",
+        "exit_reason",
+    ]
+    w.writerow(trade_fields)
+    for t in filtered:
+        day = _trade_day(t) or ""
+        w.writerow(
+            [
+                day,
+                t.get("strategy_id"),
+                t.get("instance_id"),
+                t.get("symbol"),
+                t.get("side"),
+                t.get("status"),
+                t.get("quantity"),
+                t.get("entry_price"),
+                t.get("exit_price"),
+                t.get("stop_price"),
+                t.get("target_price"),
+                t.get("entry_at"),
+                t.get("exit_at"),
+                t.get("realized_pnl"),
+                t.get("fees"),
+                t.get("exit_reason"),
+            ]
+        )
+    return out.getvalue()
+
+
+def full_report_html(
+    *,
+    from_date: str | None = None,
+    to_date: str | None = None,
+    strategy_id: str | None = None,
+) -> str:
+    """Printable HTML report (browser → Save as PDF)."""
+    from html import escape
+
+    summary = report_summary(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+    daily = daily_report(from_date=from_date, to_date=to_date, strategy_id=strategy_id)
+    trades = list_trades(strategy_id=strategy_id, limit=5000)
+    filtered = []
+    for t in trades:
+        day = _trade_day(t)
+        if from_date and day and day < from_date:
+            continue
+        if to_date and day and day > to_date:
+            continue
+        filtered.append(t)
+
+    def money(v: Any) -> str:
+        if v is None:
+            return "—"
+        try:
+            return f"{float(v):,.2f}"
+        except (TypeError, ValueError):
+            return str(v)
+
+    strat_rows = "".join(
+        f"<tr><td>{escape(str(r.get('strategy_id') or ''))}</td>"
+        f"<td>{r.get('trades')}</td><td>{r.get('wins')}</td><td>{r.get('losses')}</td>"
+        f"<td>{r.get('win_rate') if r.get('win_rate') is not None else '—'}</td>"
+        f"<td>{money(r.get('avg_win'))}</td><td>{money(r.get('avg_loss'))}</td>"
+        f"<td>{money(r.get('net_pnl'))}</td></tr>"
+        for r in (summary.get("by_strategy") or [])
+    ) or "<tr><td colspan='8'>No closed trades</td></tr>"
+
+    day_rows = "".join(
+        f"<tr><td>{escape(str(d.get('date') or ''))}</td>"
+        f"<td>{d.get('trades')}</td><td>{d.get('closed')}</td>"
+        f"<td>{d.get('win_rate') if d.get('win_rate') is not None else '—'}</td>"
+        f"<td>{money(d.get('net_pnl'))}</td>"
+        f"<td>{escape(', '.join(d.get('symbols') or []))}</td></tr>"
+        for d in (daily.get("days") or [])
+    ) or "<tr><td colspan='6'>No daily data</td></tr>"
+
+    trade_rows = "".join(
+        f"<tr><td>{escape(str(_trade_day(t) or ''))}</td>"
+        f"<td>{escape(str(t.get('strategy_id') or ''))}</td>"
+        f"<td>{escape(str(t.get('symbol') or ''))}</td>"
+        f"<td>{escape(str(t.get('side') or ''))}</td>"
+        f"<td>{money(t.get('entry_price'))}</td>"
+        f"<td>{money(t.get('exit_price'))}</td>"
+        f"<td>{money(t.get('stop_price'))}</td>"
+        f"<td>{money(t.get('target_price'))}</td>"
+        f"<td>{money(t.get('realized_pnl'))}</td>"
+        f"<td>{escape(str(t.get('status') or ''))}"
+        f"{(' · ' + escape(str(t.get('exit_reason')))) if t.get('exit_reason') else ''}</td></tr>"
+        for t in filtered[:500]
+    ) or "<tr><td colspan='10'>No trades</td></tr>"
+
+    period = f"{from_date or 'all'} → {to_date or 'all'}"
+    filt = strategy_id or "all strategies"
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Paper Desk Report</title>
+  <style>
+    body {{ font-family: Georgia, "Times New Roman", serif; color: #1a1a1a; margin: 2rem; }}
+    h1 {{ font-size: 1.6rem; margin: 0 0 0.25rem; }}
+    h2 {{ font-size: 1.1rem; margin: 1.4rem 0 0.5rem; border-bottom: 1px solid #ccc; padding-bottom: 0.25rem; }}
+    .meta {{ color: #555; font-size: 0.92rem; margin-bottom: 1rem; }}
+    .kpis {{ display: flex; flex-wrap: wrap; gap: 1rem; margin: 1rem 0; }}
+    .kpi {{ border: 1px solid #ddd; padding: 0.6rem 0.85rem; min-width: 7rem; }}
+    .kpi span {{ display: block; font-size: 0.75rem; color: #666; text-transform: uppercase; }}
+    .kpi strong {{ font-size: 1.15rem; }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; margin-bottom: 0.5rem; }}
+    th, td {{ border: 1px solid #ddd; padding: 0.35rem 0.45rem; text-align: left; }}
+    th {{ background: #f4f4f4; }}
+    .actions {{ margin: 1rem 0 1.5rem; }}
+    .actions button {{ font-size: 1rem; padding: 0.45rem 0.9rem; cursor: pointer; }}
+    @media print {{
+      .actions {{ display: none; }}
+      body {{ margin: 0.6rem; }}
+    }}
+  </style>
+</head>
+<body>
+  <div class="actions">
+    <button type="button" onclick="window.print()">Print / Save as PDF</button>
+  </div>
+  <h1>Paper Desk — Trading Report</h1>
+  <p class="meta">Period: {escape(period)} · Filter: {escape(filt)} · Generated: {escape(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))}</p>
+  <div class="kpis">
+    <div class="kpi"><span>Trades</span><strong>{summary.get("trades", 0)}</strong></div>
+    <div class="kpi"><span>Closed</span><strong>{summary.get("closed", 0)}</strong></div>
+    <div class="kpi"><span>Win rate</span><strong>{summary.get("win_rate") if summary.get("win_rate") is not None else "—"}%</strong></div>
+    <div class="kpi"><span>Net PnL</span><strong>₹{money(summary.get("net_pnl"))}</strong></div>
+  </div>
+
+  <h2>By strategy</h2>
+  <table>
+    <thead><tr><th>Strategy</th><th>Trades</th><th>Wins</th><th>Losses</th><th>Win %</th><th>Avg win</th><th>Avg loss</th><th>Net PnL</th></tr></thead>
+    <tbody>{strat_rows}</tbody>
+  </table>
+
+  <h2>Day-wise</h2>
+  <table>
+    <thead><tr><th>Date</th><th>Trades</th><th>Closed</th><th>Win %</th><th>Net PnL</th><th>Symbols</th></tr></thead>
+    <tbody>{day_rows}</tbody>
+  </table>
+
+  <h2>Trade details</h2>
+  <table>
+    <thead><tr><th>Day</th><th>Strategy</th><th>Symbol</th><th>Side</th><th>Entry</th><th>Exit</th><th>Stop</th><th>Target</th><th>PnL</th><th>Status</th></tr></thead>
+    <tbody>{trade_rows}</tbody>
+  </table>
+  <p class="meta">Showing up to 500 trades. Use CSV full export for the complete file.</p>
+</body>
+</html>"""
 
 
 def _trade_dict(r: PaperTradeRow) -> dict[str, Any]:

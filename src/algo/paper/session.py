@@ -24,7 +24,7 @@ from algo.paper.equity_orb_tier import (
 )
 from algo.paper.journal import end_journal_session, list_open_trades, start_journal_session
 from algo.paper.models import Bar, SessionSnapshot, Side, SignalAction, StrategyState
-from algo.paper.quotes import LiveQuoteProvider
+from algo.paper.quotes import LiveQuoteProvider, suggested_poll_seconds
 from algo.paper.registry import create_strategy, list_strategies
 from algo.paper.strategy import Strategy
 from algo.storage.db import get_engine
@@ -167,6 +167,39 @@ class StrategyRunner:
                 else:
                     st.stop_price = round(st.entry_price + stop_pts, 2)
                     st.target_price = round(st.entry_price - target_pts, 2)
+        # Plain trade view for the desk / popup (option ORB + others).
+        p_all = {**getattr(strat, "default_params", lambda: {})(), **getattr(strat, "params", {})}
+        opt = self.option_state or {}
+        closed = list(getattr(self.broker, "closed_trades", []) or [])
+        last_closed = closed[-1] if closed else None
+        in_trade = bool(st.legs_in_trade or (self.broker.position.quantity))
+        st.trade_view = {
+            "market": last if last is not None else st.last_price,
+            "entry": st.entry_price,
+            "stop": st.stop_price,
+            "target": st.target_price,
+            "in_trade": in_trade,
+            "realized_pnl": float(st.realized_pnl or 0),
+            "unrealized_pnl": float(st.unrealized_pnl or 0),
+            "option_type": p_all.get("option_type") or getattr(strat, "locked_option_type", None),
+            "strike": int(opt["strike"]) if opt.get("strike") else getattr(strat, "_selected_strike", None),
+            "spot": opt.get("spot") or opt.get("prev_spot"),
+            "premium": opt.get("premium"),
+            "range_high": getattr(strat, "_range_high", None),
+            "stop_points": p_all.get("stop_points"),
+            "target_points": p_all.get("target_points"),
+            "hold_minutes": p_all.get("hold_minutes"),
+            "range_minutes": p_all.get("range_minutes"),
+            "session_open": p_all.get("session_open"),
+            "last_closed": last_closed,
+            "closed_count": len(closed),
+        }
+        if not in_trade and last_closed:
+            # Desk shows last closed levels so PnL isn't "mystery money".
+            st.note = st.note or self.last_signal or "HOLD"
+            if "flat" not in (st.note or "").lower() and "waiting" not in (st.note or "").lower():
+                if abs(float(st.realized_pnl or 0)) > 1e-9:
+                    st.note = f"{st.note} · flat (realized)"
         return st
 
     def on_bar(self, bar: Bar) -> None:
@@ -905,8 +938,8 @@ class PaperSession:
             raise RuntimeError("Session already running")
         if not self.runners:
             raise RuntimeError("Add at least one strategy first")
-        source = (self.settings.paper_price_source or "public").lower()
-        if source in {"dhan", "dhan-ws", "auto"}:
+        source = (self.settings.paper_price_source or "dhan-ws").lower()
+        if source in {"dhan", "dhan-ws", "auto", "public"}:
             from algo.providers.dhan.auth import TokenRotator, current_token, ensure_fresh_token
 
             TokenRotator.instance().start()
@@ -935,6 +968,24 @@ class PaperSession:
             except Exception:
                 pass
         self._quotes = LiveQuoteProvider(self.settings)
+        try:
+            # Let the websocket connect before the first poll hammers REST LTP.
+            self._quotes.wait_for_ws(timeout=8.0)
+            with self._lock:
+                boot_syms: list[str] = []
+                for r in self.runners.values():
+                    if not r.enabled:
+                        continue
+                    if isinstance(r, BasketRunner):
+                        boot_syms.extend(r.selected or [])
+                    else:
+                        boot_syms.append(getattr(r, "symbol", "") or "")
+            if boot_syms:
+                self._quotes.ensure_subscribed(boot_syms)
+                # Seed marks via WS; one REST batch only if WS is empty (boot only).
+                self._quotes.prefetch_ltps(boot_syms, wait_ws_sec=4.0, allow_rest=True)
+        except Exception:
+            pass
         feed = self._quotes.feed_status
         self.message = (
             f"Live paper via {feed} · poll {poll_seconds:.0f}s — virtual fills only (no Dhan orders)"
@@ -1088,26 +1139,43 @@ class PaperSession:
                     break
                 with self._lock:
                     runners = list(self.runners.values())
-                # Keep WebSocket subscriptions warm for all enabled legs.
+                # Subscribe only active trade legs (selected / open), not the full scan universe.
                 want_syms: list[str] = []
                 for runner in runners:
                     if not runner.enabled:
                         continue
                     if isinstance(runner, BasketRunner):
                         want_syms.extend(runner.selected or [])
-                        # Pre-scan universe once selection pending
-                        if not runner.selected:
-                            from algo.paper.universe import resolve_universe
-
-                            want_syms.extend(resolve_universe(runner.strategy.params)[:40])
+                        for sym, broker in runner.brokers.items():
+                            if broker.position.quantity:
+                                want_syms.append(sym)
                     else:
                         want_syms.append(getattr(runner, "symbol", "") or "")
+                want_syms = [s for s in dict.fromkeys(want_syms) if s]
                 try:
-                    quotes.ensure_subscribed([s for s in want_syms if s])
+                    quotes.ensure_subscribed(want_syms)
+                    ws_down = bool(
+                        quotes._ws is not None
+                        and (quotes._ws.rate_limited() or not quotes._ws.connected)
+                    )
+                    if ws_down:
+                        # Slow REST refresh so SL/TP aren't stuck on frozen marks.
+                        # At most 12 symbols / poll; Quote API ≤1/s via client limiter.
+                        if self._runtime_tick % 3 == 0:
+                            quotes.prefetch_ltps(
+                                want_syms[:12], wait_ws_sec=0.0, allow_rest=True
+                            )
+                    else:
+                        quotes.prefetch_ltps(want_syms, wait_ws_sec=2.0, allow_rest=False)
                 except Exception:
                     pass
+                # Adaptive cadence: more active symbols → slower poll (Dhan-safe).
+                sleep_for = suggested_poll_seconds(
+                    len(want_syms), base=float(self.poll_seconds or 15.0)
+                )
                 src = quotes.feed_status
                 labels: list[str] = []
+                errors: list[str] = []
                 for runner in runners:
                     if not runner.enabled:
                         continue
@@ -1144,7 +1212,9 @@ class PaperSession:
                             )
                             src = quotes.feed_status
                         else:
-                            price, ts, used = quotes.get_ltp(runner.symbol)
+                            price, ts, used = quotes.get_ltp(
+                                runner.symbol, allow_rest=False, wait_ws_sec=0.5, max_stale_sec=180
+                            )
                             bar = Bar(
                                 timestamp=ts, open=price, high=price, low=price, close=price, volume=0
                             )
@@ -1153,14 +1223,25 @@ class PaperSession:
                             src = used
                     except Exception as exc:
                         name = getattr(runner, "symbol", runner.strategy.id)
-                        self.message = f"LTP error ({name}): {exc}"
+                        err = str(exc)
+                        if "429" in err or "too many" in err.lower() or "rate limited" in err.lower():
+                            errors.append(f"{name}: Dhan 429 — waiting for websocket")
+                        else:
+                            errors.append(f"{name}: {err}")
                 self.updated_at = utcnow()
-                if labels and not str(self.message).startswith("LTP error"):
+                if labels:
                     self.message = (
                         f"Live paper ({src}) @ {datetime.now(tz=IST).strftime('%H:%M:%S')} IST — "
                         + ", ".join(labels[:12])
                         + ("…" if len(labels) > 12 else "")
                         + " · virtual fills only"
+                    )
+                    if errors:
+                        self.message += f" · warn: {errors[0]}"
+                elif errors:
+                    # Soft degrade — keep last marks; short WS cool must not freeze the desk.
+                    self.message = (
+                        f"Live paper holding last marks ({quotes.feed_status}) — {errors[0]}"
                     )
                 self._runtime_tick += 1
                 # Checkpoint often so a crash/laptop sleep can resume open trades.
@@ -1179,7 +1260,7 @@ class PaperSession:
                         )
                     except Exception:
                         pass
-                time.sleep(self.poll_seconds)
+                time.sleep(sleep_for)
         except Exception as exc:
             self.message = f"Live paper error: {exc}"
         finally:
@@ -1197,15 +1278,26 @@ class PaperSession:
         assert self._quotes is not None
         if not runner.history:
             try:
+                if self._quotes._rest_cooling():
+                    raise RuntimeError("rest cooling — defer zen chart warmup")
                 hist = self._quotes.load_public_bars(runner.symbol, interval="5m", range_="60d")
                 # Keep enough for 800m lookback (+ cushion)
                 runner.history = hist[-500:] if len(hist) > 500 else hist
                 self.message = f"Zen warmed {len(runner.history)} × 5m bars for {runner.symbol}"
             except Exception as exc:
-                self.message = f"Zen warmup fallback: {exc}"
-                runner.history = self._quotes.synthetic_bars(runner.symbol, n=900)
+                self.message = f"Zen warmup deferred: {exc}"
+                # Do not synthetic-spam forever — try again next ticks once feed is healthy.
+                if not runner.history:
+                    runner.history = []
 
-        price, ts, _ = self._quotes.get_ltp(runner.symbol)
+        price, ts, _ = self._quotes.get_ltp(
+            runner.symbol, allow_rest=False, wait_ws_sec=0.8, max_stale_sec=180
+        )
+        if not runner.history:
+            # Still no history — emit a single forming bar so UI is not stuck on LTP error.
+            runner.history = [
+                Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=0)
+            ]
         local = ts.astimezone(IST)
         bucket = local.replace(minute=(local.minute // 5) * 5, second=0, microsecond=0)
         forming = runner._forming_bar
@@ -1240,7 +1332,7 @@ def get_session() -> PaperSession:
     """Return the singleton paper session.
 
     Heavy restore / auto-resume must NOT hold ``_SESSION_LOCK`` — otherwise
-    every HTTP handler (including ``/api/health``) deadlocks while Dhan/Yahoo
+    every HTTP handler (including ``/api/health``) deadlocks while Dhan
     network calls run inside ``start_live``.
     """
     global _SESSION
