@@ -74,7 +74,7 @@ class _EquityOrbTierBase(Strategy):
     def default_params(self) -> dict[str, Any]:
         return {
             "session_open": "09:15",
-            "scan_at": "09:18",
+            "scan_at": "09:30",
             "range_minutes": 5,
             "top_n": 10,
             "buffer_pct": 0.2,
@@ -107,8 +107,8 @@ class _EquityOrbTierBase(Strategy):
                 "key": "scan_at",
                 "label": "Scan time",
                 "type": "time",
-                "help": "When to rank NIFTY500 by % and lock top_n (after 3m of open).",
-                "example": "09:18",
+                "help": "When to REST-scan NIFTY500 by % and lock top_n. Start live after this clock → scan on next tick.",
+                "example": "09:30",
             },
             {
                 "key": "range_minutes",

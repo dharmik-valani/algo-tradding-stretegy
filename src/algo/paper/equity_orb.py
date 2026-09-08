@@ -25,7 +25,7 @@ class _EquityOrbBase(Strategy):
     def default_params(self) -> dict[str, Any]:
         return {
             "session_open": "09:15",
-            "scan_at": "09:16",
+            "scan_at": "09:30",
             "range_minutes": 5,
             "top_n": 5,
             "buffer_pct": 0.5,
@@ -53,8 +53,8 @@ class _EquityOrbBase(Strategy):
                 "key": "scan_at",
                 "label": "Scan time",
                 "type": "time",
-                "help": "Clock to REST-scan the universe once, then WS-subscribe only the selected names.",
-                "example": "Example: 09:16 — after open, rank gainers/losers from day OHLC.",
+                "help": "Clock to REST-scan the universe once, then WS-subscribe only the selected names. If you Start live after this time, scan runs on the next tick.",
+                "example": "Example: 09:30 — after open auction settles, rank gainers/losers from day OHLC.",
             },
             {
                 "key": "range_minutes",

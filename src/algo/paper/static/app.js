@@ -1,10 +1,10 @@
 const $ = (id) => document.getElementById(id);
 
 const VIEW_META = {
-  analytics: { title: "Analytics", subtitle: "Live session and closed-trade performance" },
-  execute: { title: "Execute", subtitle: "Register, configure, and run strategies" },
-  reports: { title: "Reports", subtitle: "Persisted trades, selections, and historical analysis" },
+  execute: { title: "Execute", subtitle: "Day capital, live strategies, and paper fills" },
+  reports: { title: "Reports", subtitle: "Day / week / month history and exports" },
   settings: { title: "Settings", subtitle: "Session mode and paper controls" },
+  analytics: { title: "Execute", subtitle: "Day capital, live strategies, and paper fills" },
 };
 
 async function api(path, options = {}) {
@@ -56,11 +56,11 @@ let catalog = [];
 let instruments = { indices: [], stocks: [], option_underlyings: [], timeframes: ["1m", "5m", "15m"] };
 let lastSession = { strategies: [] };
 let lastAnalytics = { strategies: [], overall: {} };
-let currentView = "analytics";
+let currentView = "execute";
 
 function setView(view) {
-  if (view === "dashboard") view = "analytics";
-  if (!VIEW_META[view]) view = "analytics";
+  if (view === "dashboard" || view === "analytics") view = "execute";
+  if (!VIEW_META[view] || view === "analytics") view = "execute";
   currentView = view;
   document.querySelectorAll(".nav-item").forEach((el) => {
     el.classList.toggle("active", el.dataset.view === view);
@@ -320,7 +320,7 @@ async function quickAdd(strategyId) {
       asset_kind: isZenId(strategyId) ? "index" : isBasketId(strategyId) ? "stock" : kind,
       timeframe,
       quantity: 1,
-      starting_cash: 100000,
+      starting_cash: 500000,
       params: { ...(s.default_params || {}) },
       enabled: true,
     }),
@@ -343,90 +343,44 @@ function analyticsMap() {
   return map;
 }
 
-function renderSummary(session) {
+function renderExecDayKpis(session) {
   const strats = session.strategies || [];
-  const enabled = strats.filter((s) => s.enabled).length;
-  const pnl = strats.reduce((a, s) => a + (s.realized_pnl || 0) + (s.unrealized_pnl || 0), 0);
-  $("sumRegistered").textContent = String(catalog.length);
-  $("sumDeskLine").textContent = `${enabled} / ${strats.length}`;
-  const el = $("sumPnl");
-  el.textContent = strats.length ? `₹${money(pnl)}` : "—";
-  el.className = pnlClass(pnl);
-  $("deskCount").textContent = String(strats.length);
+  let invested = 0;
+  let dayPnl = 0;
+  let enabled = 0;
+  for (const s of strats) {
+    const tv = s.trade_view || {};
+    const cap = Number(tv.invested != null ? tv.invested : s.starting_cash) || 0;
+    const dp = Number(
+      tv.day_pnl != null ? tv.day_pnl : (s.realized_pnl || 0) + (s.unrealized_pnl || 0)
+    );
+    invested += cap;
+    dayPnl += dp;
+    if (s.enabled) enabled += 1;
+  }
+  const generated = invested + dayPnl;
+  const overall = lastAnalytics.overall || {};
+  const set = (id, text, cls) => {
+    const el = $(id);
+    if (!el) return;
+    el.textContent = text;
+    if (cls !== undefined) el.className = cls;
+  };
+  set("execInvested", `₹${money(invested)}`);
+  set("execGenerated", `₹${money(generated)}`, pnlClass(dayPnl));
+  set("execDayPnl", `₹${money(dayPnl)}`, pnlClass(dayPnl));
+  set("execWinRate", pct(overall.win_rate));
+  set("execDeskLine", `${enabled} / ${strats.length}`);
+  const deskCount = $("deskCount");
+  if (deskCount) deskCount.textContent = String(strats.length);
+}
+
+function renderSummary(session) {
+  renderExecDayKpis(session);
 }
 
 function renderAnalytics() {
-  const overall = lastAnalytics.overall || {};
-  $("anWinRate").textContent = pct(overall.win_rate);
-  $("anAvgWin").textContent = overall.avg_win != null ? `₹${money(overall.avg_win)}` : "—";
-  $("anAvgLoss").textContent = overall.avg_loss != null ? `₹${money(overall.avg_loss)}` : "—";
-  const net = overall.net_pnl;
-  const netEl = $("anNet");
-  netEl.textContent = net != null ? `₹${money(net)}` : "—";
-  netEl.className = pnlClass(net || 0);
-  $("anPf").textContent = overall.profit_factor != null ? String(overall.profit_factor) : "—";
-  $("anTrades").textContent = String(overall.trades || 0);
-
-  const root = $("analyticsCards");
-  if (!root) return;
-  const rows = lastAnalytics.strategies || [];
-  const countEl = $("anStratCount");
-  if (countEl) countEl.textContent = String(rows.length);
-  if (!rows.length) {
-    root.innerHTML = `<div class="empty">No closed-trade stats yet. Run live paper, then check back here.</div>`;
-    return;
-  }
-  const deskIds = new Set((lastSession.strategies || []).map((s) => s.instance_id || s.strategy_id));
-  root.innerHTML = rows
-    .map((r) => {
-      const id = r.instance_id || r.strategy_id;
-      const onDesk = deskIds.has(id);
-      const side = r.option_type || (String(r.strategy_id || "").includes("gainer") ? "long" : String(r.strategy_id || "").includes("loser") ? "short" : "—");
-      return `
-      <article class="exec-card analytics-card ${onDesk ? "is-run" : ""}" data-id="${escapeHtml(id)}">
-        <button type="button" class="exec-card-main" data-act="open" ${onDesk ? "" : "disabled"}>
-          <div class="exec-card-top">
-            <div class="exec-card-title">
-              <strong>${escapeHtml(r.name || r.strategy_id || "Strategy")}</strong>
-              <span class="badge ${onDesk ? "on" : ""}">${onDesk ? "on desk" : side}</span>
-            </div>
-            ${onDesk ? `<span class="exec-card-chevron" aria-hidden="true">›</span>` : ""}
-          </div>
-          <div class="meta exec-card-sub">${escapeHtml(side)} · ${escapeHtml(String(r.strategy_id || ""))}</div>
-          <div class="exec-kpi">
-            <div class="exec-kpi-cell">
-              <span>Net PnL</span>
-              <strong class="${pnlClass(r.total_pnl || 0)}">₹${money(r.total_pnl)}</strong>
-            </div>
-            <div class="exec-kpi-cell">
-              <span>Win%</span>
-              <strong>${pct(r.win_rate)}</strong>
-            </div>
-            <div class="exec-kpi-cell">
-              <span>Trades</span>
-              <strong class="mono">${r.trades ?? 0}</strong>
-            </div>
-            <div class="exec-kpi-cell">
-              <span>Avg+</span>
-              <strong class="pos mono">${r.avg_win != null ? money(r.avg_win) : "—"}</strong>
-            </div>
-          </div>
-          <div class="exec-meta-row">
-            <span>Avg− <b class="neg mono">${r.avg_loss != null ? money(r.avg_loss) : "—"}</b></span>
-            ${onDesk ? "<span>Tap for settings</span>" : "<span>History only</span>"}
-          </div>
-        </button>
-      </article>`;
-    })
-    .join("");
-
-  root.querySelectorAll(".analytics-card [data-act=open]").forEach((btn) => {
-    if (btn.disabled) return;
-    btn.addEventListener("click", () => {
-      const id = btn.closest(".analytics-card")?.dataset.id;
-      if (id) openStrategyModal(id);
-    });
-  });
+  /* Analytics tab removed — day KPIs live on Execute. */
 }
 
 function renderExecStats(session) {
@@ -444,8 +398,13 @@ function renderExecStats(session) {
       const a = map[id] || {};
       const realized = s.realized_pnl || 0;
       const unreal = s.unrealized_pnl || 0;
-      const total = realized + unreal;
       const tv = s.trade_view || {};
+      const invested = Number(tv.invested != null ? tv.invested : s.starting_cash) || 0;
+      const dayPnl = Number(
+        tv.day_pnl != null ? tv.day_pnl : realized + unreal
+      );
+      const generated = Number(tv.generated != null ? tv.generated : invested + dayPnl);
+      const total = tv.desk_settled ? dayPnl : realized + unreal;
       const basket = s.basket || [];
       const active = basket.filter((l) => l.in_trade);
       const selected = (s.params?.selected || []).length || basket.length || 0;
@@ -516,8 +475,9 @@ function renderExecStats(session) {
         }
       }
 
-      const pnlSub =
-        Math.abs(unreal) > 1e-9
+      const pnlSub = tv.desk_settled
+        ? `settled day`
+        : Math.abs(unreal) > 1e-9
           ? `R ${money(realized)} · U ${money(unreal)}`
           : Math.abs(realized) > 1e-9
             ? `realized`
@@ -539,7 +499,12 @@ function renderExecStats(session) {
           <div class="row-title">${escapeHtml(s.name)}</div>
           <div class="meta">${nameSub}</div>
         </td>
-        <td data-label="PnL" class="mono ${pnlClass(total)}" title="Total = realized (closed) + unrealized (open)">
+        <td data-label="Capital" class="mono" title="Paper capital for this strategy">₹${money(invested)}</td>
+        <td data-label="Generated" class="mono ${pnlClass(dayPnl)}" title="Capital + day PnL">
+          <div>₹${money(generated)}</div>
+          <div class="meta pnl-sub">day ₹${money(dayPnl)}</div>
+        </td>
+        <td data-label="PnL" class="mono ${pnlClass(total)}" title="Open row PnL (0 after EOD settle)">
           <div>₹${money(total)}</div>
           <div class="meta pnl-sub">${escapeHtml(pnlSub)}</div>
         </td>
@@ -550,8 +515,8 @@ function renderExecStats(session) {
           ${levelsHint && levelsHint !== "open" ? `<div class="meta pnl-sub">${escapeHtml(levelsHint)}</div>` : ""}
         </td>
         <td data-label="${posLabel}" class="mono">${stocks}</td>
-        <td data-label="Stop" class="mono" title="${levelsHint === "open" ? "Open stop-loss" : "Only set while in a trade"}">${sl}</td>
-        <td data-label="Target" class="mono" title="${levelsHint === "last closed" ? "Last closed exit" : levelsHint === "open" ? "Open take-profit" : "Only set while in a trade"}">${tp}</td>
+        <td data-label="Stop" class="mono">${sl}</td>
+        <td data-label="Target" class="mono">${tp}</td>
         <td data-label="Win" class="mono">${pct(a.win_rate)}</td>
         <td data-label="Actions" class="desk-actions-cell">
           <div class="desk-row-actions">
@@ -565,9 +530,9 @@ function renderExecStats(session) {
 
   root.innerHTML = `
     <p class="hint desk-legend">
-      <strong>PnL</strong> = closed (realized) + open (unrealized).
-      <strong>Entry / Stop / Target</strong> apply only while a trade is open (Pos &gt; 0).
-      When flat, Entry shows the <em>last closed</em> fill if any — not a live position.
+      <strong>Capital</strong> = paper cash assigned (e.g. ₹5L).
+      <strong>Generated</strong> = capital + day PnL.
+      After <strong>15:20</strong> settle, row PnL shows day result then clears to 0; Reports keep history.
     </p>
     <div class="table-wrap desk-table-wrap">
       <table class="data-table dense cards-on-mobile" id="execStatsTable">
@@ -575,13 +540,15 @@ function renderExecStats(session) {
           <tr>
             <th>Status</th>
             <th>Strategy</th>
-            <th title="Realized + unrealized">PnL</th>
+            <th title="Paper capital">Capital</th>
+            <th title="Capital + day PnL">Generated</th>
+            <th title="Live / settled day PnL">PnL</th>
             <th>Signal</th>
             <th title="Current mark">Market</th>
             <th title="Open entry, or last closed when flat">Entry</th>
             <th>Pos</th>
-            <th title="Stop-loss (open trades only)">Stop</th>
-            <th title="Target (open) or last exit when flat">Target</th>
+            <th>Stop</th>
+            <th>Target</th>
             <th>Win</th>
             <th>Actions</th>
           </tr>
@@ -1015,9 +982,7 @@ function render(session) {
   pill.classList.toggle("running", !!session.running);
   renderSummary(session);
   renderRegistry();
-  renderAnalytics();
   renderExecStats(session);
-  renderDeskCards("dashDesk", session);
   if (currentView === "reports") refreshReports();
 }
 
@@ -1090,8 +1055,8 @@ async function onOrbPair() {
   }
 }
 
-$("btnOrbPair").addEventListener("click", onOrbPair);
-$("btnOrbPair2").addEventListener("click", onOrbPair);
+$("btnOrbPair")?.addEventListener("click", onOrbPair);
+$("btnOrbPair2")?.addEventListener("click", onOrbPair);
 $("btnStart").addEventListener("click", () => startSession().catch((e) => alert(e.message)));
 $("btnStart2").addEventListener("click", () => startSession().catch((e) => alert(e.message)));
 $("btnStop").addEventListener("click", () => stopSession().catch((e) => alert(e.message)));
@@ -1121,6 +1086,10 @@ document.querySelectorAll("[data-range]").forEach((btn) => {
     const from = new Date();
     if (range === "today") {
       // from = to = today
+    } else if (range === "week") {
+      const day = to.getDay(); // 0 Sun … 6 Sat
+      const mondayOffset = day === 0 ? -6 : 1 - day;
+      from.setDate(to.getDate() + mondayOffset);
     } else if (range === "7d") {
       from.setDate(to.getDate() - 6);
     } else if (range === "month") {

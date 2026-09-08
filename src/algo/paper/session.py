@@ -201,6 +201,18 @@ class StrategyRunner:
             if "flat" not in (st.note or "").lower() and "waiting" not in (st.note or "").lower():
                 if abs(float(st.realized_pnl or 0)) > 1e-9:
                     st.note = f"{st.note} · flat (realized)"
+                else:
+                    st.note = f"{st.note} · flat (last closed)"
+        day_pnl = float(st.realized_pnl or 0) + float(st.unrealized_pnl or 0)
+        invested = float(st.starting_cash or 0)
+        st.trade_view = {
+            **(st.trade_view or {}),
+            "invested": invested,
+            "equity": invested + day_pnl,
+            "day_pnl": day_pnl,
+            "generated": invested + day_pnl,
+            "desk_settled": False,
+        }
         return st
 
     def on_bar(self, bar: Bar) -> None:

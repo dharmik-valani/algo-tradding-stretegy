@@ -43,7 +43,7 @@ class AddStrategyBody(BaseModel):
     symbol: str = "NIFTY"
     timeframe: str = "5m"
     quantity: int = 1
-    starting_cash: float = 100_000.0
+    starting_cash: float = 500_000.0
     params: dict[str, Any] = Field(default_factory=dict)
     enabled: bool = True
     asset_kind: str | None = None

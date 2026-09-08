@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=desk15" />
+  <link rel="stylesheet" href="/static/styles.css?v=desk16" />
 </head>
 <body>
   <div class="app">
@@ -24,11 +24,7 @@
         </div>
       </div>
       <nav class="nav" id="nav">
-        <button type="button" class="nav-item active" data-view="analytics">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 19V9"/><path d="M12 19V5"/><path d="M20 19v-7"/><path d="M3 19h18"/></svg>
-          <span>Analytics</span>
-        </button>
-        <button type="button" class="nav-item" data-view="execute">
+        <button type="button" class="nav-item active" data-view="execute">
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="4" y="4" width="16" height="16" rx="2"/><path d="m10 8 6 4-6 4z"/></svg>
           <span>Execute</span>
         </button>
@@ -49,8 +45,8 @@
 
     <header class="topbar">
       <div class="topbar-copy">
-        <h1 id="viewTitle">Analytics</h1>
-        <p class="subtitle" id="viewSubtitle">Live session and closed-trade performance</p>
+        <h1 id="viewTitle">Execute</h1>
+        <p class="subtitle" id="viewSubtitle">Day capital, live strategies, and paper fills</p>
       </div>
       <div class="top-actions">
         <button id="btnStart" class="primary">Start</button>
@@ -61,77 +57,38 @@
     <div class="main">
       <p class="msg" id="sessionMsg">Loading…</p>
 
-      <section class="view active" id="view-analytics" data-view="analytics">
-        <div class="kpi-board compact-kpis" id="summaryGrid">
+      <section class="view" id="view-analytics" data-view="analytics" hidden aria-hidden="true"></section>
+
+      <section class="view active" id="view-execute" data-view="execute">
+        <div class="kpi-board compact-kpis" id="execDayKpis">
           <div class="metric hero">
-            <span>Session PnL</span>
-            <strong id="sumPnl">—</strong>
+            <span>Invested today</span>
+            <strong id="execInvested">—</strong>
           </div>
           <div class="metric hero">
-            <span>Closed net</span>
-            <strong id="anNet">—</strong>
+            <span>Generated (equity)</span>
+            <strong id="execGenerated">—</strong>
+          </div>
+          <div class="metric hero">
+            <span>Day PnL</span>
+            <strong id="execDayPnl">—</strong>
           </div>
           <div class="metric">
             <span>Win rate</span>
-            <strong id="anWinRate">—</strong>
-          </div>
-          <div class="metric">
-            <span>Profit factor</span>
-            <strong id="anPf">—</strong>
-          </div>
-          <div class="metric">
-            <span>Avg win</span>
-            <strong id="anAvgWin" class="pos">—</strong>
-          </div>
-          <div class="metric">
-            <span>Avg loss</span>
-            <strong id="anAvgLoss" class="neg">—</strong>
-          </div>
-          <div class="metric">
-            <span>Closed trades</span>
-            <strong id="anTrades">0</strong>
+            <strong id="execWinRate">—</strong>
           </div>
           <div class="metric">
             <span>Desk</span>
-            <strong id="sumDeskLine">0 / 0</strong>
+            <strong id="execDeskLine">0 / 0</strong>
             <em class="metric-note">enabled / on desk</em>
           </div>
         </div>
-
-        <div class="panel accent-panel compact-panel">
-          <div class="panel-head">
-            <h2>Quick add</h2>
-            <button id="btnOrbPair" class="primary">Add Call + Put ORB</button>
-          </div>
-          <p class="hint">Adds NIFTY Opt ORB Call and Put with defaults. Start live paper after enabling.</p>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Strategy performance</h2>
-            <span class="count-pill" id="anStratCount">0</span>
-          </div>
-          <p class="hint">Closed-trade stats per strategy. Tap a card to open desk settings.</p>
-          <div id="analyticsCards" class="exec-desk-list"></div>
-        </div>
-
-        <div class="panel">
-          <div class="panel-head">
-            <h2>Live desk</h2>
-            <span class="count-pill" id="sumRegistered" hidden>0</span>
-          </div>
-          <p class="hint">Same controls as Execute — pause one leg without stopping the session.</p>
-          <div id="dashDesk" class="exec-desk-list"></div>
-        </div>
-      </section>
-
-      <section class="view" id="view-execute" data-view="execute">
         <div class="panel exec-panel">
           <div class="panel-head">
             <h2>On desk</h2>
             <span class="count-pill" id="deskCount">0</span>
           </div>
-          <p class="hint">Tap a row for settings. Pause one strategy without stopping the whole session. PnL can be from closed trades even when Entry/Stop show flat.</p>
+          <p class="hint">Market day ~09:15–15:30 IST. Baskets REST-scan at <strong>09:30</strong> (or on Start if later), then WebSocket tracks selected names only. After <strong>15:20</strong> flatten, rows settle to 0; day capital stays above. History → Reports.</p>
           <div id="execDeskList" class="exec-desk-list"></div>
         </div>
 
@@ -181,13 +138,14 @@
           </div>
           <div class="report-presets" role="group" aria-label="Date range presets">
             <button type="button" class="ghost" data-range="today">Today</button>
+            <button type="button" class="ghost" data-range="week">This week</button>
             <button type="button" class="ghost" data-range="7d">Last 7 days</button>
             <button type="button" class="ghost" data-range="month">This month</button>
             <button type="button" class="ghost" data-range="all">All time</button>
           </div>
-          <p class="hint">Day flow: timed REST scan (e.g. 09:16 / 09:18) → WebSocket only selected names → trade until <strong>flatten_at ~15:20</strong> → cron sleep ~15:45. Next IST day desk PnL resets to 0; entry/exit history stays in Reports.</p>
-          <p class="hint">Exports respect From / To / Strategy filters. <strong>CSV trades</strong> = trade lines only. <strong>CSV full</strong> = summary + by strategy + day-wise + trades. <strong>PDF / Print</strong> opens a printable report — use your browser’s Print → Save as PDF.</p>
-          <p class="hint">Trades live in SQLite (<code>data/algo.db</code>). On <strong>free Render</strong> that file is wiped when the service sleeps or redeploys — weekly reports will not survive unless you use Supabase Postgres. Local laptop DB is separate and is <strong>not</strong> auto-synced.</p>
+          <p class="hint">Day flow: wake → wait for <strong>scan_at 09:30</strong> (or Start later) → REST basket → WebSocket selected only → flatten ~15:20 → sleep ~15:45. Next day Execute resets; Reports keep history.</p>
+          <p class="hint">Exports respect From / To / Strategy filters. <strong>CSV full</strong> = summary + by strategy + day-wise + trades. <strong>PDF / Print</strong> = printable day/strategy report.</p>
+          <p class="hint">Use Supabase Postgres on Render so day / week / month reports survive free-tier sleeps.</p>
         </div>
 
         <div class="panel">
@@ -350,8 +308,8 @@
         <label>Qty (lots)
           <input id="qty" type="number" value="1" min="1" inputmode="numeric" />
         </label>
-        <label>Cash ₹
-          <input id="cash" type="number" value="100000" step="1000" inputmode="decimal" />
+        <label>Cash ₹ (capital / strategy)
+          <input id="cash" type="number" value="500000" step="1000" inputmode="decimal" />
         </label>
       </div>
       <div class="row" id="paramFields"></div>
@@ -389,6 +347,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=desk15"></script>
+  <script src="/static/app.js?v=desk16"></script>
 </body>
 </html>

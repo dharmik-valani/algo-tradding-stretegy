@@ -38,8 +38,6 @@ class BasketRunner:
         self.starting_cash = starting_cash
         self.settings = settings
         self.journal_session_id = journal_session_id
-        self._desk_day = datetime.now(IST).date()
-        self._eod_done_day = None
         self.enabled = True
         self.logs: list[str] = []
         self.last_signal = "HOLD"
@@ -49,6 +47,10 @@ class BasketRunner:
         self.brokers: dict[str, PaperBroker] = {}
         self.open_trade_ids: dict[str, str] = {}
         self._scanned = False
+        self._desk_day = datetime.now(IST).date()
+        self._eod_done_day = None
+        self._desk_settled = False
+        self._day_pnl = 0.0
         p = {**strategy.default_params(), **strategy.params}
         self.qty = int(quantity if quantity is not None else p.get("qty_per_symbol") or 1)
         self.cash_pool = starting_cash
@@ -144,10 +146,10 @@ class BasketRunner:
             asset_kind="stock",
             timeframe=self.timeframe,
             quantity=self.qty,
-            cash=cash,
+            cash=cash if not self._desk_settled else self.starting_cash + float(self._day_pnl or 0),
             starting_cash=self.starting_cash,
-            realized_pnl=realized,
-            unrealized_pnl=unreal,
+            realized_pnl=0.0 if self._desk_settled else realized,
+            unrealized_pnl=0.0 if self._desk_settled else unreal,
             last_price=last_px,
             last_signal=self.last_signal,
             last_bar_at=self.last_bar_at,
@@ -181,23 +183,37 @@ class BasketRunner:
             st.note = f"{waiting} waiting breakout" if waiting else (self.last_signal or "HOLD")
         else:
             st.note = self.last_signal or "HOLD"
+        if self._desk_settled:
+            st.note = f"settled · day PnL ₹{float(self._day_pnl or 0):,.0f}"
+            st.legs_in_trade = 0
         closed_all: list[dict] = []
         for b in self.brokers.values():
             closed_all.extend(getattr(b, "closed_trades", []) or [])
         last_closed = closed_all[-1] if closed_all else None
+        live_day = float(self._day_pnl or 0) if self._desk_settled else float(realized + unreal)
         st.trade_view = {
             "market": st.last_price,
             "entry": st.entry_price,
             "stop": st.stop_price,
             "target": st.target_price,
-            "in_trade": bool(active),
-            "realized_pnl": float(realized or 0),
-            "unrealized_pnl": float(unreal or 0),
+            "in_trade": bool(active) and not self._desk_settled,
+            "realized_pnl": 0.0 if self._desk_settled else float(realized or 0),
+            "unrealized_pnl": 0.0 if self._desk_settled else float(unreal or 0),
             "last_closed": last_closed,
             "closed_count": len(closed_all),
-            "open_count": len(active),
+            "open_count": 0 if self._desk_settled else len(active),
+            "invested": float(self.starting_cash),
+            "equity": float(self.starting_cash) + live_day,
+            "day_pnl": live_day,
+            "desk_settled": bool(self._desk_settled),
+            "generated": float(self.starting_cash) + live_day,
         }
-        if not active and abs(float(realized or 0)) > 1e-9 and "realized" not in (st.note or "").lower():
+        if (
+            not active
+            and not self._desk_settled
+            and abs(float(realized or 0)) > 1e-9
+            and "realized" not in (st.note or "").lower()
+        ):
             st.note = f"{st.note} · flat (realized)" if st.note else "flat (realized)"
         return st
 
@@ -374,7 +390,29 @@ class BasketRunner:
         self.open_trade_ids = {}
         self._scanned = False
         self._eod_done_day = None
+        self._desk_settled = False
+        self._day_pnl = 0.0
         self._desk_day = today
+
+    def _settle_desk_display(self) -> None:
+        """After EOD: lock day PnL, zero Execute row PnL (journal kept)."""
+        if self._desk_settled:
+            return
+        realized = sum(b.realized_pnl for b in self.brokers.values())
+        self._day_pnl = float(realized)
+        n = max(len(self.selected) or 1, 1)
+        fresh: dict[str, PaperBroker] = {}
+        for sym in self.selected:
+            b = PaperBroker(starting_cash=self.starting_cash / n)
+            b.bind(self.strategy.id, f"NSE:EQ:{sym}", sym)
+            fresh[sym] = b
+        self.brokers = fresh
+        self.open_trade_ids = {}
+        self._desk_settled = True
+        self._log(
+            f"Desk settled — day PnL ₹{self._day_pnl:,.2f} shown as Generated; "
+            f"Execute row PnL cleared to 0 (journal kept)"
+        )
 
     def _maybe_eod_flatten(self, quotes: LiveQuoteProvider) -> None:
         """Force-close open intraday legs at flatten_at (default 15:20 IST)."""
@@ -383,7 +421,7 @@ class BasketRunner:
         if not flat_raw:
             return
         today = datetime.now(IST).date()
-        if self._eod_done_day == today:
+        if self._eod_done_day == today and self._desk_settled:
             return
         try:
             hh, mm = [int(x) for x in flat_raw.split(":")[:2]]
@@ -397,31 +435,30 @@ class BasketRunner:
             for sym, broker in self.brokers.items()
             if broker.position.quantity
         ]
-        if not open_syms:
-            self._eod_done_day = today
-            return
-        self._log(f"EOD flatten @ {flat_raw} IST — closing {len(open_syms)} open leg(s)")
-        from algo.paper.models import Signal
+        if open_syms:
+            self._log(f"EOD flatten @ {flat_raw} IST — closing {len(open_syms)} open leg(s)")
+            from algo.paper.models import Signal
 
-        for sym in open_syms:
-            try:
-                price, ts, _src = quotes.get_ltp(
-                    sym, allow_rest=True, wait_ws_sec=0.5, max_stale_sec=600
+            for sym in open_syms:
+                try:
+                    price, ts, _src = quotes.get_ltp(
+                        sym, allow_rest=True, wait_ws_sec=0.5, max_stale_sec=600
+                    )
+                except Exception:
+                    continue
+                broker = self.brokers[sym]
+                sig = Signal(
+                    action=SignalAction.FLAT,
+                    reason=f"EOD flatten @ {flat_raw} IST",
+                    meta={"structure": "eod", "fill_price": float(price), "symbol": sym},
                 )
-            except Exception:
-                continue
-            broker = self.brokers[sym]
-            sig = Signal(
-                action=SignalAction.FLAT,
-                reason=f"EOD flatten @ {flat_raw} IST",
-                meta={"structure": "eod", "fill_price": float(price), "symbol": sym},
-            )
-            self._apply(sym, broker, sig, float(price), ts)
-            leg = (getattr(self.strategy, "_legs", {}) or {}).get(sym)
-            if isinstance(leg, dict):
-                leg["in_trade"] = False
+                self._apply(sym, broker, sig, float(price), ts)
+                leg = (getattr(self.strategy, "_legs", {}) or {}).get(sym)
+                if isinstance(leg, dict):
+                    leg["in_trade"] = False
+            self.last_signal = "EOD_FLAT"
         self._eod_done_day = today
-        self.last_signal = "EOD_FLAT"
+        self._settle_desk_display()
 
     def run_replay(self, quotes: LiveQuoteProvider, max_bars: int | None = 500) -> None:
         self.ensure_selection(quotes)
