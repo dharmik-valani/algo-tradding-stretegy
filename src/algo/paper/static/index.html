@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=desk31" />
+  <link rel="stylesheet" href="/static/styles.css?v=desk33" />
 </head>
 <body>
   <div class="app">
@@ -217,7 +217,7 @@
             <h2>On desk</h2>
             <span class="count-pill" id="deskCount">0</span>
           </div>
-          <p class="hint tight">09:15–15:30 IST · scan 09:30 · flatten 15:00 · history in Reports</p>
+          <p class="hint tight">09:15–15:30 IST · scan 09:30 → basket legs · fill on breakout · 1 trade/symbol/day · flatten 15:00</p>
           <div id="execDeskList" class="exec-desk-list"></div>
         </div>
 
@@ -411,10 +411,11 @@
               <input id="poll" type="number" value="5" min="2" max="120" step="1" inputmode="numeric" />
             </label>
           </div>
-          <p class="hint">Live paper uses virtual fills only. With Dhan Data API, marks come from WebSocket; poll is how often strategies evaluate.</p>
+          <p class="hint">Live paper uses virtual fills only. With Dhan Data API, marks come from WebSocket; poll is how often strategies evaluate. Desk strategies live in shared Supabase — use <strong>Reload from DB</strong> if laptop and Render diverge.</p>
           <div class="actions">
             <button id="btnStart2" class="primary">Start all</button>
             <button id="btnStop2">Stop session</button>
+            <button id="btnReloadDesk" class="ghost" type="button">Reload from DB</button>
             <button id="btnReset" class="ghost">Reset runtime</button>
           </div>
         </div>
@@ -522,6 +523,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=desk31"></script>
+  <script src="/static/app.js?v=desk33"></script>
 </body>
 </html>

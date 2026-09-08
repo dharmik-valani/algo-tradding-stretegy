@@ -114,10 +114,17 @@ class BasketRunner:
             in_trade = bool(leg.get("in_trade")) and not self._desk_settled
             # After settle / when flat: do not surface stale LTPs on the desk.
             show_px = None if (self._desk_settled or not in_trade) else px
+            filled_qty = 0 if self._desk_settled else int(pos.quantity or 0)
+            last_qty = int((last_closed or {}).get("quantity") or 0) if last_closed else 0
+            planned_qty = int(leg.get("qty") or 0) if not self._desk_settled else 0
+            # Prefer live position qty; else last closed fill; else planned tier qty.
+            show_qty = abs(filled_qty) if filled_qty else (last_qty if not in_trade and last_qty else planned_qty)
             legs.append(
                 {
                     "symbol": sym,
-                    "qty": 0 if self._desk_settled else pos.quantity,
+                    "qty": show_qty,
+                    "filled_qty": abs(filled_qty),
+                    "planned_qty": planned_qty,
                     "avg": pos.avg_price if in_trade else None,
                     "last": show_px,
                     "realized": 0.0 if self._desk_settled else broker.realized_pnl,

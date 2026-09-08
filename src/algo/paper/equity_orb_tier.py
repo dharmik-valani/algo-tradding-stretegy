@@ -239,10 +239,10 @@ class _EquityOrbTierBase(Strategy):
             },
             {
                 "key": "one_trade_per_symbol",
-                "label": "One trade / symbol",
+                "label": "One trade / symbol (locked)",
                 "type": "select",
-                "options": ["true", "false"],
-                "help": "Each selected stock may enter only once per day.",
+                "options": ["true"],
+                "help": "Locked on: each selected stock may enter only once per IST day (no re-entry after exit).",
                 "example": "true",
             },
         ]
@@ -356,7 +356,9 @@ class _EquityOrbTierBase(Strategy):
         rr2 = float(p.get("risk_reward_2") or 3.0)
         partial_pct = float(p.get("partial_at_r1_pct") or 50.0) / 100.0
         entry_end = _parse_hhmm(str(p["entry_end"]))
-        one_trade = str(p.get("one_trade_per_symbol", True)).lower() in {"1", "true", "yes"}
+        # Always once-per-symbol per IST day — ignore toggles that would allow re-entry.
+        one_trade = True
+        p["one_trade_per_symbol"] = True
         clock = local.time().replace(tzinfo=None)
         range_end = (
             datetime.combine(day, open_t, tzinfo=IST) + timedelta(minutes=range_mins)

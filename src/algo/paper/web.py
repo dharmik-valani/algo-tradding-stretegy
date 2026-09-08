@@ -124,6 +124,31 @@ def report_close(
     return run_market_report("close", send=send_email)
 
 
+@app.post("/api/session/reload")
+def session_reload() -> dict:
+    """Reload desk + runtime from shared database (Supabase) / files.
+
+    Use when laptop UI drifted from Render: both share DATABASE_URL; this
+    drops in-memory strategies and re-reads the Postgres ``paper_desk`` blob.
+    """
+    session = reload_session_from_disk()
+    snap = session.snapshot().model_dump(mode="json")
+    return {
+        "ok": True,
+        "strategies": len(snap.get("strategies") or []),
+        "running": bool(session.running),
+        "message": snap.get("message") or session.message,
+        "desk": [
+            {
+                "instance_id": s.get("instance_id"),
+                "name": s.get("name"),
+                "enabled": s.get("enabled"),
+            }
+            for s in (snap.get("strategies") or [])
+        ],
+    }
+
+
 @app.post("/api/session/wake")
 def wake_live(
     poll_seconds: float = Query(15.0, ge=5.0, le=120.0),
@@ -232,12 +257,18 @@ class SnapshotRestoreBody(BaseModel):
 
 @app.post("/api/admin/restore-snapshot")
 def restore_snapshot(body: SnapshotRestoreBody) -> dict:
-    """Replace desk/runtime/SQLite from a local export. Requires PAPER_SYNC_TOKEN."""
+    """Replace desk/runtime from a local export. Requires PAPER_SYNC_TOKEN.
+
+    Writes into shared Postgres (``paper_app_state``) when DATABASE_URL is set,
+    and mirrors files for offline inspection.
+    """
     import base64
+    import json
     import os
     from pathlib import Path
 
     from algo.config import ROOT
+    from algo.paper.desk_store import save_desk, save_runtime
 
     expected = (os.environ.get("PAPER_SYNC_TOKEN") or "").strip()
     if not expected or body.sync_token.strip() != expected:
@@ -247,18 +278,32 @@ def restore_snapshot(body: SnapshotRestoreBody) -> dict:
     data_dir.mkdir(parents=True, exist_ok=True)
     written: list[str] = []
 
-    def _write(name: str, b64: str | None) -> None:
+    def _decode(b64: str | None) -> bytes | None:
         if not b64:
-            return
-        raw = base64.b64decode(b64)
-        path = data_dir / name
-        path.write_bytes(raw)
-        written.append(name)
+            return None
+        return base64.b64decode(b64)
 
     try:
-        _write("paper_desk.json", body.desk_json_b64)
-        _write("paper_runtime.json", body.runtime_json_b64)
-        _write("algo.db", body.sqlite_b64)
+        desk_raw = _decode(body.desk_json_b64)
+        runtime_raw = _decode(body.runtime_json_b64)
+        sqlite_raw = _decode(body.sqlite_b64)
+        if desk_raw is not None:
+            payload = json.loads(desk_raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("desk JSON must be an object")
+            save_desk(payload)  # Postgres SSoT + file mirror
+            written.append("paper_desk")
+        if runtime_raw is not None:
+            payload = json.loads(runtime_raw.decode("utf-8"))
+            if not isinstance(payload, dict):
+                raise ValueError("runtime JSON must be an object")
+            save_runtime(payload)
+            written.append("paper_runtime")
+        if sqlite_raw is not None:
+            # Only useful for SQLite local; ignored on next boot if Postgres is configured.
+            path = data_dir / "algo.db"
+            path.write_bytes(sqlite_raw)
+            written.append("algo.db")
     except Exception as exc:
         raise HTTPException(status_code=400, detail=f"decode/write failed: {exc}") from exc
 

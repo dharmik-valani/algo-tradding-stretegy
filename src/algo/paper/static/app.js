@@ -662,12 +662,20 @@ function renderExecStats(session) {
 
       let stocks;
       let posTitle;
+      let qtyCell;
+      let qtyTitle;
       if (isBasket) {
         stocks = `${settled ? 0 : inTrade}/${selected || basket.length}`;
         posTitle = "Open legs / selected symbols in basket";
+        const openQtySum = active.reduce((n, l) => n + Math.abs(Number(l.qty) || 0), 0);
+        qtyCell = settled ? "—" : openQtySum > 0 ? String(openQtySum) : "—";
+        qtyTitle = "Sum of share qty on open basket legs";
       } else {
-        stocks = isOpen ? String(Math.abs(posQty) || 1) : "0";
-        posTitle = "Open position quantity (lots/shares)";
+        stocks = isOpen ? "1" : "0";
+        posTitle = "Open trade count (0 or 1 — once per day)";
+        const q = Math.abs(posQty) || (isOpen ? Number(s.quantity) || 0 : 0);
+        qtyCell = q > 0 ? String(q) : "—";
+        qtyTitle = "Open position quantity (lots/shares)";
       }
 
       // Market = live mark only while a trade is open. Flat/settled desk stays blank (fresh start).
@@ -734,6 +742,11 @@ function renderExecStats(session) {
       const status = s.enabled ? "run" : "paused";
       const toggleLabel = s.enabled ? "Pause" : "Resume";
       const toggleAct = s.enabled ? "pause" : "start";
+      // Auto-expand baskets that already scanned / have open legs so qty rows are visible.
+      if (isBasket && basket.length > 0 && (inTrade > 0 || selected > 0) && !deskExpanded.has(`seen:${id}`)) {
+        deskExpanded.add(id);
+        deskExpanded.add(`seen:${id}`);
+      }
       const expanded = deskExpanded.has(id);
       const canExpand = isBasket && basket.length > 0;
       const expandBtn = canExpand
@@ -748,7 +761,7 @@ function renderExecStats(session) {
             <span class="badge ${s.enabled ? "on" : ""}">${status}</span>
             <span class="strat-name">${escapeHtml(s.name)}</span>
           </div>
-          <div class="meta">${nameSub}${canExpand ? ` · ${basket.length} symbols` : ""}</div>
+          <div class="meta">${nameSub}${canExpand ? ` · ${basket.length} symbols` : " · 1 trade/day"}</div>
         </td>
         <td data-label="Capital" class="mono" title="Paper capital ₹${money(invested)}">₹${moneyShort(invested)}</td>
         <td data-label="Generated" class="mono ${pnlClass(dayPnl)}" title="Capital + day PnL · ₹${money(generated)}">
@@ -767,6 +780,7 @@ function renderExecStats(session) {
           ${levelCell(exitPx, levelsHint === "last exit" ? "last exit" : (isOpen ? "open" : ""))}
         </td>
         <td data-label="Open" class="mono" title="${escapeHtml(posTitle)}">${stocks}</td>
+        <td data-label="Qty" class="mono" title="${escapeHtml(qtyTitle)}">${qtyCell}</td>
         <td data-label="Stop" class="mono">${sl}</td>
         <td data-label="Target" class="mono">${tp}</td>
         <td data-label="Win" class="mono">${pct(a.win_rate)}</td>
@@ -796,15 +810,24 @@ function renderExecStats(session) {
           const legExit = !legOpen && leg.exit != null ? money(leg.exit) : "—";
           const legSl = legOpen && leg.stop != null ? money(leg.stop) : "—";
           const legTp = legOpen && leg.target != null ? money(leg.target) : "—";
-          const legHint = legOpen ? "open" : leg.exit != null ? "last exit" : (leg.status || "flat");
+          const legQty = Math.abs(Number(leg.qty) || Number(leg.filled_qty) || Number(leg.planned_qty) || 0);
+          const legQtyLabel = legQty > 0 ? String(legQty) : "—";
+          const tradedToday = Number(leg.trades_today || 0) >= 1;
+          const legHint = legOpen
+            ? "open"
+            : tradedToday
+              ? "done today"
+              : leg.exit != null
+                ? "last exit"
+                : (leg.status || "waiting");
           return `
           <tr class="desk-leg-row ${legOpen ? "has-open" : "is-flat"}" data-parent="${escapeHtml(id)}">
             <td data-label="Symbol" class="col-strategy">
               <div class="row-title leg-indent">
-                <span class="badge ${legOpen ? "on" : ""}">${legOpen ? "open" : "flat"}</span>
+                <span class="badge ${legOpen ? "on" : ""}">${legOpen ? "open" : tradedToday ? "done" : "wait"}</span>
                 <span class="strat-name">${escapeHtml(leg.symbol || "")}</span>
               </div>
-              <div class="meta">${escapeHtml(leg.status || "")}${leg.side ? ` · ${escapeHtml(String(leg.side))}` : ""}</div>
+              <div class="meta">${escapeHtml(leg.status || "")}${leg.side ? ` · ${escapeHtml(String(leg.side))}` : ""}${tradedToday && !legOpen ? " · 1/day" : ""}</div>
             </td>
             <td data-label="Capital" class="mono" title="Allocated to this symbol ₹${money(legCap)}">₹${moneyShort(legCap)}</td>
             <td data-label="Generated" class="mono ${pnlClass(legPnl)}">
@@ -815,7 +838,8 @@ function renderExecStats(session) {
             <td data-label="Market" class="mono">${legMarket}</td>
             <td data-label="Entry" class="mono">${levelCell(legEntry, legOpen ? "" : (leg.exit != null ? "" : legHint))}</td>
             <td data-label="Exit" class="mono">${levelCell(legExit, legOpen ? "open" : (leg.exit != null ? "exited" : ""))}</td>
-            <td data-label="Open" class="mono">${legOpen ? Math.abs(leg.qty || 1) : 0}</td>
+            <td data-label="Open" class="mono" title="0 = flat, 1 = in trade">${legOpen ? "1" : "0"}</td>
+            <td data-label="Qty" class="mono" title="Trade-wise share quantity">${legQtyLabel}</td>
             <td data-label="Stop" class="mono">${legSl}</td>
             <td data-label="Target" class="mono">${legTp}</td>
             <td data-label="Win" class="mono">—</td>
@@ -830,7 +854,8 @@ function renderExecStats(session) {
 
   root.innerHTML = `
     <p class="hint desk-legend tight">
-      Market = LTP while open · Entry/Exit = fills · Open = in-trade/selected · ▶ expands basket legs
+      After 09:30 scan, ▶ shows basket symbols. Live fills appear on those sub-rows with Qty.
+      Open = in-trade count · Qty = shares · each symbol once/day.
     </p>
     <div class="table-wrap desk-table-wrap">
       <table class="data-table dense cards-on-mobile" id="execStatsTable">
@@ -843,7 +868,8 @@ function renderExecStats(session) {
             <th title="Live mark while in trade">Market</th>
             <th title="Entry fill">Entry</th>
             <th title="Exit fill">Exit</th>
-            <th title="Basket: in-trade / selected. Single: open qty">Open</th>
+            <th title="Basket: in-trade / selected. Single: 0 or 1">Open</th>
+            <th title="Share / lot quantity">Qty</th>
             <th>Stop</th>
             <th>Target</th>
             <th>Win</th>
@@ -1483,6 +1509,26 @@ $("btnReset").addEventListener("click", async () => {
   if (!confirm("Reset paper session?")) return;
   await api("/api/session/reset", { method: "POST" });
   await refresh();
+});
+
+$("btnReloadDesk")?.addEventListener("click", async () => {
+  if (
+    !confirm(
+      "Reload desk from shared database (Supabase)?\n\nThis replaces the strategies in this browser session with whatever Render / DB currently has. Do not leave laptop + Render both running live."
+    )
+  ) {
+    return;
+  }
+  try {
+    const data = await api("/api/session/reload", { method: "POST" });
+    await refresh();
+    alert(
+      data.message ||
+        `Reloaded ${data.strategies ?? 0} strategies from database.`
+    );
+  } catch (err) {
+    alert(err.message || String(err));
+  }
 });
 
 $("btnRefreshReports")?.addEventListener("click", () => refreshReports());

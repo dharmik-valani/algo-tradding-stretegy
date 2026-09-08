@@ -1512,7 +1512,7 @@ def reset_session() -> PaperSession:
 
 
 def reload_session_from_disk() -> PaperSession:
-    """Stop live, re-open SQLite, restore desk + runtime from data/ files."""
+    """Stop live, re-open DB engine, restore desk + runtime from Postgres (or files)."""
     global _SESSION
     with _SESSION_LOCK:
         if _SESSION and _SESSION.running:
@@ -1528,7 +1528,7 @@ def reload_session_from_disk() -> PaperSession:
     try:
         sess.restore_desk()
         sess.restore_runtime()
-        sess.message = f"Restored from disk — {len(sess.runners)} strategies on desk"
+        sess.message = f"Restored from database — {len(sess.runners)} strategies on desk"
     finally:
         _SESSION_READY.set()
     return sess

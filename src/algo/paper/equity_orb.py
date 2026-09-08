@@ -159,10 +159,10 @@ class _EquityOrbBase(Strategy):
             },
             {
                 "key": "one_trade_per_symbol",
-                "label": "One trade / symbol",
+                "label": "One trade / symbol (locked)",
                 "type": "select",
-                "options": ["true", "false"],
-                "help": "If true, each selected stock may enter only once per day.",
+                "options": ["true"],
+                "help": "Locked on: each selected stock may enter only once per IST day (no re-entry after exit).",
                 "example": "Example: true → RELIANCE breaks out once; no re-entry same day.",
             },
         ]
@@ -269,7 +269,9 @@ class _EquityOrbBase(Strategy):
         buffer = float(p["buffer_pct"]) / 100.0
         rr = float(p["risk_reward"])
         entry_end = _parse_hhmm(str(p["entry_end"]))
-        one_trade = str(p.get("one_trade_per_symbol", True)).lower() in {"1", "true", "yes"}
+        # Hard lock: each symbol may enter at most once per IST day (no same-day re-entry).
+        one_trade = True
+        p["one_trade_per_symbol"] = True
         clock = local.time().replace(tzinfo=None)
         range_end = (
             datetime.combine(day, open_t, tzinfo=IST) + timedelta(minutes=range_mins)

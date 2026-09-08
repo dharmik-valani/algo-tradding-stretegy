@@ -285,10 +285,10 @@ class NiftyOptionOrbStrategy(Strategy):
                 },
                 {
                     "key": "one_trade_per_day",
-                    "label": "One trade / day",
+                    "label": "One trade / day (locked)",
                     "type": "select",
-                    "options": ["true", "false"],
-                    "help": "If true, after one entry (win or loss) the strategy sits out until next session day.",
+                    "options": ["true"],
+                    "help": "Locked on: after one entry (win or loss) this instance sits out until the next IST session day.",
                     "example": "Example: true → one CE ORB at 09:35, then flat for the rest of the day.",
                 },
             ]
@@ -329,7 +329,9 @@ class NiftyOptionOrbStrategy(Strategy):
         else:
             target_pts = float(target_pts)
         entry_end = _parse_hhmm(str(p.get("entry_end") or "15:15"))
-        one_trade = str(p.get("one_trade_per_day", True)).lower() in {"1", "true", "yes"}
+        # Always one paper entry per strategy instance per IST day.
+        one_trade = True
+        p["one_trade_per_day"] = True
 
         range_end = (datetime.combine(day, open_t, tzinfo=IST) + timedelta(minutes=range_mins)).timetz().replace(
             tzinfo=None
