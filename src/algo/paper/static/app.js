@@ -68,9 +68,9 @@ function setView(view) {
   document.querySelectorAll(".view").forEach((el) => {
     el.classList.toggle("active", el.dataset.view === view);
   });
-  const meta = VIEW_META[view];
-  $("viewTitle").textContent = meta.title;
-  $("viewSubtitle").textContent = meta.subtitle;
+  const meta = VIEW_META[view] || VIEW_META.execute;
+  setText("viewTitle", meta.title);
+  setText("viewSubtitle", meta.subtitle);
   if (location.hash !== `#${view}`) {
     history.replaceState(null, "", `#${view}`);
   }
@@ -208,10 +208,18 @@ function deskCountFor(strategyId) {
   return (lastSession.strategies || []).filter((s) => s.strategy_id === strategyId).length;
 }
 
+function setText(id, text, cls) {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = text;
+  if (cls !== undefined) el.className = cls;
+}
+
 function renderRegistry() {
   const root = $("registryCards");
-  $("sumRegistered").textContent = String(catalog.length);
-  $("regCount").textContent = String(catalog.length);
+  if (!root) return;
+  setText("sumRegistered", String(catalog.length));
+  setText("regCount", String(catalog.length));
   root.innerHTML = catalog
     .map((s) => {
       const onDesk = deskCountFor(s.id);
@@ -360,19 +368,12 @@ function renderExecDayKpis(session) {
   }
   const generated = invested + dayPnl;
   const overall = lastAnalytics.overall || {};
-  const set = (id, text, cls) => {
-    const el = $(id);
-    if (!el) return;
-    el.textContent = text;
-    if (cls !== undefined) el.className = cls;
-  };
-  set("execInvested", `₹${money(invested)}`);
-  set("execGenerated", `₹${money(generated)}`, pnlClass(dayPnl));
-  set("execDayPnl", `₹${money(dayPnl)}`, pnlClass(dayPnl));
-  set("execWinRate", pct(overall.win_rate));
-  set("execDeskLine", `${enabled} / ${strats.length}`);
-  const deskCount = $("deskCount");
-  if (deskCount) deskCount.textContent = String(strats.length);
+  setText("execInvested", `₹${money(invested)}`);
+  setText("execGenerated", `₹${money(generated)}`, pnlClass(dayPnl));
+  setText("execDayPnl", `₹${money(dayPnl)}`, pnlClass(dayPnl));
+  setText("execWinRate", pct(overall.win_rate));
+  setText("execDeskLine", `${enabled} / ${strats.length}`);
+  setText("deskCount", String(strats.length));
 }
 
 function renderSummary(session) {
@@ -902,19 +903,22 @@ async function refreshReports() {
       api(`/api/reports/daily${q ? `?${q}` : ""}`),
       api(`/api/reports/calendar?year=${calYear}&month=${calMonth}`),
     ]);
-    $("rpTrades").textContent = String(summary.trades || 0);
-    $("rpClosed").textContent = String(summary.closed || 0);
-    $("rpWinRate").textContent = pct(summary.win_rate);
-    $("rpAvgWin").textContent = summary.avg_win != null ? `₹${money(summary.avg_win)}` : "—";
-    $("rpAvgLoss").textContent = summary.avg_loss != null ? `₹${money(summary.avg_loss)}` : "—";
+    setText("rpTrades", String(summary.trades || 0));
+    setText("rpClosed", String(summary.closed || 0));
+    setText("rpWinRate", pct(summary.win_rate));
+    setText("rpAvgWin", summary.avg_win != null ? `₹${money(summary.avg_win)}` : "—");
+    setText("rpAvgLoss", summary.avg_loss != null ? `₹${money(summary.avg_loss)}` : "—");
     const net = $("rpNet");
-    net.textContent = `₹${money(summary.net_pnl || 0)}`;
-    net.className = pnlClass(summary.net_pnl || 0);
+    if (net) {
+      net.textContent = `₹${money(summary.net_pnl || 0)}`;
+      net.className = pnlClass(summary.net_pnl || 0);
+    }
     const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-    $("calLabel").textContent = `${months[cal.month - 1]} ${cal.year}`;
-    $("calMonthPnl").textContent = `₹${money(cal.month_pnl || 0)}`;
-    $("calMonthPnl").className = pnlClass(cal.month_pnl || 0);
-    $("calGrid").innerHTML = (cal.cells || [])
+    setText("calLabel", `${months[cal.month - 1]} ${cal.year}`);
+    setText("calMonthPnl", `₹${money(cal.month_pnl || 0)}`, pnlClass(cal.month_pnl || 0));
+    const calGrid = $("calGrid");
+    if (calGrid) {
+      calGrid.innerHTML = (cal.cells || [])
       .map((c) => {
         if (!c.date) return `<div class="cal-cell empty"></div>`;
         const day = c.date.slice(-2);
@@ -923,6 +927,7 @@ async function refreshReports() {
         return `<div class="cal-cell ${cls}"><span class="d">${day}</span><strong>${pnl == null ? "—" : `₹${money(pnl)}`}</strong></div>`;
       })
       .join("");
+    }
     const dbody = $("reportDailyBody");
     const days = daily.days || [];
     dbody.innerHTML = days.length
@@ -976,10 +981,12 @@ async function refreshReports() {
 
 function render(session) {
   lastSession = session;
-  $("sessionMsg").textContent = session.message || "";
+  setText("sessionMsg", session.message || "");
   const pill = $("statusPill");
-  pill.textContent = session.running ? `${session.mode} · running` : session.mode || "idle";
-  pill.classList.toggle("running", !!session.running);
+  if (pill) {
+    pill.textContent = session.running ? `${session.mode} · running` : session.mode || "idle";
+    pill.classList.toggle("running", !!session.running);
+  }
   renderSummary(session);
   renderRegistry();
   renderExecStats(session);
