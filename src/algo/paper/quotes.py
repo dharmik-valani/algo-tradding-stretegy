@@ -275,15 +275,15 @@ class LiveQuoteProvider:
         if self._ws is None:
             return
         cleaned = [s.upper() for s in symbols if s]
-        self._last_want_syms = list(dict.fromkeys(cleaned))
+        # Additive want-list for diagnostics; set_subscriptions owns replace semantics.
+        self._last_want_syms = list(dict.fromkeys([*self._last_want_syms, *cleaned]))
         # Only skip while the *socket* itself is rate-limited (reconnect cool).
-        # REST cool must NOT stop websocket subscribe/trade marks.
         if self._ws.rate_limited():
             return
         if not self._ws._thread or not self._ws._thread.is_alive():
             self._ws.start()
         instruments: list[tuple[str, str]] = []
-        for sym in self._last_want_syms:
+        for sym in cleaned:
             try:
                 instruments.append(self._resolve_dhan_key(sym))
             except Exception:
