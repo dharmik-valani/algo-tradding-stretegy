@@ -127,6 +127,214 @@ class StrategyRunner:
         self._desk_day = datetime.now(IST).date()
         self.journal_session_id: str | None = None
         self.open_trade_id: str | None = None
+        self._desk_settled = False
+        self._day_pnl = 0.0
+        self._eod_done_day: date | None = None
+        self._journal_restored = False
+
+    def closed_pnl_total(self) -> float:
+        total = 0.0
+        for t in getattr(self.broker, "closed_trades", []) or []:
+            try:
+                total += float(t.get("pnl") or 0)
+            except (TypeError, ValueError):
+                pass
+        return round(total, 6)
+
+    def restore_today_from_journal(self) -> int:
+        """Rebuild same-day 1/day lock + last exit levels from paper_trades."""
+        from algo.paper.journal import list_trades
+
+        today = datetime.now(IST).date()
+        rows = list_trades(instance_id=self.instance_id, limit=80)
+        day_rows: list[dict[str, Any]] = []
+        for t in rows:
+            raw = t.get("exit_at") or t.get("entry_at")
+            if not raw:
+                continue
+            try:
+                if isinstance(raw, datetime):
+                    day = raw.astimezone(IST).date()
+                else:
+                    day = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(IST).date()
+            except Exception:
+                continue
+            if day == today:
+                day_rows.append(t)
+        if not day_rows:
+            return 0
+        closed = [t for t in day_rows if t.get("status") == "closed"]
+        opens = [t for t in day_rows if t.get("status") == "open"]
+        strat = self.strategy
+        restored = 0
+        if closed:
+            # Prefer latest closed by exit_at.
+            def _sort_key(t: dict[str, Any]) -> str:
+                return str(t.get("exit_at") or t.get("entry_at") or "")
+
+            closed_sorted = sorted(closed, key=_sort_key)
+            fills: list[dict[str, Any]] = []
+            for t in closed_sorted:
+                entry = float(t.get("entry_price") or 0)
+                fills.append(
+                    {
+                        "pnl": float(t.get("realized_pnl") or 0),
+                        "quantity": int(t.get("quantity") or self.quantity or 0),
+                        "entry": entry,
+                        "exit": float(t.get("exit_price") or 0),
+                        "side": "long" if str(t.get("side") or "").upper() in {"LONG", "BUY"} else "short",
+                        "stop": float(t["stop_price"]) if t.get("stop_price") is not None else None,
+                        "target": float(t["target_price"]) if t.get("target_price") is not None else None,
+                        "entry_at": (
+                            t.get("entry_at").isoformat()
+                            if hasattr(t.get("entry_at"), "isoformat")
+                            else t.get("entry_at")
+                        ),
+                        "exit_at": (
+                            t.get("exit_at").isoformat()
+                            if hasattr(t.get("exit_at"), "isoformat")
+                            else t.get("exit_at")
+                        ),
+                    }
+                )
+            self.broker.closed_trades = fills
+            last = fills[-1]
+            setattr(strat, "_trades_today", max(int(getattr(strat, "_trades_today", 0) or 0), 1))
+            setattr(strat, "_in_trade", False)
+            setattr(strat, "_entry_price", float(last.get("entry") or 0))
+            self.broker.realized_pnl = self.closed_pnl_total()
+            self._day_pnl = float(self.broker.realized_pnl)
+            if self.broker.position.quantity == 0:
+                now_t = datetime.now(IST).time().replace(tzinfo=None)
+                if now_t.hour > 15 or (now_t.hour == 15 and now_t.minute >= 0):
+                    self._desk_settled = True
+                    self._eod_done_day = today
+            self._log(f"Restored {len(fills)} closed option trade(s) today — 1/day locked")
+            restored = len(fills)
+        elif opens:
+            t = opens[0]
+            setattr(strat, "_trades_today", 1)
+            setattr(strat, "_in_trade", True)
+            entry = float(t.get("entry_price") or 0)
+            setattr(strat, "_entry_price", entry)
+            qty = int(t.get("quantity") or self.quantity or 0)
+            self.broker.position.quantity = qty
+            self.broker.position.avg_price = entry
+            self.open_trade_id = t.get("id")
+            et = t.get("entry_at")
+            if et is not None:
+                try:
+                    parsed = et if hasattr(et, "isoformat") else datetime.fromisoformat(str(et).replace("Z", "+00:00"))
+                    setattr(strat, "_entry_time", parsed)
+                    self.broker.position_entry_at = parsed
+                except Exception:
+                    pass
+            self._log(f"Restored open option trade qty={qty}")
+            restored = 1
+        return restored
+
+    def _settle_desk_display(self) -> None:
+        """After EOD: lock day PnL; keep today's closed fill for Execute/Analytics review."""
+        if self._desk_settled:
+            return
+        from_fills = self.closed_pnl_total()
+        realized = float(self.broker.realized_pnl or 0)
+        self._day_pnl = float(from_fills if abs(from_fills) > 1e-9 else realized)
+        preserved = list(getattr(self.broker, "closed_trades", []) or [])
+        cash = float(self.broker.starting_cash)
+        fee = float(self.broker.fee_bps)
+        slip = float(self.broker.slippage_bps)
+        fresh = PaperBroker(starting_cash=cash, fee_bps=fee, slippage_bps=slip)
+        fresh.bind(self.strategy.id, self.instrument_id, self.symbol)
+        fresh.closed_trades = preserved
+        fresh.realized_pnl = float(self._day_pnl)
+        self.broker = fresh
+        self.open_trade_id = None
+        if hasattr(self.strategy, "_in_trade"):
+            self.strategy._in_trade = False  # type: ignore[attr-defined]
+        self._desk_settled = True
+        self._eod_done_day = datetime.now(IST).date()
+        if preserved:
+            self._log(
+                f"Option desk settled — day PnL ₹{self._day_pnl:,.2f}; "
+                f"entry/exit/qty/SL/TP kept for review"
+            )
+        else:
+            self._log("Option desk settled — no fills today (review stays empty until a trade)")
+
+    def _maybe_eod_flatten(self, quotes: Any | None = None) -> None:
+        """Flatten open ORB leg at flatten_at, then settle review for the rest of the IST day."""
+        today = datetime.now(IST).date()
+        if self._eod_done_day == today and self._desk_settled:
+            return
+        p = {**getattr(self.strategy, "default_params", lambda: {})(), **(self.strategy.params or {})}
+        flat_raw = str(p.get("flatten_at") or "15:00").strip() or "15:00"
+        try:
+            hh, mm = [int(x) for x in flat_raw.split(":")[:2]]
+        except Exception:
+            hh, mm = 15, 0
+        now = datetime.now(IST)
+        if now.hour < hh or (now.hour == hh and now.minute < mm):
+            return
+        pos_qty = int(self.broker.position.quantity or 0)
+        if pos_qty != 0 and quotes is not None:
+            try:
+                fill_px = None
+                exit_ts = datetime.combine(today, time_cls(hh, mm), tzinfo=IST)
+                if self.asset_kind == "option":
+                    bar, st = quotes.option_premium_bar(
+                        self.symbol,
+                        option_type=str(p.get("option_type", "CE")),
+                        strike_mode=str(p.get("strike_mode", "ATM")),
+                        strike_step=int(p.get("strike_step", 50)),
+                        state=self.option_state,
+                    )
+                    self.option_state = st
+                    fill_px = float(bar.close)
+                    self.mark_price = fill_px
+                else:
+                    fill_px, _ts, _ = quotes.get_ltp(
+                        self.symbol, allow_rest=True, wait_ws_sec=0.5, max_stale_sec=600
+                    )
+                if fill_px is not None:
+                    side = Side.SELL if pos_qty > 0 else Side.BUY
+                    before = self.broker.realized_pnl
+                    order = self.broker.submit_market(
+                        strategy_id=self.strategy.id,
+                        instrument_id=self.instrument_id,
+                        symbol=self.symbol,
+                        side=side,
+                        quantity=abs(pos_qty),
+                        last_price=float(fill_px),
+                        ts=exit_ts,
+                    )
+                    self.broker.annotate_last_closed(
+                        stop=getattr(self.strategy, "_stop_price", None)
+                        or p.get("sl")
+                        or p.get("stop"),
+                        target=getattr(self.strategy, "_target_price", None)
+                        or p.get("tp")
+                        or p.get("target"),
+                        quantity=abs(pos_qty),
+                    )
+                    if order.status.value == "FILLED":
+                        self._journal_close(
+                            side="LONG" if pos_qty > 0 else "SHORT",
+                            qty=abs(pos_qty),
+                            exit_price=float(order.fill_price or fill_px),
+                            ts=exit_ts,
+                            pnl=self.broker.realized_pnl - before,
+                            reason=f"EOD flatten {flat_raw} IST",
+                            meta={"flatten_at": flat_raw},
+                        )
+                    if hasattr(self.strategy, "_in_trade"):
+                        self.strategy._in_trade = False  # type: ignore[attr-defined]
+                    self.last_signal = "EOD_FLAT"
+                    self._log(f"EOD flatten @ {flat_raw} IST @ {float(fill_px):.2f}")
+            except Exception as exc:
+                self._log(f"EOD flatten failed: {exc}")
+                return
+        self._settle_desk_display()
 
     def state(self) -> StrategyState:
         last = self.mark_price
@@ -186,7 +394,7 @@ class StrategyRunner:
         opt = self.option_state or {}
         closed = list(getattr(self.broker, "closed_trades", []) or [])
         last_closed = closed[-1] if closed else None
-        in_trade = bool(st.legs_in_trade or (self.broker.position.quantity))
+        in_trade = bool(st.legs_in_trade or (self.broker.position.quantity)) and not self._desk_settled
         # After exit: keep qty / stop / target visible from last closed (or recompute from entry).
         if not in_trade and last_closed:
             entry = last_closed.get("entry")
@@ -208,20 +416,45 @@ class StrategyRunner:
                 st.target_price = round(float(entry) + float(target_pts), 2)
             if last_closed.get("quantity"):
                 st.quantity = int(last_closed["quantity"])
+        review_qty = 0
+        if in_trade:
+            review_qty = abs(int(self.broker.position.quantity or 0)) or int(st.quantity or 0)
+        elif last_closed and last_closed.get("quantity"):
+            review_qty = int(last_closed["quantity"])
+        day_realized = (
+            self.closed_pnl_total()
+            if self._desk_settled
+            else float(st.realized_pnl or 0) + float(st.unrealized_pnl or 0)
+        )
+        if self._desk_settled:
+            self._day_pnl = float(day_realized)
+            st.realized_pnl = float(day_realized)
+            st.unrealized_pnl = 0.0
+            st.legs_in_trade = 0
+            if last_closed and last_closed.get("exit") is not None and last is None:
+                last = float(last_closed["exit"])
+                st.last_price = last
+            st.note = (
+                f"settled · day PnL ₹{day_realized:,.0f}"
+                if last_closed
+                else "settled · no fills today"
+            )
+        market_px = last if last is not None else st.last_price
+        if self._desk_settled and last_closed and last_closed.get("exit") is not None:
+            market_px = float(last_closed.get("exit") or market_px or 0) or market_px
         st.trade_view = {
-            "market": last if last is not None else st.last_price,
+            "market": market_px,
             "entry": st.entry_price,
             "stop": st.stop_price,
             "target": st.target_price,
-            "qty": abs(int(self.broker.position.quantity or 0))
-            or (int(last_closed["quantity"]) if last_closed and last_closed.get("quantity") else int(st.quantity or 0)),
+            "qty": review_qty,
             "in_trade": in_trade,
-            "realized_pnl": float(st.realized_pnl or 0),
-            "unrealized_pnl": float(st.unrealized_pnl or 0),
+            "realized_pnl": float(day_realized if self._desk_settled else (st.realized_pnl or 0)),
+            "unrealized_pnl": 0.0 if self._desk_settled else float(st.unrealized_pnl or 0),
             "option_type": p_all.get("option_type") or getattr(strat, "locked_option_type", None),
             "strike": int(opt["strike"]) if opt.get("strike") else getattr(strat, "_selected_strike", None),
             "spot": opt.get("spot") or opt.get("prev_spot"),
-            "premium": opt.get("premium"),
+            "premium": opt.get("premium") if opt.get("premium") is not None else market_px,
             "range_high": getattr(strat, "_range_high", None),
             "stop_points": p_all.get("stop_points"),
             "target_points": p_all.get("target_points"),
@@ -238,6 +471,7 @@ class StrategyRunner:
                 else ((last_closed or {}).get("entry_at") if last_closed else None)
             ),
             "exit_at": None if in_trade else ((last_closed or {}).get("exit_at") if last_closed else None),
+            "no_fill_today": bool(self._desk_settled and not last_closed),
         }
         qty_n = int(st.trade_view["qty"] or 0)
         entry_n = float(st.entry_price) if st.entry_price is not None else None
@@ -253,7 +487,7 @@ class StrategyRunner:
                 "free": round(float(st.starting_cash or 0) - (notional if in_trade else 0.0), 2),
             }
         )
-        if not in_trade and last_closed:
+        if not in_trade and last_closed and not self._desk_settled:
             # Desk shows last closed levels so PnL isn't "mystery money".
             st.note = st.note or self.last_signal or "HOLD"
             if "flat" not in (st.note or "").lower() and "waiting" not in (st.note or "").lower():
@@ -261,7 +495,7 @@ class StrategyRunner:
                     st.note = f"{st.note} · flat (realized)"
                 else:
                     st.note = f"{st.note} · flat (last closed)"
-        day_pnl = float(st.realized_pnl or 0) + float(st.unrealized_pnl or 0)
+        day_pnl = float(self._day_pnl if self._desk_settled else day_realized)
         invested = float(st.starting_cash or 0)
         st.trade_view = {
             **(st.trade_view or {}),
@@ -269,7 +503,7 @@ class StrategyRunner:
             "equity": invested + day_pnl,
             "day_pnl": day_pnl,
             "generated": invested + day_pnl,
-            "desk_settled": False,
+            "desk_settled": bool(self._desk_settled),
         }
         return st
 
@@ -289,6 +523,11 @@ class StrategyRunner:
                 self.broker.bind(self.strategy.id, self.instrument_id, self.symbol)
                 self.history = []
                 self.last_signal = "HOLD"
+                self._desk_settled = False
+                self._day_pnl = 0.0
+                self._eod_done_day = None
+                self._journal_restored = False
+                self.open_trade_id = None
                 self._log(f"New trading day {today.isoformat()} — desk PnL reset")
             self._desk_day = today
         # Same 5m bucket updates (live Zen): replace last bar instead of duplicating.
@@ -1231,7 +1470,9 @@ class PaperSession:
                         pass
                 else:
                     try:
-                        self._restore_option_day_from_journal(r)
+                        r.journal_session_id = self.journal_session_id
+                        r.restore_today_from_journal()
+                        r._journal_restored = True
                     except Exception:
                         pass
         self.message = (
@@ -1242,88 +1483,9 @@ class PaperSession:
         self._thread.start()
 
     def _restore_option_day_from_journal(self, runner: StrategyRunner) -> None:
-        """Keep option ORB 1/day lock + last exit levels after restart."""
-        from algo.paper.journal import list_trades
-
-        today = datetime.now(IST).date()
-        rows = list_trades(instance_id=runner.instance_id, limit=50)
-        day_rows = []
-        for t in rows:
-            raw = t.get("exit_at") or t.get("entry_at")
-            if not raw:
-                continue
-            try:
-                if isinstance(raw, datetime):
-                    day = raw.astimezone(IST).date()
-                else:
-                    day = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(IST).date()
-            except Exception:
-                continue
-            if day == today:
-                day_rows.append(t)
-        if not day_rows:
-            return
-        closed = [t for t in day_rows if t.get("status") == "closed"]
-        opens = [t for t in day_rows if t.get("status") == "open"]
-        strat = runner.strategy
-        if closed:
-            t = closed[0]
-            setattr(strat, "_trades_today", 1)
-            setattr(strat, "_in_trade", False)
-            entry = float(t.get("entry_price") or 0)
-            setattr(strat, "_entry_price", entry)
-            stop = t.get("stop_price")
-            target = t.get("target_price")
-            runner.broker.closed_trades = [
-                {
-                    "pnl": float(t.get("realized_pnl") or 0),
-                    "quantity": int(t.get("quantity") or runner.quantity or 0),
-                    "entry": entry,
-                    "exit": float(t.get("exit_price") or 0),
-                    "side": "long",
-                    "stop": float(stop) if stop is not None else None,
-                    "target": float(target) if target is not None else None,
-                    "entry_at": (
-                        t.get("entry_at").isoformat()
-                        if hasattr(t.get("entry_at"), "isoformat")
-                        else t.get("entry_at")
-                    ),
-                    "exit_at": (
-                        t.get("exit_at").isoformat()
-                        if hasattr(t.get("exit_at"), "isoformat")
-                        else t.get("exit_at")
-                    ),
-                }
-            ]
-            et = t.get("entry_at")
-            if et is not None:
-                try:
-                    setattr(
-                        strat,
-                        "_entry_time",
-                        et if hasattr(et, "isoformat") else datetime.fromisoformat(str(et).replace("Z", "+00:00")),
-                    )
-                except Exception:
-                    pass
-            runner._log(f"Restored closed option trade today — 1/day locked")
-        elif opens:
-            t = opens[0]
-            setattr(strat, "_trades_today", 1)
-            setattr(strat, "_in_trade", True)
-            entry = float(t.get("entry_price") or 0)
-            setattr(strat, "_entry_price", entry)
-            qty = int(t.get("quantity") or runner.quantity or 0)
-            runner.broker.position.quantity = qty
-            runner.broker.position.avg_price = entry
-            et = t.get("entry_at")
-            if et is not None:
-                try:
-                    parsed = et if hasattr(et, "isoformat") else datetime.fromisoformat(str(et).replace("Z", "+00:00"))
-                    setattr(strat, "_entry_time", parsed)
-                    runner.broker.position_entry_at = parsed
-                except Exception:
-                    pass
-            runner._log(f"Restored open option trade qty={qty}")
+        """Back-compat wrapper — prefer StrategyRunner.restore_today_from_journal()."""
+        runner.restore_today_from_journal()
+        runner._journal_restored = True
 
     def stop(self) -> None:
         try:
@@ -1374,50 +1536,12 @@ class PaperSession:
             if getattr(runner.strategy, "id", "") == "zen_credit_spread":
                 # Designed to hold overnight unless hold_overnight=false.
                 continue
-            pos_qty = runner.broker.position.quantity
-            if pos_qty == 0:
-                continue
             try:
-                fill_px = None
-                p = {**getattr(runner.strategy, "default_params", lambda: {})(), **(runner.strategy.params or {})}
-                flat_raw = str(p.get("flatten_at") or "15:00").strip() or "15:00"
-                try:
-                    hh, mm = [int(x) for x in flat_raw.split(":")[:2]]
-                except Exception:
-                    hh, mm = 15, 0
-                exit_ts = datetime.combine(datetime.now(IST).date(), time_cls(hh, mm), tzinfo=IST)
-                if runner.asset_kind == "option":
-                    bar, st = quotes.option_premium_bar(
-                        runner.symbol,
-                        option_type=str(p.get("option_type", "CE")),
-                        strike_mode=str(p.get("strike_mode", "ATM")),
-                        strike_step=int(p.get("strike_step", 50)),
-                        state=runner.option_state,
-                    )
-                    runner.option_state = st
-                    fill_px = float(bar.close)
-                else:
-                    fill_px, _ts, _ = quotes.get_ltp(
-                        runner.symbol, allow_rest=True, wait_ws_sec=0.5, max_stale_sec=600
-                    )
-                if fill_px is None:
-                    continue
-                side = Side.SELL if pos_qty > 0 else Side.BUY
-                runner.broker.submit_market(
-                    strategy_id=runner.strategy.id,
-                    instrument_id=runner.instrument_id,
-                    symbol=runner.symbol,
-                    side=side,
-                    quantity=abs(pos_qty),
-                    last_price=float(fill_px),
-                    ts=exit_ts,
-                )
-                if hasattr(runner.strategy, "_in_trade"):
-                    runner.strategy._in_trade = False  # type: ignore[attr-defined]
-                runner.last_signal = "EOD_FLAT"
-                runner._log(
-                    f"EOD flatten @ session sleep ({flat_raw} IST) @ {float(fill_px):.2f}"
-                )
+                runner.journal_session_id = self.journal_session_id
+                if not getattr(runner, "_journal_restored", False):
+                    runner.restore_today_from_journal()
+                    runner._journal_restored = True
+                runner._maybe_eod_flatten(quotes)
             except Exception:
                 continue
 
@@ -1647,7 +1771,14 @@ class PaperSession:
                             runner.option_state = st
                             runner.strategy.params["strike"] = int(st.get("strike", 0))
                             runner.strategy._selected_strike = int(st.get("strike", 0))  # type: ignore[attr-defined]
+                            if not getattr(runner, "_journal_restored", False):
+                                try:
+                                    runner.restore_today_from_journal()
+                                except Exception:
+                                    pass
+                                runner._journal_restored = True
                             runner.on_bar(bar)
+                            runner._maybe_eod_flatten(quotes)
                             labels.append(
                                 f"{runner.symbol}{p.get('option_type', 'CE')}@{int(st.get('strike', 0))}={bar.close:.1f}"
                             )
@@ -1659,7 +1790,14 @@ class PaperSession:
                             bar = Bar(
                                 timestamp=ts, open=price, high=price, low=price, close=price, volume=0
                             )
+                            if not getattr(runner, "_journal_restored", False):
+                                try:
+                                    runner.restore_today_from_journal()
+                                except Exception:
+                                    pass
+                                runner._journal_restored = True
                             runner.on_bar(bar)
+                            runner._maybe_eod_flatten(quotes)
                             labels.append(f"{runner.symbol}={price:.2f}")
                             src = used
                     except Exception as exc:

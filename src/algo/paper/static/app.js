@@ -683,16 +683,17 @@ function renderAnalyticsDeskRows(strategies) {
         qtyCell = openQtySum > 0 ? String(openQtySum) : doneQtySum > 0 ? String(doneQtySum) : "—";
         qtyTitle = "Sum of share qty on open/closed legs";
       } else {
+        const traded =
+          !!(lc && (lc.exit != null || lc.entry != null)) || Number(tv.closed_count || 0) > 0;
         stocks = isOpen ? "1" : "0";
-        posTitle = "Open trade count";
-        const q =
-          Math.abs(posQty) ||
-          (isOpen ? Number(s.quantity) || 0 : 0) ||
-          Number(tv.qty) ||
-          (lc && lc.quantity ? Number(lc.quantity) : 0) ||
-          0;
-        qtyCell = q > 0 ? String(q) : "—";
-        qtyTitle = "Position qty";
+        posTitle = traded ? "Open trade count" : "No fill today";
+        const q = isOpen
+          ? Math.abs(posQty) || Number(tv.qty) || Number(s.quantity) || 0
+          : lc && lc.quantity
+            ? Number(lc.quantity)
+            : Number(tv.qty) || 0;
+        qtyCell = q > 0 && (isOpen || traded) ? String(q) : "—";
+        qtyTitle = traded ? "Filled qty" : "Qty blank until a fill";
       }
 
       let market = "—";
@@ -700,7 +701,11 @@ function renderAnalyticsDeskRows(strategies) {
       let exitPx = "—";
       let sl = "—";
       let tp = "—";
-      let levelsHint = settled ? "settled day" : "no open trade";
+      let levelsHint = settled
+        ? Number(tv.closed_count || 0) > 0 || (lc && (lc.exit != null || lc.entry != null))
+          ? "settled day"
+          : "settled · no fill today"
+        : "no open trade";
       let entryAt = null;
       let exitAt = null;
 
@@ -737,6 +742,16 @@ function renderAnalyticsDeskRows(strategies) {
         levelsHint = "settled";
         entryAt = lc.entry_at || tv.entry_at || null;
         exitAt = lc.exit_at || tv.exit_at || null;
+      } else if (settled && !isBasket) {
+        market =
+          s.last_price != null
+            ? money(s.last_price)
+            : tv.premium != null
+              ? money(tv.premium)
+              : tv.market != null
+                ? money(tv.market)
+                : "—";
+        levelsHint = "settled · no fill today";
       } else if (isBasket) {
         if (active.length === 1) {
           market = money(active[0].last);
@@ -785,18 +800,34 @@ function renderAnalyticsDeskRows(strategies) {
         levelsHint = "last exit";
         entryAt = lc.entry_at || tv.entry_at || null;
         exitAt = lc.exit_at || tv.exit_at || null;
+      } else if (!isBasket && (s.last_price != null || tv.premium != null || tv.market != null)) {
+        market =
+          s.last_price != null
+            ? money(s.last_price)
+            : tv.premium != null
+              ? money(tv.premium)
+              : money(tv.market);
+        levelsHint = "no fill today";
       }
 
+      const tradedToday =
+        !!(lc && (lc.exit != null || lc.entry != null)) ||
+        Number(tv.closed_count || 0) > 0 ||
+        Number(j.trades || 0) > 0;
       const pnlSub =
-        journalNet != null
+        journalNet != null && Number(j.trades || 0) > 0
           ? `journal · ${j.trades || 0} closed`
           : settled
-            ? `settled day`
+            ? tradedToday
+              ? `settled day`
+              : `no fill today`
             : Math.abs(unreal) > 1e-9
               ? `R ${money(realized)} · U ${money(unreal)}`
               : Math.abs(realized) > 1e-9
                 ? `realized`
-                : `flat`;
+                : tradedToday
+                  ? `flat`
+                  : `no fill today`;
       const nameSub = escapeHtml(
         [s.params?.option_type, s.timeframe, isBasket ? "basket" : s.instrument]
           .filter(Boolean)
@@ -1018,16 +1049,21 @@ function renderExecStats(session) {
           ? "Sum of share qty on today's closed legs (review until next session)"
           : "Sum of share qty on open legs (or last exits if flat)";
       } else {
+        const traded =
+          !!(lc && (lc.exit != null || lc.entry != null)) || Number(tv.closed_count || 0) > 0;
         stocks = isOpen ? "1" : "0";
-        posTitle = "Open trade count (0 or 1 — once per day)";
-        const q =
-          Math.abs(posQty) ||
-          (isOpen ? Number(s.quantity) || 0 : 0) ||
-          Number(tv.qty) ||
-          (lc && lc.quantity ? Number(lc.quantity) : 0) ||
-          0;
-        qtyCell = q > 0 ? String(q) : "—";
-        qtyTitle = "Position qty (open) or last exit qty";
+        posTitle = traded
+          ? "Open trade count (0 after exit — 1 trade/day)"
+          : "No fill today — Open stays 0";
+        const q = isOpen
+          ? Math.abs(posQty) || Number(tv.qty) || Number(s.quantity) || 0
+          : lc && lc.quantity
+            ? Number(lc.quantity)
+            : Number(tv.qty) || 0;
+        qtyCell = q > 0 && (isOpen || traded) ? String(q) : "—";
+        qtyTitle = traded
+          ? "Filled qty (open or last exit)"
+          : "Qty blank until a fill (not the configured lot size)";
       }
 
       // Market = live mark; after exit keep entry/exit/SL/TP for review (1 trade/day).
@@ -1036,7 +1072,11 @@ function renderExecStats(session) {
       let exitPx = "—";
       let sl = "—";
       let tp = "—";
-      let levelsHint = settled ? "settled day" : "no open trade";
+      let levelsHint = settled
+        ? Number(tv.closed_count || 0) > 0 || (lc && (lc.exit != null || lc.entry != null))
+          ? "settled day"
+          : "settled · no fill today"
+        : "no open trade";
       let entryAt = null;
       let exitAt = null;
 
@@ -1074,6 +1114,16 @@ function renderExecStats(session) {
         levelsHint = "settled";
         entryAt = lc.entry_at || tv.entry_at || null;
         exitAt = lc.exit_at || tv.exit_at || null;
+      } else if (settled && !isBasket) {
+        market =
+          s.last_price != null
+            ? money(s.last_price)
+            : tv.premium != null
+              ? money(tv.premium)
+              : tv.market != null
+                ? money(tv.market)
+                : "—";
+        levelsHint = "settled · no fill today";
       } else if (settled) {
         levelsHint = "settled";
       } else if (isBasket) {
@@ -1133,15 +1183,29 @@ function renderExecStats(session) {
         levelsHint = "last exit";
         entryAt = lc.entry_at || tv.entry_at || null;
         exitAt = lc.exit_at || tv.exit_at || null;
+      } else if (!isBasket && (s.last_price != null || tv.premium != null || tv.market != null)) {
+        market =
+          s.last_price != null
+            ? money(s.last_price)
+            : tv.premium != null
+              ? money(tv.premium)
+              : money(tv.market);
+        levelsHint = "no fill today";
       }
 
+      const tradedToday =
+        !!(lc && (lc.exit != null || lc.entry != null)) || Number(tv.closed_count || 0) > 0;
       const pnlSub = settled
-        ? `settled day`
+        ? tradedToday
+          ? `settled day`
+          : `no fill today`
         : Math.abs(unreal) > 1e-9
           ? `R ${money(realized)} · U ${money(unreal)}`
           : Math.abs(realized) > 1e-9
             ? `realized`
-            : `flat`;
+            : tradedToday
+              ? `flat`
+              : `no fill today`;
       const nameSub = escapeHtml(
         [s.params?.option_type, s.timeframe, isBasket ? "basket" : s.instrument]
           .filter(Boolean)
