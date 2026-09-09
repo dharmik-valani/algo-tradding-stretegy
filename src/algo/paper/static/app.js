@@ -673,7 +673,6 @@ function renderExecStats(session) {
       const dayPnl = Number(
         tv.day_pnl != null ? tv.day_pnl : realized + unreal
       );
-      const generated = Number(tv.generated != null ? tv.generated : invested + dayPnl);
       const total = tv.desk_settled ? dayPnl : realized + unreal;
       const basket = s.basket || [];
       const isBasket = basket.length > 0 || (s.params?.selected || []).length > 0;
