@@ -1462,6 +1462,25 @@ class PaperSession:
             pass
         feed = self._quotes.feed_status
         seeded_n = len(self._rest_seeded_syms)
+        # New IST day → clear prior-day review before rehydrate/scan.
+        with self._lock:
+            for r in self.runners.values():
+                try:
+                    if isinstance(r, BasketRunner):
+                        r._maybe_roll_trading_day()
+                    elif hasattr(r, "_desk_day"):
+                        today = datetime.now(IST).date()
+                        if getattr(r, "_desk_day", today) != today and int(
+                            getattr(getattr(r, "broker", None), "position", None).quantity or 0
+                        ) == 0:
+                            # StrategyRunner rolls on first bar; force flags here for clean wake.
+                            r._desk_day = today
+                            r._desk_settled = False
+                            r._day_pnl = 0.0
+                            r._eod_done_day = None
+                            r._journal_restored = False
+                except Exception:
+                    pass
         # Rebuild same-day locks / open legs from journal so restarts never re-enter.
         with self._lock:
             for r in self.runners.values():
@@ -1469,6 +1488,8 @@ class PaperSession:
                     try:
                         r.journal_session_id = self.journal_session_id
                         r.restore_today_from_journal()
+                        if r._desk_settled:
+                            r._prune_untraded_legs()
                     except Exception:
                         pass
                 else:

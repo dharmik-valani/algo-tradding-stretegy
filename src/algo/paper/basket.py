@@ -217,6 +217,16 @@ class BasketRunner:
             )
             # Market: live LTP while session is open; after settle prefer exit / last mark.
             if self._desk_settled:
+                # Post-settle review = today's fills only (hide WAIT / zero-capital noise).
+                has_fill = bool(
+                    last_closed
+                    or int(leg.get("trades_today") or 0) >= 1
+                    or leg.get("exit") is not None
+                    or leg.get("entry") is not None
+                    or abs(float(leg.get("leg_pnl") or 0)) > 1e-9
+                )
+                if not has_fill:
+                    continue
                 show_px = (
                     float(exit_px)
                     if exit_px is not None
@@ -799,6 +809,10 @@ class BasketRunner:
                     self._settled_review_restored = True
                 except Exception:
                     pass
+            try:
+                self._prune_untraded_legs()
+            except Exception:
+                pass
         labels = []
         # Marks should already be REST-seeded + WS-subscribed by session.
         for sym in list(self.selected):
@@ -838,6 +852,50 @@ class BasketRunner:
         self._desk_settled = False
         self._day_pnl = 0.0
         self._desk_day = today
+
+    def _prune_untraded_legs(
+        self, *, preserved_closed: dict[str, list[dict]] | None = None
+    ) -> None:
+        """After settle (or when already settled): keep only symbols that filled today."""
+        preserved = preserved_closed or {
+            str(sym).upper(): list(getattr(b, "closed_trades", []) or [])
+            for sym, b in self.brokers.items()
+        }
+        traded_syms: list[str] = [
+            str(sym).upper() for sym, trades in preserved.items() if trades
+        ]
+        legs_map = getattr(self.strategy, "_legs", {}) or {}
+        if isinstance(legs_map, dict):
+            for sym, leg in legs_map.items():
+                if not isinstance(leg, dict):
+                    continue
+                if (
+                    int(leg.get("trades_today") or 0) >= 1
+                    or leg.get("exit") is not None
+                    or leg.get("entry") is not None
+                    or abs(float(leg.get("leg_pnl") or 0)) > 1e-9
+                ):
+                    su = str(sym).upper()
+                    if su not in traded_syms:
+                        traded_syms.append(su)
+        if not traded_syms:
+            return
+        keep = set(traded_syms)
+        before = len(self.selected)
+        self.selected = list(dict.fromkeys(traded_syms))
+        self.strategy.selected = list(self.selected)
+        if isinstance(legs_map, dict):
+            for sym in list(legs_map.keys()):
+                if str(sym).upper() not in keep:
+                    legs_map.pop(sym, None)
+        for sym in list(self.brokers.keys()):
+            if str(sym).upper() not in keep:
+                self.brokers.pop(sym, None)
+        if before != len(self.selected):
+            self._log(
+                f"Review prune: {before} → {len(self.selected)} filled legs "
+                f"(hid WAIT / non-fill candidates)"
+            )
 
     def _settle_desk_display(self) -> None:
         """After EOD: lock day PnL and reset open positions — keep today's closed-trade review.
@@ -884,6 +942,9 @@ class BasketRunner:
             leg["trades_today"] = max(int(leg.get("trades_today") or 0), 1)
             leg["in_trade"] = False
         n = max(len(self.selected) or 1, 1)
+        # Keep only symbols that actually filled today — drop WAIT candidates from review.
+        self._prune_untraded_legs(preserved_closed=preserved)
+        n = max(len(self.selected) or 1, 1)
         fresh: dict[str, PaperBroker] = {}
         for sym in self.selected:
             sym_u = str(sym).upper()
@@ -897,7 +958,7 @@ class BasketRunner:
         self._desk_settled = True
         self._log(
             f"Desk settled — day PnL ₹{self._day_pnl:,.2f} locked; "
-            f"today's entry/exit/qty/SL/TP kept for review until next session"
+            f"{len(self.selected)} filled leg(s) kept for review (WAIT candidates hidden)"
         )
 
     def _eod_exit_ts(self, flat_raw: str) -> datetime:

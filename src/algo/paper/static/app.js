@@ -129,10 +129,14 @@ function winCell(a) {
     : wr;
 }
 
-function capitalCell(allocated, used, { usedLabel = "used" } = {}) {
+function capitalCell(allocated, used, { usedLabel = "used", idleLabel = "bank" } = {}) {
   const dep = used != null && !Number.isNaN(Number(used)) ? Number(used) : 0;
+  const bank = allocated != null && !Number.isNaN(Number(allocated)) ? Number(allocated) : 0;
   if (dep > 0) {
     return `<div title="Capital in trades = qty × entry">₹${moneyShort(dep)}</div><div class="meta pnl-sub">${escapeHtml(usedLabel)}</div>`;
+  }
+  if (bank > 0) {
+    return `<div title="Paper bank allocated to this strategy (no fill / nothing deployed)">₹${moneyShort(bank)}</div><div class="meta pnl-sub">${escapeHtml(idleLabel)}</div>`;
   }
   return `<div title="No capital in trades yet">₹0</div><div class="meta pnl-sub">${escapeHtml(usedLabel)}</div>`;
 }
@@ -645,8 +649,19 @@ function renderAnalyticsDeskRows(strategies) {
             : realized + unreal
       );
       const total = tv.desk_settled || journalNet != null ? dayPnl : realized + unreal;
-      const basket = s.basket || [];
-      const isBasket = basket.length > 0 || (s.params?.selected || []).length > 0;
+      const basketAll = s.basket || [];
+      const settledPreview = !!(s.trade_view || {}).desk_settled;
+      // After settle: only today's filled legs (hide WAIT / ₹0 noise).
+      const basket = settledPreview
+        ? basketAll.filter(
+            (l) =>
+              Number(l.trades_today || 0) >= 1 ||
+              l.exit != null ||
+              l.entry != null ||
+              Math.abs(Number(l.leg_pnl || 0)) > 1e-9
+          )
+        : basketAll;
+      const isBasket = basketAll.length > 0 || (s.params?.selected || []).length > 0;
       const active = basket.filter((l) => l.in_trade);
       const selected = (s.params?.selected || []).length || basket.length || 0;
       const inTrade = s.legs_in_trade != null ? s.legs_in_trade : active.length;
@@ -1014,8 +1029,19 @@ function renderExecStats(session) {
         tv.day_pnl != null ? tv.day_pnl : realized + unreal
       );
       const total = tv.desk_settled ? dayPnl : realized + unreal;
-      const basket = s.basket || [];
-      const isBasket = basket.length > 0 || (s.params?.selected || []).length > 0;
+      const basketAll = s.basket || [];
+      const settledPreview = !!(s.trade_view || {}).desk_settled;
+      // After settle: only today's filled legs (hide WAIT / ₹0 noise).
+      const basket = settledPreview
+        ? basketAll.filter(
+            (l) =>
+              Number(l.trades_today || 0) >= 1 ||
+              l.exit != null ||
+              l.entry != null ||
+              Math.abs(Number(l.leg_pnl || 0)) > 1e-9
+          )
+        : basketAll;
+      const isBasket = basketAll.length > 0 || (s.params?.selected || []).length > 0;
       const active = basket.filter((l) => l.in_trade);
       const selected = (s.params?.selected || []).length || basket.length || 0;
       const inTrade = s.legs_in_trade != null ? s.legs_in_trade : active.length;

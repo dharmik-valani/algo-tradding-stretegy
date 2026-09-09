@@ -23,6 +23,8 @@ IST = ZoneInfo("Asia/Kolkata")
 OPS_KEY = "paper_ops"
 
 # NSE cash session window used for wake/sleep automation.
+# Wake from 08:00 IST (~75m before cash open) so free-tier cold start +
+# REST token verify/seed can finish before 09:15 WS subscribe / scan_at.
 WAKE_FROM = time(8, 0)
 WAKE_UNTIL = time(15, 45)
 # Emails fire on first heartbeat after these clocks (once per day).
