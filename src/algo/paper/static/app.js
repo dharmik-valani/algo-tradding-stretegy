@@ -668,17 +668,31 @@ function renderExecStats(session) {
         stocks = `${settled ? 0 : inTrade}/${selected || basket.length}`;
         posTitle = "Open legs / selected symbols in basket";
         const openQtySum = active.reduce((n, l) => n + Math.abs(Number(l.qty) || 0), 0);
-        qtyCell = settled ? "—" : openQtySum > 0 ? String(openQtySum) : "—";
-        qtyTitle = "Sum of share qty on open basket legs";
+        const doneQtySum = basket
+          .filter((l) => !l.in_trade && Number(l.trades_today || 0) >= 1)
+          .reduce((n, l) => n + Math.abs(Number(l.qty) || Number(l.filled_qty) || 0), 0);
+        qtyCell = settled
+          ? "—"
+          : openQtySum > 0
+            ? String(openQtySum)
+            : doneQtySum > 0
+              ? String(doneQtySum)
+              : "—";
+        qtyTitle = "Sum of share qty on open legs (or last exits if flat)";
       } else {
         stocks = isOpen ? "1" : "0";
         posTitle = "Open trade count (0 or 1 — once per day)";
-        const q = Math.abs(posQty) || (isOpen ? Number(s.quantity) || 0 : 0);
+        const q =
+          Math.abs(posQty) ||
+          (isOpen ? Number(s.quantity) || 0 : 0) ||
+          Number(tv.qty) ||
+          (lc && lc.quantity ? Number(lc.quantity) : 0) ||
+          0;
         qtyCell = q > 0 ? String(q) : "—";
-        qtyTitle = "Open position quantity (lots/shares)";
+        qtyTitle = "Position qty (open) or last exit qty";
       }
 
-      // Market = live mark only while a trade is open. Flat/settled desk stays blank (fresh start).
+      // Market = live mark; after exit keep entry/exit/SL/TP for review (1 trade/day).
       let market = "—";
       let entry = "—";
       let exitPx = "—";
@@ -707,8 +721,8 @@ function renderExecStats(session) {
           market = "—";
           entry = lc.entry != null ? money(lc.entry) : "—";
           exitPx = lc.exit != null ? money(lc.exit) : "—";
-          sl = "—";
-          tp = "—";
+          sl = lc.stop != null ? money(lc.stop) : (s.stop_price != null ? money(s.stop_price) : "—");
+          tp = lc.target != null ? money(lc.target) : (s.target_price != null ? money(s.target_price) : "—");
           levelsHint = "last exit";
         }
       } else if (isOpen && s.entry_price != null) {
@@ -719,11 +733,25 @@ function renderExecStats(session) {
         tp = s.target_price != null ? money(s.target_price) : "—";
         levelsHint = "open";
       } else if (lc && (lc.exit != null || lc.entry != null)) {
-        market = "—";
-        entry = lc.entry != null ? money(lc.entry) : "—";
+        market = s.last_price != null ? money(s.last_price) : "—";
+        entry = lc.entry != null ? money(lc.entry) : (s.entry_price != null ? money(s.entry_price) : "—");
         exitPx = lc.exit != null ? money(lc.exit) : "—";
-        sl = "—";
-        tp = "—";
+        sl =
+          lc.stop != null
+            ? money(lc.stop)
+            : s.stop_price != null
+              ? money(s.stop_price)
+              : tv.stop != null
+                ? money(tv.stop)
+                : "—";
+        tp =
+          lc.target != null
+            ? money(lc.target)
+            : s.target_price != null
+              ? money(s.target_price)
+              : tv.target != null
+                ? money(tv.target)
+                : "—";
         levelsHint = "last exit";
       }
 
@@ -808,8 +836,9 @@ function renderExecStats(session) {
                 ? money(leg.avg)
                 : "—";
           const legExit = !legOpen && leg.exit != null ? money(leg.exit) : "—";
-          const legSl = legOpen && leg.stop != null ? money(leg.stop) : "—";
-          const legTp = legOpen && leg.target != null ? money(leg.target) : "—";
+          // Keep SL/TP/Qty visible after exit so the day's trade can be reviewed.
+          const legSl = leg.stop != null ? money(leg.stop) : "—";
+          const legTp = leg.target != null ? money(leg.target) : "—";
           const legQty = Math.abs(Number(leg.qty) || Number(leg.filled_qty) || Number(leg.planned_qty) || 0);
           const legQtyLabel = legQty > 0 ? String(legQty) : "—";
           const tradedToday = Number(leg.trades_today || 0) >= 1;
@@ -849,8 +878,8 @@ function renderExecStats(session) {
 
   root.innerHTML = `
     <p class="hint desk-legend tight">
-      ▶ basket symbols show live MARKET while waiting. ENTRY/EXIT/STOP/TARGET fill only after a paper trade opens.
-      Open = in-trade count · Qty = shares · each symbol once/day.
+      ▶ basket symbols show live MARKET. After exit, Qty / Stop / Target stay visible (1 trade/symbol/day — no re-entry).
+      Open = in-trade count · Qty = shares.
     </p>
     <div class="table-wrap desk-table-wrap">
       <table class="data-table dense cards-on-mobile" id="execStatsTable">

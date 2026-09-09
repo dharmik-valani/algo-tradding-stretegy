@@ -190,16 +190,39 @@ class PaperBroker:
         entry: float,
         exit_: float,
         side: str,
+        stop: float | None = None,
+        target: float | None = None,
     ) -> None:
-        self.closed_trades.append(
-            {
-                "pnl": round(pnl, 4),
-                "quantity": quantity,
-                "entry": round(entry, 4),
-                "exit": round(exit_, 4),
-                "side": side,
-            }
-        )
+        row: dict = {
+            "pnl": round(pnl, 4),
+            "quantity": quantity,
+            "entry": round(entry, 4),
+            "exit": round(exit_, 4),
+            "side": side,
+        }
+        if stop is not None:
+            row["stop"] = round(float(stop), 4)
+        if target is not None:
+            row["target"] = round(float(target), 4)
+        self.closed_trades.append(row)
+
+    def annotate_last_closed(
+        self,
+        *,
+        stop: float | None = None,
+        target: float | None = None,
+        quantity: int | None = None,
+    ) -> None:
+        """Attach SL/TP (and qty if needed) onto the most recent closed trade for desk review."""
+        if not self.closed_trades:
+            return
+        row = self.closed_trades[-1]
+        if stop is not None:
+            row["stop"] = round(float(stop), 4)
+        if target is not None:
+            row["target"] = round(float(target), 4)
+        if quantity is not None:
+            row["quantity"] = int(quantity)
 
 
 def utcnow() -> datetime:

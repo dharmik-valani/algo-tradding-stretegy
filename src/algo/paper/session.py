@@ -185,11 +185,34 @@ class StrategyRunner:
         closed = list(getattr(self.broker, "closed_trades", []) or [])
         last_closed = closed[-1] if closed else None
         in_trade = bool(st.legs_in_trade or (self.broker.position.quantity))
+        # After exit: keep qty / stop / target visible from last closed (or recompute from entry).
+        if not in_trade and last_closed:
+            entry = last_closed.get("entry")
+            stop_pts = float(p_all.get("stop_points") or 0)
+            target_pts = p_all.get("target_points")
+            if target_pts in (None, "", 0, "0"):
+                target_pts = stop_pts * float(p_all.get("risk_reward") or 2)
+            else:
+                target_pts = float(target_pts)
+            if st.entry_price is None and entry is not None:
+                st.entry_price = float(entry)
+            if last_closed.get("stop") is not None:
+                st.stop_price = float(last_closed["stop"])
+            elif entry is not None and stop_pts:
+                st.stop_price = round(float(entry) - stop_pts, 2)
+            if last_closed.get("target") is not None:
+                st.target_price = float(last_closed["target"])
+            elif entry is not None and stop_pts:
+                st.target_price = round(float(entry) + float(target_pts), 2)
+            if last_closed.get("quantity"):
+                st.quantity = int(last_closed["quantity"])
         st.trade_view = {
             "market": last if last is not None else st.last_price,
             "entry": st.entry_price,
             "stop": st.stop_price,
             "target": st.target_price,
+            "qty": abs(int(self.broker.position.quantity or 0))
+            or (int(last_closed["quantity"]) if last_closed and last_closed.get("quantity") else int(st.quantity or 0)),
             "in_trade": in_trade,
             "realized_pnl": float(st.realized_pnl or 0),
             "unrealized_pnl": float(st.unrealized_pnl or 0),
@@ -264,6 +287,7 @@ class StrategyRunner:
             f"{signal.action.value} @ {fill_px:.2f} — {signal.reason}"
         )
         pos_qty = self.broker.position.quantity
+        meta = signal.meta or {}
         if signal.action is SignalAction.BUY and pos_qty <= 0:
             qty = self.quantity + abs(min(pos_qty, 0))
             self.broker.submit_market(
@@ -275,6 +299,11 @@ class StrategyRunner:
                 last_price=fill_px,
                 ts=bar.timestamp,
             )
+            if pos_qty < 0:
+                self.broker.annotate_last_closed(
+                    stop=meta.get("sl") or meta.get("stop"),
+                    target=meta.get("tp") or meta.get("target"),
+                )
         elif signal.action is SignalAction.SELL and pos_qty >= 0:
             qty = self.quantity + max(pos_qty, 0)
             if qty > 0:
@@ -287,6 +316,11 @@ class StrategyRunner:
                     last_price=fill_px,
                     ts=bar.timestamp,
                 )
+                if pos_qty > 0:
+                    self.broker.annotate_last_closed(
+                        stop=meta.get("sl") or meta.get("stop"),
+                        target=meta.get("tp") or meta.get("target"),
+                    )
         elif signal.action is SignalAction.FLAT and pos_qty != 0:
             side = Side.SELL if pos_qty > 0 else Side.BUY
             self.broker.submit_market(
@@ -297,6 +331,11 @@ class StrategyRunner:
                 quantity=abs(pos_qty),
                 last_price=fill_px,
                 ts=bar.timestamp,
+            )
+            self.broker.annotate_last_closed(
+                stop=meta.get("sl") or meta.get("stop"),
+                target=meta.get("tp") or meta.get("target"),
+                quantity=abs(pos_qty),
             )
 
     def _log(self, message: str) -> None:

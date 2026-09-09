@@ -117,8 +117,27 @@ class BasketRunner:
             filled_qty = 0 if self._desk_settled else int(pos.quantity or 0)
             last_qty = int((last_closed or {}).get("quantity") or 0) if last_closed else 0
             planned_qty = int(leg.get("qty") or 0) if not self._desk_settled else 0
+            # Backfill stop/target onto last_closed for legs already exited this session.
+            if last_closed is not None and not in_trade:
+                if last_closed.get("stop") is None and leg.get("stop") is not None:
+                    last_closed["stop"] = leg.get("stop")
+                if last_closed.get("target") is None and leg.get("target") is not None:
+                    last_closed["target"] = leg.get("target")
+                if not last_closed.get("quantity") and leg.get("qty"):
+                    last_closed["quantity"] = int(leg.get("qty") or 0)
             # Prefer live position qty; else last closed fill; else planned tier qty.
             show_qty = abs(filled_qty) if filled_qty else (last_qty if not in_trade and last_qty else planned_qty)
+            # Keep SL/TP visible after exit (review) — only blank after EOD desk settle.
+            show_stop = None if self._desk_settled else (
+                leg.get("stop")
+                if leg.get("stop") is not None
+                else (last_closed or {}).get("stop")
+            )
+            show_target = None if self._desk_settled else (
+                leg.get("target")
+                if leg.get("target") is not None
+                else (last_closed or {}).get("target")
+            )
             legs.append(
                 {
                     "symbol": sym,
@@ -129,8 +148,8 @@ class BasketRunner:
                     "last": show_px,
                     "realized": 0.0 if self._desk_settled else broker.realized_pnl,
                     "unrealized": 0.0 if self._desk_settled else broker.unrealized_pnl(px),
-                    "stop": leg.get("stop") if in_trade else None,
-                    "target": leg.get("target") if in_trade else None,
+                    "stop": show_stop,
+                    "target": show_target,
                     "in_trade": in_trade,
                     "range_high": leg.get("range_high"),
                     "range_low": leg.get("range_low"),
@@ -517,6 +536,15 @@ class BasketRunner:
                 leg = (getattr(self.strategy, "_legs", {}) or {}).get(sym)
                 if isinstance(leg, dict):
                     leg["in_trade"] = False
+                self._preserve_exit_levels(
+                    sym,
+                    broker,
+                    {
+                        "stop": (leg or {}).get("stop") if isinstance(leg, dict) else None,
+                        "target": (leg or {}).get("target") if isinstance(leg, dict) else None,
+                        "qty": (leg or {}).get("qty") if isinstance(leg, dict) else None,
+                    },
+                )
             self.last_signal = "EOD_FLAT"
         self._eod_done_day = today
         self._settle_desk_display()
@@ -587,6 +615,7 @@ class BasketRunner:
                     self.open_trade_ids[symbol] = tid
             elif order.status.value == "FILLED" and pos < 0:
                 pnl_delta = broker.realized_pnl - before
+                self._preserve_exit_levels(symbol, broker, meta)
                 tid = self.open_trade_ids.pop(symbol, None)
                 if self.journal_session_id and tid:
                     close_trade(
@@ -649,6 +678,7 @@ class BasketRunner:
                     self.open_trade_ids[symbol] = tid
             elif order.status.value == "FILLED" and pos > 0:
                 pnl_delta = broker.realized_pnl - before
+                self._preserve_exit_levels(symbol, broker, meta)
                 tid = self.open_trade_ids.pop(symbol, None)
                 if self.journal_session_id and tid:
                     close_trade(
@@ -698,6 +728,7 @@ class BasketRunner:
                 leg = (getattr(self.strategy, "_legs", {}) or {}).get(symbol)
                 if isinstance(leg, dict):
                     leg["in_trade"] = False
+                self._preserve_exit_levels(symbol, broker, meta, quantity=abs(pos))
                 tid = self.open_trade_ids.pop(symbol, None)
                 if self.journal_session_id and tid:
                     close_trade(
@@ -714,6 +745,39 @@ class BasketRunner:
                         reason=signal.reason,
                         meta=meta,
                     )
+
+    def _preserve_exit_levels(
+        self,
+        symbol: str,
+        broker: PaperBroker,
+        meta: dict[str, Any],
+        *,
+        quantity: int | None = None,
+    ) -> None:
+        """Keep qty/stop/target on the closed trade + leg for desk review (no same-day re-entry)."""
+        leg = (getattr(self.strategy, "_legs", {}) or {}).get(symbol) or {}
+        stop = meta.get("stop")
+        if stop is None:
+            stop = leg.get("stop")
+        target = meta.get("target")
+        if target is None:
+            target = leg.get("target")
+        qty = quantity
+        if qty is None:
+            qty = meta.get("qty") or leg.get("qty")
+        broker.annotate_last_closed(
+            stop=float(stop) if stop is not None else None,
+            target=float(target) if target is not None else None,
+            quantity=int(qty) if qty is not None else None,
+        )
+        # Keep levels on the leg so Execute can show them after DONE (1/day lock still applies).
+        if isinstance(leg, dict):
+            if stop is not None:
+                leg["stop"] = float(stop)
+            if target is not None:
+                leg["target"] = float(target)
+            if qty is not None:
+                leg["qty"] = int(qty)
 
     def _entry_qty(self, broker: PaperBroker, fill_px: float, signal) -> int:
         """Tiered qty (brother strategies), fixed qty, or cash-fit for *_cash."""
