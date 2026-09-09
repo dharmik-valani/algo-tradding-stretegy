@@ -112,12 +112,7 @@ class BasketRunner:
             closed = list(getattr(broker, "closed_trades", []) or [])
             last_closed = closed[-1] if closed else None
             in_trade = bool(leg.get("in_trade")) and not self._desk_settled
-            # Hide marks only after EOD settle; while WAITING show live LTP so the desk is readable.
-            show_px = None if self._desk_settled else px
-            filled_qty = 0 if self._desk_settled else int(pos.quantity or 0)
-            last_qty = int((last_closed or {}).get("quantity") or 0) if last_closed else 0
-            planned_qty = int(leg.get("qty") or 0) if not self._desk_settled else 0
-            # Backfill stop/target onto last_closed for legs already exited this session.
+            # Backfill stop/target / 1-day lock BEFORE status text is built.
             if last_closed is not None and not in_trade:
                 if last_closed.get("stop") is None and leg.get("stop") is not None:
                     last_closed["stop"] = leg.get("stop")
@@ -125,7 +120,6 @@ class BasketRunner:
                     last_closed["target"] = leg.get("target")
                 if not last_closed.get("quantity") and leg.get("qty"):
                     last_closed["quantity"] = int(leg.get("qty") or 0)
-                # Never allow same-day re-entry once a closed fill exists.
                 leg["trades_today"] = max(int(leg.get("trades_today") or 0), 1)
                 if leg.get("stop") is None and last_closed.get("stop") is not None:
                     leg["stop"] = last_closed.get("stop")
@@ -133,6 +127,12 @@ class BasketRunner:
                     leg["target"] = last_closed.get("target")
                 if not leg.get("qty") and last_closed.get("quantity"):
                     leg["qty"] = int(last_closed.get("quantity") or 0)
+            status = self._leg_status(sym, leg, px)
+            # Hide marks only after EOD settle; while WAITING show live LTP so the desk is readable.
+            show_px = None if self._desk_settled else px
+            filled_qty = 0 if self._desk_settled else int(pos.quantity or 0)
+            last_qty = int((last_closed or {}).get("quantity") or 0) if last_closed else 0
+            planned_qty = int(leg.get("qty") or 0) if not self._desk_settled else 0
             # Prefer live position qty; else last closed fill; else planned tier qty.
             show_qty = abs(filled_qty) if filled_qty else (last_qty if not in_trade and last_qty else planned_qty)
             # Keep SL/TP visible after exit (review) — only blank after EOD desk settle.
