@@ -55,6 +55,34 @@ class BasketRunner:
         self.qty = int(quantity if quantity is not None else p.get("qty_per_symbol") or 1)
         self.cash_pool = starting_cash
 
+    def max_trades_per_day(self) -> int:
+        fn = getattr(self.strategy, "max_trades_per_day", None)
+        if callable(fn):
+            try:
+                return max(1, int(fn()))
+            except Exception:
+                pass
+        p = {**self.strategy.default_params(), **self.strategy.params}
+        try:
+            return max(1, int(p.get("max_trades_per_day") or p.get("top_n") or 10))
+        except (TypeError, ValueError):
+            return 10
+
+    def trades_used_today(self) -> int:
+        fn = getattr(self.strategy, "trades_used_today", None)
+        if callable(fn):
+            try:
+                return max(0, int(fn()))
+            except Exception:
+                pass
+        n = 0
+        for leg in (getattr(self.strategy, "_legs", {}) or {}).values():
+            if isinstance(leg, dict) and (
+                int(leg.get("trades_today") or 0) >= 1 or leg.get("in_trade")
+            ):
+                n += 1
+        return n
+
     def _leg_status(self, symbol: str, leg: dict[str, Any], last: float | None) -> str:
         """Human-readable why a selected name is / isn't in a trade."""
         if leg.get("in_trade"):
@@ -64,6 +92,10 @@ class BasketRunner:
             return f"rejected · {reject}"
         if int(leg.get("trades_today") or 0) >= 1:
             return "already traded today"
+        max_day = self.max_trades_per_day()
+        used_day = self.trades_used_today()
+        if used_day >= max_day:
+            return f"max {max_day} trades today ({used_day}/{max_day})"
         if not leg.get("range_done"):
             return "building first range"
         p = {**self.strategy.default_params(), **self.strategy.params}
@@ -307,6 +339,8 @@ class BasketRunner:
             "day_pnl": live_day,
             "desk_settled": bool(self._desk_settled),
             "generated": float(self.starting_cash) + live_day,
+            "trades_today_count": self.trades_used_today(),
+            "max_trades_per_day": self.max_trades_per_day(),
         }
         if (
             not active
@@ -353,7 +387,9 @@ class BasketRunner:
         if not by_sym:
             return 0
 
-        # Ensure selection includes journal symbols.
+        # Attach same-day journal symbols for review / open management.
+        # New entries are still hard-capped by max_trades_per_day; ensure_selection
+        # also skips a fresh top_n scan once today's journal exists.
         for sym in by_sym:
             if sym not in self.selected:
                 self.selected.append(sym)
@@ -454,13 +490,33 @@ class BasketRunner:
                 restored += 1
 
         if restored:
+            used = self.trades_used_today()
+            max_day = self.max_trades_per_day()
             self._log(
                 f"Restored {restored} same-day journal leg(s) — qty/stop/target kept; "
-                f"1 trade/symbol/day enforced"
+                f"1 trade/symbol/day · day trades {used}/{max_day}"
             )
         return restored
 
     def ensure_selection(self, quotes: LiveQuoteProvider) -> None:
+        # Prefer same-day journal + already-locked basket over a fresh top_n scan.
+        # Re-scanning after restart was merging a new top_n with yesterday's journal
+        # names and blowing past the 10-trade daily cap.
+        if not self._scanned:
+            try:
+                restored = self.restore_today_from_journal()
+            except Exception as exc:
+                restored = 0
+                self._log(f"pre-scan journal restore failed: {exc}")
+            if self.selected:
+                self.strategy.selected = list(self.selected)
+                self._scanned = True
+                if restored:
+                    self._log(
+                        f"Locked today's basket ({len(self.selected)} symbols, "
+                        f"{self.trades_used_today()}/{self.max_trades_per_day()} trades) — skip re-scan"
+                    )
+                return
         if self._scanned and self.strategy.selected:
             self.selected = list(self.strategy.selected)
             return
@@ -506,7 +562,10 @@ class BasketRunner:
             self._log(f"Scan incomplete ({len(snaps)} snaps) — waiting before re-scan")
             return
         picked = self.strategy.select_symbols(snaps)
-        self.selected = list(picked)
+        # Hard-cap selection to top_n / max trades so the basket never grows past quota.
+        max_day = self.max_trades_per_day()
+        self.selected = list(picked)[:max_day]
+        self.strategy.selected = list(self.selected)
         self._scanned = True
         for sym in self.selected:
             if sym not in self.brokers:
@@ -524,7 +583,7 @@ class BasketRunner:
             )
         self._log(
             f"Selected {len(self.selected)}: {', '.join(self.selected) or 'none'} "
-            f"(from {len(snaps)} scanned) — REST seed then WS selected only"
+            f"(from {len(snaps)} scanned, max {max_day}/day) — REST seed then WS selected only"
         )
         # Immediately REST-seed selected LTPs so the same poll can trade / show marks.
         try:
@@ -781,6 +840,13 @@ class BasketRunner:
                     self.strategy.rollback_entry(symbol, reason="insufficient cash for 1 share")
                     self._log(f"{symbol} BUY skipped — insufficient cash @ {fill_px:.2f}")
                 return
+            max_day = self.max_trades_per_day()
+            used_day = self.trades_used_today()
+            # Strategy may already have marked this leg in_trade / trades_today.
+            if used_day > max_day:
+                self.strategy.rollback_entry(symbol, reason=f"max {max_day} trades today")
+                self._log(f"{symbol} BUY blocked — day trades {used_day}/{max_day}")
+                return
             need = qty + abs(min(pos, 0))
             before = broker.realized_pnl
             order = broker.submit_market(
@@ -844,6 +910,13 @@ class BasketRunner:
                     self.strategy.rollback_entry(symbol, reason="insufficient cash for 1 share")
                     self._log(f"{symbol} SELL skipped — insufficient cash @ {fill_px:.2f}")
                 return
+            if pos == 0 and meta.get("structure") == "short_orb":
+                max_day = self.max_trades_per_day()
+                used_day = self.trades_used_today()
+                if used_day > max_day:
+                    self.strategy.rollback_entry(symbol, reason=f"max {max_day} trades today")
+                    self._log(f"{symbol} SELL blocked — day trades {used_day}/{max_day}")
+                    return
             sell_qty = qty if pos == 0 else pos
             before = broker.realized_pnl
             order = broker.submit_market(

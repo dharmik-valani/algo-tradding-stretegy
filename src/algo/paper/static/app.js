@@ -101,14 +101,11 @@ function winCell(a) {
 }
 
 function capitalCell(allocated, used, { usedLabel = "used" } = {}) {
-  const alloc = allocated != null && !Number.isNaN(Number(allocated)) ? Number(allocated) : null;
   const dep = used != null && !Number.isNaN(Number(used)) ? Number(used) : 0;
-  if (alloc == null) return "—";
-  const usedLine =
-    dep > 0
-      ? `<div class="meta pnl-sub" title="Actual ₹ put into trades = qty × entry">${usedLabel} ₹${moneyShort(dep)}</div>`
-      : `<div class="meta pnl-sub" title="No shares bought/sold yet from this capital">used ₹0</div>`;
-  return `<div title="Paper capital allocated ₹${money(alloc)}">₹${moneyShort(alloc)}</div>${usedLine}`;
+  if (dep > 0) {
+    return `<div title="Capital in trades = qty × entry">₹${moneyShort(dep)}</div><div class="meta pnl-sub">${escapeHtml(usedLabel)}</div>`;
+  }
+  return `<div title="No capital in trades yet">₹0</div><div class="meta pnl-sub">${escapeHtml(usedLabel)}</div>`;
 }
 
 function pnlClass(n) {
@@ -449,23 +446,27 @@ function analyticsMap() {
 
 function renderExecDayKpis(session) {
   const strats = session.strategies || [];
-  let invested = 0;
+  let capitalInUse = 0;
   let dayPnl = 0;
   let enabled = 0;
   for (const s of strats) {
     const tv = s.trade_view || {};
-    const cap = Number(tv.invested != null ? tv.invested : s.starting_cash) || 0;
+    const used = Number(
+      tv.deployed_day != null
+        ? tv.deployed_day
+        : tv.deployed != null
+          ? tv.deployed
+          : tv.notional || 0
+    ) || 0;
     const dp = Number(
       tv.day_pnl != null ? tv.day_pnl : (s.realized_pnl || 0) + (s.unrealized_pnl || 0)
     );
-    invested += cap;
+    capitalInUse += used;
     dayPnl += dp;
     if (s.enabled) enabled += 1;
   }
-  const generated = invested + dayPnl;
   const overall = lastAnalytics.overall || {};
-  setText("execInvested", `₹${money(invested)}`);
-  setText("execGenerated", `₹${money(generated)}`, pnlClass(dayPnl));
+  setText("execInvested", `₹${money(capitalInUse)}`);
   setText("execDayPnl", `₹${money(dayPnl)}`, pnlClass(dayPnl));
   setText("execWinRate", pct(overall.win_rate));
   setText("execDeskLine", `${enabled} / ${strats.length}`);
@@ -683,14 +684,28 @@ function renderExecStats(session) {
       const isOpen = !!(inTrade || (posQty && !isBasket) || tv.in_trade);
       const settled = !!tv.desk_settled;
       const lc = tv.last_closed || null;
+      const maxTrades = Math.max(
+        1,
+        Number(tv.max_trades_per_day || s.params?.max_trades_per_day || s.params?.top_n || 10) || 10
+      );
+      const tradesUsed = Math.max(
+        0,
+        Number(
+          tv.trades_today_count != null
+            ? tv.trades_today_count
+            : basket.filter((l) => l.in_trade || Number(l.trades_today || 0) >= 1).length
+        ) || 0
+      );
 
       let stocks;
       let posTitle;
       let qtyCell;
       let qtyTitle;
       if (isBasket) {
-        stocks = `${settled ? 0 : inTrade}/${selected || basket.length}`;
-        posTitle = "Open legs / selected symbols in basket";
+        stocks = settled
+          ? `0/${maxTrades}`
+          : `${inTrade}<div class="meta pnl-sub">${tradesUsed}/${maxTrades} day</div>`;
+        posTitle = `Open legs · day trades used/max (cap ${maxTrades}/strategy/day)`;
         const openQtySum = active.reduce((n, l) => n + Math.abs(Number(l.qty) || 0), 0);
         const doneQtySum = basket
           .filter((l) => !l.in_trade && Number(l.trades_today || 0) >= 1)
@@ -813,7 +828,7 @@ function renderExecStats(session) {
             <span class="badge ${s.enabled ? "on" : ""}">${status}</span>
             <span class="strat-name">${escapeHtml(s.name)}</span>
           </div>
-          <div class="meta">${nameSub}${canExpand ? ` · ${basket.length} symbols` : " · 1 trade/day"}</div>
+          <div class="meta">${nameSub}${canExpand ? ` · max ${maxTrades}/day` : " · 1 trade/day"}</div>
         </td>
         <td data-label="Capital" class="mono">${capitalCell(
           invested,
@@ -826,11 +841,7 @@ function renderExecStats(session) {
           ) || 0,
           { usedLabel: isOpen ? "in use" : "used" }
         )}</td>
-        <td data-label="Generated" class="mono ${pnlClass(dayPnl)}" title="Capital + day PnL · ₹${money(generated)}">
-          <div>₹${moneyShort(generated)}</div>
-          <div class="meta pnl-sub">day ₹${moneyShort(dayPnl)}</div>
-        </td>
-        <td data-label="PnL" class="mono ${pnlClass(total)}" title="Open row PnL (0 after EOD settle) · ₹${money(total)}">
+        <td data-label="PnL" class="mono ${pnlClass(total)}" title="Day / live PnL · ₹${money(total)}">
           <div>₹${moneyShort(total)}</div>
           <div class="meta pnl-sub">${escapeHtml(pnlSub)}</div>
         </td>
@@ -862,7 +873,6 @@ function renderExecStats(session) {
           const legCap = Number(leg.allocated != null ? leg.allocated : leg.capital != null ? leg.capital : invested / Math.max(basket.length, 1));
           const legUsed = Number(leg.notional != null ? leg.notional : leg.deployed) || 0;
           const legPnl = Number(leg.leg_pnl != null ? leg.leg_pnl : (legOpen ? leg.unrealized : leg.realized) || 0);
-          const legGen = legCap + legPnl;
           const legMarket = leg.last != null ? money(leg.last) : "—";
           const legEntry =
             leg.entry != null
@@ -891,10 +901,6 @@ function renderExecStats(session) {
               <div class="meta">${escapeHtml(leg.status || "")}${leg.side ? ` · ${escapeHtml(String(leg.side))}` : ""}${tradedToday && !legOpen ? " · 1/day" : ""}</div>
             </td>
             <td data-label="Capital" class="mono">${capitalCell(legCap, legUsed, { usedLabel: legOpen ? "in use" : "used" })}</td>
-            <td data-label="Generated" class="mono ${pnlClass(legPnl)}">
-              <div>₹${moneyShort(legGen)}</div>
-              <div class="meta pnl-sub">day ₹${moneyShort(legPnl)}</div>
-            </td>
             <td data-label="PnL" class="mono ${pnlClass(legPnl)}">₹${moneyShort(legPnl)}</td>
             <td data-label="Market" class="mono">${legMarket}</td>
             <td data-label="Entry" class="mono">${levelCell(legEntry, legEntryHint)}</td>
@@ -915,21 +921,21 @@ function renderExecStats(session) {
 
   root.innerHTML = `
     <p class="hint desk-legend tight">
-      ▶ Capital = allocated bank. Under it, used = actual money in trades (qty × entry).
-      Win = wins÷(wins+losses) on closed trades · leg W/L is that symbol's result · 1 trade/symbol/day.
+      ▶ Capital = money in trades (qty × entry). PnL = day result.
+      Baskets: max ${10} trades/strategy/day — after that, no new entries. 1 trade/symbol/day.
+      Win = wins÷(wins+losses) on closed trades.
     </p>
     <div class="table-wrap desk-table-wrap">
       <table class="data-table dense cards-on-mobile" id="execStatsTable">
         <thead>
           <tr>
             <th>Strategy</th>
-            <th title="Allocated paper capital · used = qty × entry">Capital</th>
-            <th title="Capital + day PnL">Generated</th>
-            <th title="Live / settled day PnL">PnL</th>
+            <th title="Capital currently in trades (qty × entry)">Capital</th>
+            <th title="Live / day PnL">PnL</th>
             <th title="Live mark while in trade">Market</th>
             <th title="Entry fill">Entry</th>
             <th title="Exit fill">Exit</th>
-            <th title="Basket: in-trade / selected. Single: 0 or 1">Open</th>
+            <th title="Open legs · day trades used / max (default 10)">Open</th>
             <th title="Share / lot quantity">Qty</th>
             <th>Stop</th>
             <th>Target</th>

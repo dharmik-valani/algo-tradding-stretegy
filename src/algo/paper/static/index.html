@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=desk37" />
+  <link rel="stylesheet" href="/static/styles.css?v=desk38" />
 </head>
 <body>
   <div class="app">
@@ -191,12 +191,8 @@
       <section class="view" id="view-execute" data-view="execute">
         <div class="kpi-board compact-kpis" id="execDayKpis">
           <div class="metric hero">
-            <span>Invested today</span>
+            <span>Capital in use</span>
             <strong id="execInvested">—</strong>
-          </div>
-          <div class="metric hero">
-            <span>Generated (equity)</span>
-            <strong id="execGenerated">—</strong>
           </div>
           <div class="metric hero">
             <span>Day PnL</span>
@@ -217,7 +213,7 @@
             <h2>On desk</h2>
             <span class="count-pill" id="deskCount">0</span>
           </div>
-          <p class="hint tight">09:15–15:30 IST · scan 09:30 → basket legs · fill on breakout · 1 trade/symbol/day · flatten 15:00</p>
+          <p class="hint tight">09:15–15:30 IST · scan 09:30 → basket legs · fill on breakout · max 10 trades/strategy/day · 1 trade/symbol/day · flatten 15:00</p>
           <div id="execDeskList" class="exec-desk-list"></div>
         </div>
 
@@ -523,6 +519,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=desk37"></script>
+  <script src="/static/app.js?v=desk38"></script>
 </body>
 </html>

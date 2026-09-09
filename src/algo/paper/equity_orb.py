@@ -356,6 +356,23 @@ class _EquityOrbBase(Strategy):
         if clock > entry_end:
             return Signal(action=SignalAction.HOLD, reason="past entry window", meta=meta)
 
+        try:
+            max_day = max(1, int((p.get("max_trades_per_day") or p.get("top_n") or 10)))
+        except (TypeError, ValueError):
+            max_day = 10
+        used_day = 0
+        for other in (getattr(self, "_legs", {}) or {}).values():
+            if isinstance(other, dict) and (
+                int(other.get("trades_today") or 0) >= 1 or other.get("in_trade")
+            ):
+                used_day += 1
+        if used_day >= max_day and not leg.get("in_trade"):
+            return Signal(
+                action=SignalAction.HOLD,
+                reason=f"max {max_day} trades today ({used_day}/{max_day})",
+                meta=meta,
+            )
+
         # Entries
         if self.mode == "gainer":
             if bar.close > rh or bar.high > rh:

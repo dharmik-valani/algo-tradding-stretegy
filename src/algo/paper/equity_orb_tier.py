@@ -89,6 +89,8 @@ class _EquityOrbTierBase(Strategy):
             "max_price": 1500.0,
             "min_price": 80.0,
             "one_trade_per_symbol": True,
+            # Hard daily cap for the whole basket (defaults to top_n = 10).
+            "max_trades_per_day": 10,
             "qty_per_symbol": 50,  # fallback when price outside tiers
             "qty_tiers": "80-200:500,200-500:200,500-600:150,600-900:100,900-1500:50",
         }
@@ -126,6 +128,15 @@ class _EquityOrbTierBase(Strategy):
                 "min": 1,
                 "max": 20,
                 "help": f"How many top {'gainers' if long else 'losers'} by % to trade.",
+                "example": "10",
+            },
+            {
+                "key": "max_trades_per_day",
+                "label": "Max trades / day",
+                "type": "number",
+                "min": 1,
+                "max": 20,
+                "help": "Hard cap: after this many entries today, no new breakouts (default 10).",
                 "example": "10",
             },
             {
@@ -246,6 +257,24 @@ class _EquityOrbTierBase(Strategy):
                 "example": "true",
             },
         ]
+
+    def max_trades_per_day(self) -> int:
+        p = {**self.default_params(), **self.params}
+        try:
+            cap = int(p.get("max_trades_per_day") or p.get("top_n") or 10)
+        except (TypeError, ValueError):
+            cap = 10
+        return max(1, cap)
+
+    def trades_used_today(self) -> int:
+        """Count symbols that already entered (or are still open) today."""
+        n = 0
+        for leg in (getattr(self, "_legs", {}) or {}).values():
+            if not isinstance(leg, dict):
+                continue
+            if int(leg.get("trades_today") or 0) >= 1 or leg.get("in_trade"):
+                n += 1
+        return n
 
     def qty_for_price(self, price: float) -> int:
         p = {**self.default_params(), **self.params}
@@ -487,6 +516,18 @@ class _EquityOrbTierBase(Strategy):
         if clock > entry_end:
             return Signal(action=SignalAction.HOLD, reason="past entry window", meta=meta)
 
+        max_day = self.max_trades_per_day()
+        used_day = self.trades_used_today()
+        meta["trades_today_count"] = used_day
+        meta["max_trades_per_day"] = max_day
+        # Do not open a new name once the daily basket quota is filled.
+        if used_day >= max_day and not leg.get("in_trade"):
+            return Signal(
+                action=SignalAction.HOLD,
+                reason=f"max {max_day} trades today ({used_day}/{max_day})",
+                meta=meta,
+            )
+
         # Entries on break of first 5m high/low
         if self.mode == "gainer":
             if bar.close > rh or bar.high > rh:
@@ -605,9 +646,10 @@ class Nifty500TopGainerBrkStrategy(_EquityOrbTierBase):
     id = "nifty500_top_gainer_brk"
     name = "NIFTY500 Top10 Gainers 5m Brk"
     description = (
-        "At 09:18 pick top 10 NIFTY500 gainers by % (skip >₹1500). "
+        "At scan time pick top 10 NIFTY500 gainers by % (skip >₹1500). "
         "Long when price breaks first 5m high; SL = 5m low−0.2% "
         "(or entry-candle low−0.2% if 1st 5m range >1%); book 1:2 then 1:3. "
+        "Max 10 trades/day for the basket — no new entries after the quota. "
         "Qty by price tier (80–200→500, 200–500→200, 600–900→100)."
     )
     mode: Mode = "gainer"
@@ -617,9 +659,10 @@ class Nifty500TopLoserBrkStrategy(_EquityOrbTierBase):
     id = "nifty500_top_loser_brk"
     name = "NIFTY500 Top10 Losers 5m Brk"
     description = (
-        "At 09:18 pick top 10 NIFTY500 losers by % (skip >₹1500). "
+        "At scan time pick top 10 NIFTY500 losers by % (skip >₹1500). "
         "Short when price breaks first 5m low; SL = 5m high+0.2% "
         "(or entry-candle high+0.2% if 1st 5m range >1%); book 1:2 then 1:3. "
+        "Max 10 trades/day for the basket — no new entries after the quota. "
         "Qty by price tier (adjustable)."
     )
     mode: Mode = "loser"
