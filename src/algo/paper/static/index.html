@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=desk38" />
+  <link rel="stylesheet" href="/static/styles.css?v=desk39" />
 </head>
 <body>
   <div class="app">
@@ -91,12 +91,12 @@
               <button type="button" class="ghost" data-an-range="all">All</button>
             </div>
           </div>
-          <p class="hint tight">Journal stats · strategy ranked by net PnL · capital = desk starting cash</p>
+          <p class="hint tight">Journal stats · strategy ranked by net PnL · total balance = desk bank · used = qty × entry</p>
         </div>
 
         <div class="kpi-board compact-kpis dense-kpis" id="analyticsKpiBoard">
-          <div class="metric hero"><span>Invested capital</span><strong id="anInvested">—</strong></div>
-          <div class="metric hero"><span>Generated (equity)</span><strong id="anGenerated">—</strong></div>
+          <div class="metric hero"><span>Total balance</span><strong id="anBalance">—</strong></div>
+          <div class="metric hero"><span>Used capital</span><strong id="anUsed">—</strong></div>
           <div class="metric hero"><span>Net PnL</span><strong id="anNet">—</strong></div>
           <div class="metric"><span>Win rate</span><strong id="anWinRate">—</strong></div>
           <div class="metric"><span>Profit factor</span><strong id="anPf">—</strong></div>
@@ -519,6 +519,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=desk38"></script>
+  <script src="/static/app.js?v=desk39"></script>
 </body>
 </html>

@@ -549,8 +549,24 @@ def analytics_board(
     strategies = list(snap.strategies or [])
     if strategy_id:
         strategies = [s for s in strategies if s.strategy_id == strategy_id]
-    invested = round(sum(float(s.starting_cash or 0) for s in strategies), 2)
-    generated = round(invested + float(summary.get("net_pnl") or 0), 2)
+    # Total balance = paper bank allocated to strategies on the desk.
+    total_balance = round(sum(float(s.starting_cash or 0) for s in strategies), 2)
+    # Used capital = qty × entry notionals for trades taken today (open + closed).
+    used = 0.0
+    for s in strategies:
+        tv = getattr(s, "trade_view", None) or {}
+        if isinstance(tv, dict):
+            used += float(
+                tv.get("deployed_day")
+                if tv.get("deployed_day") is not None
+                else tv.get("deployed")
+                if tv.get("deployed") is not None
+                else tv.get("notional")
+                or 0
+            )
+        else:
+            used += float(getattr(tv, "deployed_day", None) or getattr(tv, "deployed", 0) or 0)
+    used = round(used, 2)
     live = session.analytics()
     overall = live.get("overall") or {}
     return {
@@ -559,8 +575,11 @@ def analytics_board(
         "daily": daily,
         "strategy_rank": strategy_rank or [],
         "capital": {
-            "invested": invested,
-            "generated": generated,
+            "total_balance": total_balance,
+            "used": used,
+            # Back-compat aliases for older UI caches.
+            "invested": total_balance,
+            "generated": round(total_balance + float(summary.get("net_pnl") or 0), 2),
             "net_pnl": float(summary.get("net_pnl") or 0),
             "strategies_in_filter": len(strategies),
         },

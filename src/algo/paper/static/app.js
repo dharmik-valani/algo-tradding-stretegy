@@ -531,8 +531,10 @@ function renderAnalyticsBoard(board) {
   const capital = board?.capital || {};
   const live = board?.live || {};
   const net = Number(summary.net_pnl || capital.net_pnl || 0);
-  setText("anInvested", moneyOrDash(capital.invested));
-  setText("anGenerated", moneyOrDash(capital.generated), pnlClass(net));
+  const balance = capital.total_balance != null ? capital.total_balance : capital.invested;
+  const used = capital.used != null ? capital.used : null;
+  setText("anBalance", moneyOrDash(balance));
+  setText("anUsed", moneyOrDash(used));
   setText("anNet", moneyOrDash(net), pnlClass(net));
   setText("anWinRate", pct(summary.win_rate));
   setText("anPf", summary.profit_factor != null ? String(summary.profit_factor) : "—");
