@@ -817,10 +817,14 @@ function renderExecStats(session) {
         </td>
         <td data-label="Capital" class="mono">${capitalCell(
           invested,
-          Number(tv.deployed != null ? tv.deployed : tv.deployed_day) ||
-            (!isBasket && Number(tv.notional || 0)) ||
-            0,
-          { usedLabel: isOpen ? "in use" : "used today" }
+          Number(
+            tv.deployed_day != null
+              ? tv.deployed_day
+              : tv.deployed != null
+                ? tv.deployed
+                : tv.notional || 0
+          ) || 0,
+          { usedLabel: isOpen ? "in use" : "used" }
         )}</td>
         <td data-label="Generated" class="mono ${pnlClass(dayPnl)}" title="Capital + day PnL · ₹${money(generated)}">
           <div>₹${moneyShort(generated)}</div>
