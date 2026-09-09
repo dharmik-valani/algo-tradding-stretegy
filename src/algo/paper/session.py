@@ -1081,12 +1081,82 @@ class PaperSession:
             pass
         feed = self._quotes.feed_status
         seeded_n = len(self._rest_seeded_syms)
+        # Rebuild same-day locks / open legs from journal so restarts never re-enter.
+        with self._lock:
+            for r in self.runners.values():
+                if isinstance(r, BasketRunner):
+                    try:
+                        r.journal_session_id = self.journal_session_id
+                        r.restore_today_from_journal()
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        self._restore_option_day_from_journal(r)
+                    except Exception:
+                        pass
         self.message = (
             f"Live paper REST→WS ({self._feed_phase}, seeded {seeded_n}) via {feed} · "
             f"poll {poll_seconds:.0f}s — virtual fills only (no Dhan orders)"
         )
         self._thread = threading.Thread(target=self._run_live, daemon=True)
         self._thread.start()
+
+    def _restore_option_day_from_journal(self, runner: StrategyRunner) -> None:
+        """Keep option ORB 1/day lock + last exit levels after restart."""
+        from algo.paper.journal import list_trades
+
+        today = datetime.now(IST).date()
+        rows = list_trades(instance_id=runner.instance_id, limit=50)
+        day_rows = []
+        for t in rows:
+            raw = t.get("exit_at") or t.get("entry_at")
+            if not raw:
+                continue
+            try:
+                if isinstance(raw, datetime):
+                    day = raw.astimezone(IST).date()
+                else:
+                    day = datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(IST).date()
+            except Exception:
+                continue
+            if day == today:
+                day_rows.append(t)
+        if not day_rows:
+            return
+        closed = [t for t in day_rows if t.get("status") == "closed"]
+        opens = [t for t in day_rows if t.get("status") == "open"]
+        strat = runner.strategy
+        if closed:
+            t = closed[0]
+            setattr(strat, "_trades_today", 1)
+            setattr(strat, "_in_trade", False)
+            entry = float(t.get("entry_price") or 0)
+            setattr(strat, "_entry_price", entry)
+            stop = t.get("stop_price")
+            target = t.get("target_price")
+            runner.broker.closed_trades = [
+                {
+                    "pnl": float(t.get("realized_pnl") or 0),
+                    "quantity": int(t.get("quantity") or runner.quantity or 0),
+                    "entry": entry,
+                    "exit": float(t.get("exit_price") or 0),
+                    "side": "long",
+                    "stop": float(stop) if stop is not None else None,
+                    "target": float(target) if target is not None else None,
+                }
+            ]
+            runner._log(f"Restored closed option trade today — 1/day locked")
+        elif opens:
+            t = opens[0]
+            setattr(strat, "_trades_today", 1)
+            setattr(strat, "_in_trade", True)
+            entry = float(t.get("entry_price") or 0)
+            setattr(strat, "_entry_price", entry)
+            qty = int(t.get("quantity") or runner.quantity or 0)
+            runner.broker.position.quantity = qty
+            runner.broker.position.avg_price = entry
+            runner._log(f"Restored open option trade qty={qty}")
 
     def stop(self) -> None:
         try:

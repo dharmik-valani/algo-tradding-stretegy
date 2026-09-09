@@ -11,7 +11,7 @@ from algo.config import Settings
 from algo.paper.broker import PaperBroker, utcnow
 from algo.paper.equity_orb import _EquityOrbBase
 from algo.paper.equity_orb_tier import _EquityOrbTierBase
-from algo.paper.journal import close_trade, open_trade, record_selections
+from algo.paper.journal import close_trade, list_trades, open_trade, record_selections
 from algo.paper.models import Bar, Position, Side, SignalAction, StrategyState
 from algo.paper.quotes import LiveQuoteProvider
 from algo.paper.universe import resolve_universe
@@ -264,6 +264,149 @@ class BasketRunner:
         ):
             st.note = f"{st.note} · flat (realized)" if st.note else "flat (realized)"
         return st
+
+    def restore_today_from_journal(self) -> int:
+        """Rebuild same-day locks + open/closed levels from journal after process restart.
+
+        Prevents re-entry on symbols already traded today and keeps qty/stop/target visible.
+        """
+        today = datetime.now(IST).date()
+
+        def _as_day(raw: Any) -> Any:
+            if raw is None:
+                return None
+            if isinstance(raw, datetime):
+                return raw.astimezone(IST).date()
+            try:
+                return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).astimezone(IST).date()
+            except Exception:
+                return None
+
+        try:
+            rows = list_trades(instance_id=self.instance_id, limit=500)
+        except Exception as exc:
+            self._log(f"journal restore skipped: {exc}")
+            return 0
+
+        by_sym: dict[str, list[dict[str, Any]]] = {}
+        for t in rows:
+            day = _as_day(t.get("exit_at")) or _as_day(t.get("entry_at"))
+            if day != today:
+                continue
+            sym = str(t.get("symbol") or "").upper()
+            if not sym:
+                continue
+            by_sym.setdefault(sym, []).append(t)
+
+        if not by_sym:
+            return 0
+
+        # Ensure selection includes journal symbols.
+        for sym in by_sym:
+            if sym not in self.selected:
+                self.selected.append(sym)
+        self.strategy.selected = list(self.selected)
+        self._scanned = bool(self.selected)
+        n_sel = max(len(self.selected) or 1, 1)
+        restored = 0
+
+        for sym, trades in by_sym.items():
+            closed = [t for t in trades if str(t.get("status") or "") == "closed"]
+            opens = [t for t in trades if str(t.get("status") or "") == "open"]
+            closed.sort(key=lambda x: str(x.get("exit_at") or x.get("entry_at") or ""), reverse=True)
+            opens.sort(key=lambda x: str(x.get("entry_at") or ""), reverse=True)
+
+            broker = self.brokers.setdefault(
+                sym,
+                PaperBroker(starting_cash=self.starting_cash / n_sel),
+            )
+            if not broker.position.symbol:
+                broker.bind(self.strategy.id, f"NSE:EQ:{sym}", sym)
+            self.histories.setdefault(sym, [])
+            legs_map = getattr(self.strategy, "_legs", None)
+            if not isinstance(legs_map, dict):
+                self.strategy._legs = {}  # type: ignore[attr-defined]
+                legs_map = self.strategy._legs  # type: ignore[attr-defined]
+            empty_fn = getattr(self.strategy, "_empty_leg", None)
+            if sym not in legs_map:
+                legs_map[sym] = empty_fn() if callable(empty_fn) else {
+                    "in_trade": False,
+                    "trades_today": 0,
+                    "stop": None,
+                    "target": None,
+                    "qty": 0,
+                    "side": None,
+                    "entry": None,
+                }
+            leg = legs_map[sym]
+
+            if closed:
+                # Already finished today — lock 1/day and keep levels for review.
+                t = closed[0]
+                qty = int(t.get("quantity") or (t.get("meta") or {}).get("qty") or 0)
+                stop = t.get("stop_price")
+                target = t.get("target_price")
+                meta = t.get("meta") or {}
+                if stop is None:
+                    stop = meta.get("stop")
+                if target is None:
+                    target = meta.get("target")
+                leg["in_trade"] = False
+                leg["trades_today"] = max(int(leg.get("trades_today") or 0), 1)
+                leg["qty"] = qty or leg.get("qty")
+                leg["stop"] = float(stop) if stop is not None else leg.get("stop")
+                leg["target"] = float(target) if target is not None else leg.get("target")
+                leg["side"] = "short" if str(t.get("side") or "").upper() == "SHORT" else "long"
+                leg["entry"] = t.get("entry_price")
+                broker.closed_trades = [
+                    {
+                        "pnl": float(t.get("realized_pnl") or 0),
+                        "quantity": qty,
+                        "entry": float(t.get("entry_price") or 0),
+                        "exit": float(t.get("exit_price") or 0),
+                        "side": "short" if str(t.get("side") or "").upper() == "SHORT" else "long",
+                        "stop": float(stop) if stop is not None else None,
+                        "target": float(target) if target is not None else None,
+                    }
+                ]
+                # Drop orphan open journal ids so we don't manage ghost positions.
+                self.open_trade_ids.pop(sym, None)
+                restored += 1
+                continue
+
+            if opens:
+                t = opens[0]
+                qty = int(t.get("quantity") or (t.get("meta") or {}).get("qty") or 0)
+                stop = t.get("stop_price")
+                target = t.get("target_price")
+                meta = t.get("meta") or {}
+                if stop is None:
+                    stop = meta.get("stop")
+                if target is None:
+                    target = meta.get("target")
+                entry = float(t.get("entry_price") or 0)
+                side = str(t.get("side") or "").upper()
+                signed = -abs(qty) if side == "SHORT" else abs(qty)
+                broker.position.quantity = signed
+                broker.position.avg_price = entry
+                broker.position.symbol = sym
+                leg["in_trade"] = True
+                leg["trades_today"] = max(int(leg.get("trades_today") or 0), 1)
+                leg["qty"] = abs(qty)
+                leg["stop"] = float(stop) if stop is not None else None
+                leg["target"] = float(target) if target is not None else None
+                leg["side"] = "short" if side == "SHORT" else "long"
+                leg["entry"] = entry
+                if t.get("id"):
+                    self.open_trade_ids[sym] = str(t["id"])
+                restored += 1
+
+        if restored:
+            self._log(
+                f"Restored {restored} same-day journal leg(s) — qty/stop/target kept; "
+                f"1 trade/symbol/day enforced"
+            )
+        return restored
 
     def ensure_selection(self, quotes: LiveQuoteProvider) -> None:
         if self._scanned and self.strategy.selected:
