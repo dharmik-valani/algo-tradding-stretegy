@@ -514,6 +514,55 @@ def analytics() -> dict:
     return get_session().analytics()
 
 
+def _empty_strategy_stats(strategy_id: str, *, name: str | None = None) -> dict[str, Any]:
+    return {
+        "strategy_id": strategy_id,
+        "name": name,
+        "symbols": [],
+        "trades": 0,
+        "wins": 0,
+        "losses": 0,
+        "breakeven": 0,
+        "win_rate": None,
+        "avg_win": None,
+        "avg_loss": None,
+        "net_pnl": 0.0,
+        "avg_trade": None,
+        "expectancy": None,
+        "profit_factor": None,
+        "largest_win": None,
+        "largest_loss": None,
+    }
+
+
+def _merge_desk_strategies(
+    by_strategy: list[dict[str, Any]] | None,
+    desk_strategies: list[Any],
+    *,
+    strategy_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Include every desk strategy in analytics (even with 0 journal trades)."""
+    rows = list(by_strategy or [])
+    seen = {str(r.get("strategy_id") or "") for r in rows}
+    for s in desk_strategies:
+        sid = getattr(s, "strategy_id", None) or (s.get("strategy_id") if isinstance(s, dict) else None)
+        if not sid:
+            continue
+        if strategy_id and sid != strategy_id and getattr(s, "instance_id", None) != strategy_id:
+            continue
+        if sid in seen:
+            # Attach display name when journal row lacks it.
+            for r in rows:
+                if r.get("strategy_id") == sid and not r.get("name"):
+                    r["name"] = getattr(s, "name", None) or (s.get("name") if isinstance(s, dict) else None)
+            continue
+        name = getattr(s, "name", None) or (s.get("name") if isinstance(s, dict) else None)
+        rows.append(_empty_strategy_stats(str(sid), name=name))
+        seen.add(str(sid))
+    rows.sort(key=lambda r: float(r.get("net_pnl") or 0), reverse=True)
+    return rows
+
+
 @app.get("/api/analytics/board")
 def analytics_board(
     from_date: str | None = None,
@@ -533,6 +582,16 @@ def analytics_board(
         to_date=to_date or None,
         strategy_id=strategy_id or None,
     )
+    session = get_session()
+    snap = session.snapshot()
+    all_desk = list(snap.strategies or [])
+    strategies = list(all_desk)
+    if strategy_id:
+        strategies = [
+            s
+            for s in strategies
+            if s.strategy_id == strategy_id or s.instance_id == strategy_id
+        ]
     # Ranked list for the date range (all strategies) so the dropdown stays top→down
     # even while a single strategy filter is active.
     strategy_rank = (
@@ -544,11 +603,32 @@ def analytics_board(
             strategy_id=None,
         ).get("by_strategy")
     )
-    session = get_session()
-    snap = session.snapshot()
-    strategies = list(snap.strategies or [])
-    if strategy_id:
-        strategies = [s for s in strategies if s.strategy_id == strategy_id]
+    strategy_rank = _merge_desk_strategies(strategy_rank, all_desk)
+    summary["by_strategy"] = _merge_desk_strategies(
+        summary.get("by_strategy"), strategies, strategy_id=strategy_id
+    )
+    journal_by_sid = {
+        str(r.get("strategy_id")): r for r in (summary.get("by_strategy") or []) if r.get("strategy_id")
+    }
+    # Execute-shaped desk rows for Analytics (same review fields, no actions).
+    desk_rows: list[dict[str, Any]] = []
+    for s in strategies:
+        dump = s.model_dump(mode="json") if hasattr(s, "model_dump") else dict(s)
+        dump["journal"] = journal_by_sid.get(str(s.strategy_id)) or _empty_strategy_stats(
+            str(s.strategy_id), name=s.name
+        )
+        desk_rows.append(dump)
+    # Prefer journal net when available (authoritative closed fills); else live day PnL.
+    for row in desk_rows:
+        j = row.get("journal") or {}
+        tv = row.get("trade_view") or {}
+        if int(j.get("trades") or 0) > 0 and j.get("net_pnl") is not None:
+            tv = {**tv, "day_pnl": float(j["net_pnl"]), "journal_net_pnl": float(j["net_pnl"])}
+            row["trade_view"] = tv
+            # Keep parent realized aligned with journal for settled baskets.
+            if tv.get("desk_settled"):
+                row["realized_pnl"] = float(j["net_pnl"])
+                row["unrealized_pnl"] = 0.0
     # Total balance = paper bank allocated to strategies on the desk.
     total_balance = round(sum(float(s.starting_cash or 0) for s in strategies), 2)
     # Used capital = qty × entry notionals for trades taken today (open + closed).
@@ -574,6 +654,7 @@ def analytics_board(
         "summary": summary,
         "daily": daily,
         "strategy_rank": strategy_rank or [],
+        "desk_strategies": desk_rows,
         "capital": {
             "total_balance": total_balance,
             "used": used,

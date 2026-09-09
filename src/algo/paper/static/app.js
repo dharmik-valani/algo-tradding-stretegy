@@ -554,78 +554,6 @@ function fillAnalyticsStrategySelect(byStrategy) {
   else if (!current) sel.value = "";
 }
 
-function renderAnalyticsBoard(board) {
-  lastAnalyticsBoard = board;
-  const summary = board?.summary || {};
-  const capital = board?.capital || {};
-  const live = board?.live || {};
-  const net = Number(summary.net_pnl || capital.net_pnl || 0);
-  const balance = capital.total_balance != null ? capital.total_balance : capital.invested;
-  const used = capital.used != null ? capital.used : null;
-  setText("anBalance", moneyOrDash(balance));
-  setText("anUsed", moneyOrDash(used));
-  setText("anNet", moneyOrDash(net), pnlClass(net));
-  setText("anWinRate", pct(summary.win_rate));
-  setText("anPf", summary.profit_factor != null ? String(summary.profit_factor) : "—");
-  setText("anExpectancy", moneyOrDash(summary.expectancy));
-  setText("anAvgWin", moneyOrDash(summary.avg_win));
-  setText("anAvgLoss", moneyOrDash(summary.avg_loss));
-  setText("anAvgTrade", moneyOrDash(summary.avg_trade));
-  setText("anMaxWin", moneyOrDash(summary.largest_win));
-  setText("anMaxLoss", moneyOrDash(summary.largest_loss));
-  setText("anStored", String(summary.trades || 0));
-  setText("anClosedOpen", `${summary.closed || 0} / ${summary.open || 0}`);
-  setText("anWinLoss", `${summary.wins || 0} / ${summary.losses || 0}`);
-  const liveWr = live.win_rate != null ? live.win_rate : (lastAnalytics.overall || {}).win_rate;
-  setText("anLiveWr", pct(liveWr));
-
-  const byStrat = summary.by_strategy || [];
-  const rank = board?.strategy_rank || byStrat;
-  fillAnalyticsStrategySelect(rank);
-  setText("anStratCount", String(byStrat.length));
-  const sbody = $("anStrategyBody");
-  if (sbody) {
-    sbody.innerHTML = byStrat.length
-      ? byStrat
-          .map(
-            (r, i) => `<tr class="an-strat-row">
-          <td data-label="#">${i + 1}</td>
-          <td data-label="Strategy"><strong>${escapeHtml(r.strategy_id)}</strong></td>
-          <td data-label="Trades">${r.trades || 0}</td>
-          <td data-label="Win rate">${pct(r.win_rate)}</td>
-          <td data-label="Avg win" class="pos">${moneyOrDash(r.avg_win)}</td>
-          <td data-label="Avg loss" class="neg">${moneyOrDash(r.avg_loss)}</td>
-          <td data-label="PF">${r.profit_factor != null ? r.profit_factor : "—"}</td>
-          <td data-label="Net PnL" class="${pnlClass(r.net_pnl)}"><strong>₹${money(r.net_pnl || 0)}</strong></td>
-        </tr>`
-          )
-          .join("")
-      : `<tr><td colspan="8" class="empty-cell">No closed trades in this range.</td></tr>`;
-  }
-
-  const days = board?.daily?.days || [];
-  setText("anDayCount", String(days.length));
-  const dbody = $("anDailyBody");
-  if (dbody) {
-    dbody.innerHTML = days.length
-      ? days
-          .map(
-            (d) => `<tr>
-          <td data-label="Date">${d.date}</td>
-          <td data-label="Trades">${d.trades}</td>
-          <td data-label="Closed">${d.closed}</td>
-          <td data-label="Win rate">${pct(d.win_rate)}</td>
-          <td data-label="Avg win" class="pos">${moneyOrDash(d.avg_win)}</td>
-          <td data-label="Avg loss" class="neg">${moneyOrDash(d.avg_loss)}</td>
-          <td data-label="Net PnL" class="${pnlClass(d.net_pnl)}">₹${money(d.net_pnl)}</td>
-          <td data-label="Symbols">${(d.symbols || []).slice(0, 12).join(", ") || "—"}${(d.symbols || []).length > 12 ? "…" : ""}</td>
-        </tr>`
-          )
-          .join("")
-      : `<tr><td colspan="8" class="empty-cell">No daily data yet.</td></tr>`;
-  }
-}
-
 function renderCalendar(cal) {
   if (!cal) return;
   const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
@@ -676,6 +604,355 @@ function renderAnalytics() {
 }
 
 let deskExpanded = new Set();
+let anExpanded = new Set();
+
+function renderAnalyticsDeskRows(strategies) {
+  const sbody = $("anStrategyBody");
+  if (!sbody) return;
+  if (!sbody.dataset.wiredExpand) {
+    sbody.dataset.wiredExpand = "1";
+    sbody.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-an-expand]");
+      if (!btn) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const sid = btn.dataset.anExpand;
+      if (!sid) return;
+      if (anExpanded.has(sid)) anExpanded.delete(sid);
+      else anExpanded.add(sid);
+      if (lastAnalyticsBoard) renderAnalyticsBoard(lastAnalyticsBoard);
+    });
+  }
+  const strats = strategies || [];
+  if (!strats.length) {
+    sbody.innerHTML = `<tr><td colspan="11" class="empty-cell">No strategies on the desk yet.</td></tr>`;
+    return;
+  }
+  const html = strats
+    .map((s) => {
+      const id = s.instance_id || s.strategy_id;
+      const j = s.journal || {};
+      const realized = Number(s.realized_pnl || 0);
+      const unreal = Number(s.unrealized_pnl || 0);
+      const tv = s.trade_view || {};
+      const invested = Number(tv.invested != null ? tv.invested : s.starting_cash) || 0;
+      const journalNet = j.trades > 0 && j.net_pnl != null ? Number(j.net_pnl) : null;
+      const dayPnl = Number(
+        journalNet != null
+          ? journalNet
+          : tv.day_pnl != null
+            ? tv.day_pnl
+            : realized + unreal
+      );
+      const total = tv.desk_settled || journalNet != null ? dayPnl : realized + unreal;
+      const basket = s.basket || [];
+      const isBasket = basket.length > 0 || (s.params?.selected || []).length > 0;
+      const active = basket.filter((l) => l.in_trade);
+      const selected = (s.params?.selected || []).length || basket.length || 0;
+      const inTrade = s.legs_in_trade != null ? s.legs_in_trade : active.length;
+      const posQty = s.position?.quantity || 0;
+      const isOpen = !!(inTrade || (posQty && !isBasket) || tv.in_trade);
+      const settled = !!tv.desk_settled;
+      const lc = tv.last_closed || null;
+      const maxTrades = Math.max(
+        1,
+        Number(tv.max_trades_per_day || s.params?.max_trades_per_day || s.params?.top_n || 10) || 10
+      );
+      const tradesUsed = Math.max(
+        0,
+        Number(
+          j.trades != null
+            ? j.trades
+            : tv.trades_today_count != null
+              ? tv.trades_today_count
+              : basket.filter((l) => l.in_trade || Number(l.trades_today || 0) >= 1).length
+        ) || 0
+      );
+
+      let stocks;
+      let posTitle;
+      let qtyCell;
+      let qtyTitle;
+      if (isBasket) {
+        stocks = `${settled ? 0 : inTrade}<div class="meta pnl-sub">${tradesUsed}/${maxTrades} day</div>`;
+        posTitle = `Open legs · day trades used/max`;
+        const openQtySum = active.reduce((n, l) => n + Math.abs(Number(l.qty) || 0), 0);
+        const doneQtySum = basket
+          .filter((l) => !l.in_trade && Number(l.trades_today || 0) >= 1)
+          .reduce((n, l) => n + Math.abs(Number(l.qty) || Number(l.filled_qty) || 0), 0);
+        qtyCell = openQtySum > 0 ? String(openQtySum) : doneQtySum > 0 ? String(doneQtySum) : "—";
+        qtyTitle = "Sum of share qty on open/closed legs";
+      } else {
+        stocks = isOpen ? "1" : "0";
+        posTitle = "Open trade count";
+        const q =
+          Math.abs(posQty) ||
+          (isOpen ? Number(s.quantity) || 0 : 0) ||
+          Number(tv.qty) ||
+          (lc && lc.quantity ? Number(lc.quantity) : 0) ||
+          0;
+        qtyCell = q > 0 ? String(q) : "—";
+        qtyTitle = "Position qty";
+      }
+
+      let market = "—";
+      let entry = "—";
+      let exitPx = "—";
+      let sl = "—";
+      let tp = "—";
+      let levelsHint = settled ? "settled day" : "no open trade";
+      let entryAt = null;
+      let exitAt = null;
+
+      if (settled && isBasket) {
+        const doneLegs = basket.filter(
+          (l) => Number(l.trades_today || 0) >= 1 || l.exit != null || l.entry != null
+        );
+        if (doneLegs.length === 1) {
+          const d0 = doneLegs[0];
+          market = d0.last != null ? money(d0.last) : d0.exit != null ? money(d0.exit) : "—";
+          entry = d0.entry != null ? money(d0.entry) : "—";
+          exitPx = d0.exit != null ? money(d0.exit) : "—";
+          sl = d0.stop != null ? money(d0.stop) : "—";
+          tp = d0.target != null ? money(d0.target) : "—";
+          levelsHint = "settled";
+          entryAt = d0.entry_at || null;
+          exitAt = d0.exit_at || null;
+        } else if (doneLegs.length > 1) {
+          market = `${doneLegs.length} done`;
+          entry = "multi";
+          exitPx = "multi";
+          sl = "multi";
+          tp = "multi";
+          levelsHint = "settled · expand for legs";
+        } else {
+          levelsHint = "settled · no fills";
+        }
+      } else if (settled && !isBasket && lc && (lc.exit != null || lc.entry != null)) {
+        market = s.last_price != null ? money(s.last_price) : lc.exit != null ? money(lc.exit) : "—";
+        entry = lc.entry != null ? money(lc.entry) : "—";
+        exitPx = lc.exit != null ? money(lc.exit) : "—";
+        sl = lc.stop != null ? money(lc.stop) : s.stop_price != null ? money(s.stop_price) : "—";
+        tp = lc.target != null ? money(lc.target) : s.target_price != null ? money(s.target_price) : "—";
+        levelsHint = "settled";
+        entryAt = lc.entry_at || tv.entry_at || null;
+        exitAt = lc.exit_at || tv.exit_at || null;
+      } else if (isBasket) {
+        if (active.length === 1) {
+          market = money(active[0].last);
+          entry =
+            active[0].entry != null
+              ? money(active[0].entry)
+              : active[0].avg != null
+                ? money(active[0].avg)
+                : "—";
+          exitPx = "—";
+          sl = active[0].stop != null ? money(active[0].stop) : "—";
+          tp = active[0].target != null ? money(active[0].target) : "—";
+          levelsHint = "open";
+          entryAt = active[0].entry_at || null;
+        } else if (active.length > 1) {
+          market = `${active.length} open`;
+          entry = "multi";
+          exitPx = "—";
+          sl = "multi";
+          tp = "multi";
+          levelsHint = "open · expand for legs";
+        } else if (lc && (lc.exit != null || lc.entry != null)) {
+          market = "—";
+          entry = lc.entry != null ? money(lc.entry) : "—";
+          exitPx = lc.exit != null ? money(lc.exit) : "—";
+          sl = lc.stop != null ? money(lc.stop) : s.stop_price != null ? money(s.stop_price) : "—";
+          tp = lc.target != null ? money(lc.target) : s.target_price != null ? money(s.target_price) : "—";
+          levelsHint = "last exit";
+          entryAt = lc.entry_at || tv.entry_at || null;
+          exitAt = lc.exit_at || tv.exit_at || null;
+        }
+      } else if (isOpen && s.entry_price != null) {
+        market = s.last_price != null ? money(s.last_price) : "—";
+        entry = money(s.entry_price);
+        exitPx = "—";
+        sl = s.stop_price != null ? money(s.stop_price) : "—";
+        tp = s.target_price != null ? money(s.target_price) : "—";
+        levelsHint = "open";
+        entryAt = tv.entry_at || null;
+      } else if (lc && (lc.exit != null || lc.entry != null)) {
+        market = s.last_price != null ? money(s.last_price) : "—";
+        entry = lc.entry != null ? money(lc.entry) : s.entry_price != null ? money(s.entry_price) : "—";
+        exitPx = lc.exit != null ? money(lc.exit) : "—";
+        sl = lc.stop != null ? money(lc.stop) : s.stop_price != null ? money(s.stop_price) : "—";
+        tp = lc.target != null ? money(lc.target) : s.target_price != null ? money(s.target_price) : "—";
+        levelsHint = "last exit";
+        entryAt = lc.entry_at || tv.entry_at || null;
+        exitAt = lc.exit_at || tv.exit_at || null;
+      }
+
+      const pnlSub =
+        journalNet != null
+          ? `journal · ${j.trades || 0} closed`
+          : settled
+            ? `settled day`
+            : Math.abs(unreal) > 1e-9
+              ? `R ${money(realized)} · U ${money(unreal)}`
+              : Math.abs(realized) > 1e-9
+                ? `realized`
+                : `flat`;
+      const nameSub = escapeHtml(
+        [s.params?.option_type, s.timeframe, isBasket ? "basket" : s.instrument]
+          .filter(Boolean)
+          .join(" · ")
+      );
+      const status = s.enabled ? "run" : "paused";
+      if (isBasket && basket.length > 0 && (inTrade > 0 || selected > 0 || settled) && !anExpanded.has(`seen:${id}`)) {
+        anExpanded.add(id);
+        anExpanded.add(`seen:${id}`);
+      }
+      const expanded = anExpanded.has(id);
+      const canExpand = isBasket && basket.length > 0;
+      const expandBtn = canExpand
+        ? `<button type="button" class="desk-expand" data-an-expand="${escapeHtml(id)}" aria-expanded="${expanded}" title="${expanded ? "Collapse legs" : "Expand legs"}">${expanded ? "▼" : "▶"}</button>`
+        : "";
+
+      const parent = `
+      <tr class="desk-row ${s.enabled ? "is-run" : "is-paused"} ${isOpen ? "has-open" : "is-flat"} ${expanded ? "is-expanded" : ""}" data-an-id="${escapeHtml(id)}">
+        <td data-label="Strategy" class="col-strategy">
+          <div class="row-title">
+            ${expandBtn}
+            <span class="badge ${s.enabled ? "on" : ""}">${status}</span>
+            <span class="strat-name">${escapeHtml(s.name || s.strategy_id)}</span>
+          </div>
+          <div class="meta">${nameSub}${canExpand ? ` · max ${maxTrades}/day` : " · 1 trade/day"}</div>
+        </td>
+        <td data-label="Capital" class="mono">${capitalCell(
+          invested,
+          Number(
+            tv.deployed_day != null
+              ? tv.deployed_day
+              : tv.deployed != null
+                ? tv.deployed
+                : tv.notional || 0
+          ) || 0,
+          { usedLabel: isOpen ? "in use" : "used" }
+        )}</td>
+        <td data-label="PnL" class="mono ${pnlClass(total)}" title="Day / journal PnL · ₹${money(total)}">
+          <div>₹${moneyShort(total)}</div>
+          <div class="meta pnl-sub">${escapeHtml(pnlSub)}</div>
+        </td>
+        <td data-label="Market" class="mono">${market}</td>
+        <td data-label="Entry" class="mono">${levelCell(entry, levelsHint === "open" ? "" : levelsHint, entryAt)}</td>
+        <td data-label="Exit" class="mono">${levelCell(exitPx, levelsHint === "last exit" ? "last exit" : isOpen ? "open" : "", exitAt)}</td>
+        <td data-label="Open" class="mono" title="${escapeHtml(posTitle)}">${stocks}</td>
+        <td data-label="Qty" class="mono" title="${escapeHtml(qtyTitle)}">${qtyCell}</td>
+        <td data-label="Stop" class="mono">${sl}</td>
+        <td data-label="Target" class="mono">${tp}</td>
+        <td data-label="Win" class="mono">${winCell(j)}</td>
+      </tr>`;
+
+      if (!canExpand || !expanded) return parent;
+
+      const childRows = basket
+        .map((leg) => {
+          const legOpen = !!leg.in_trade;
+          const legUsed = Number(leg.notional != null ? leg.notional : leg.deployed) || 0;
+          const legPnl = Number(leg.leg_pnl != null ? leg.leg_pnl : (legOpen ? leg.unrealized : leg.realized) || 0);
+          const legMarket = leg.last != null ? money(leg.last) : "—";
+          const legEntry =
+            leg.entry != null ? money(leg.entry) : legOpen && leg.avg != null ? money(leg.avg) : "—";
+          const legExit = !legOpen && leg.exit != null ? money(leg.exit) : "—";
+          const legSl = leg.stop != null ? money(leg.stop) : "—";
+          const legTp = leg.target != null ? money(leg.target) : "—";
+          const legQty = Math.abs(Number(leg.qty) || Number(leg.filled_qty) || Number(leg.planned_qty) || 0);
+          const tradedToday = Number(leg.trades_today || 0) >= 1;
+          const legWin =
+            leg.leg_win === true ? "W" : leg.leg_win === false ? "L" : tradedToday ? "—" : "—";
+          return `
+        <tr class="desk-leg-row" data-an-parent="${escapeHtml(id)}">
+          <td data-label="Strategy" class="col-strategy">
+            <div class="row-title"><span class="strat-name">${escapeHtml(leg.symbol || "—")}</span></div>
+            <div class="meta">${legOpen ? "open" : tradedToday ? "done · settled" : "waiting"} · ${escapeHtml(leg.side || "")}</div>
+          </td>
+          <td data-label="Capital" class="mono">${capitalCell(0, legUsed, { usedLabel: legOpen ? "in use" : "used" })}</td>
+          <td data-label="PnL" class="mono ${pnlClass(legPnl)}">₹${moneyShort(legPnl)}</td>
+          <td data-label="Market" class="mono">${legMarket}</td>
+          <td data-label="Entry" class="mono">${levelCell(legEntry, "", leg.entry_at)}</td>
+          <td data-label="Exit" class="mono">${levelCell(legExit, "", leg.exit_at)}</td>
+          <td data-label="Open" class="mono">${legOpen ? "1" : "0"}</td>
+          <td data-label="Qty" class="mono">${legQty > 0 ? String(legQty) : "—"}</td>
+          <td data-label="Stop" class="mono">${legSl}</td>
+          <td data-label="Target" class="mono">${legTp}</td>
+          <td data-label="Win" class="mono">${legWin}</td>
+        </tr>`;
+        })
+        .join("");
+      return parent + childRows;
+    })
+    .join("");
+  sbody.innerHTML = html;
+}
+
+function renderAnalyticsBoard(board) {
+  lastAnalyticsBoard = board;
+  const summary = board?.summary || {};
+  const capital = board?.capital || {};
+  const live = board?.live || {};
+  const net = Number(summary.net_pnl || capital.net_pnl || 0);
+  const balance = capital.total_balance != null ? capital.total_balance : capital.invested;
+  const used = capital.used != null ? capital.used : null;
+  setText("anBalance", moneyOrDash(balance));
+  setText("anUsed", moneyOrDash(used));
+  setText("anNet", moneyOrDash(net), pnlClass(net));
+  setText("anWinRate", pct(summary.win_rate));
+  setText("anPf", summary.profit_factor != null ? String(summary.profit_factor) : "—");
+  setText("anExpectancy", moneyOrDash(summary.expectancy));
+  setText("anAvgWin", moneyOrDash(summary.avg_win));
+  setText("anAvgLoss", moneyOrDash(summary.avg_loss));
+  setText("anAvgTrade", moneyOrDash(summary.avg_trade));
+  setText("anMaxWin", moneyOrDash(summary.largest_win));
+  setText("anMaxLoss", moneyOrDash(summary.largest_loss));
+  setText("anStored", String(summary.trades || 0));
+  setText("anClosedOpen", `${summary.closed || 0} / ${summary.open || 0}`);
+  setText("anWinLoss", `${summary.wins || 0} / ${summary.losses || 0}`);
+  const liveWr = live.win_rate != null ? live.win_rate : (lastAnalytics.overall || {}).win_rate;
+  setText("anLiveWr", pct(liveWr));
+
+  const byStrat = summary.by_strategy || [];
+  const rank = board?.strategy_rank || byStrat;
+  fillAnalyticsStrategySelect(rank);
+  const desk = board?.desk_strategies || [];
+  setText("anStratCount", String(desk.length || byStrat.length));
+  renderAnalyticsDeskRows(desk.length ? desk : byStrat.map((r) => ({
+    strategy_id: r.strategy_id,
+    name: r.name || r.strategy_id,
+    journal: r,
+    trade_view: { day_pnl: r.net_pnl, desk_settled: true, deployed_day: 0 },
+    realized_pnl: r.net_pnl || 0,
+    unrealized_pnl: 0,
+    basket: [],
+    params: {},
+  })));
+
+  const days = board?.daily?.days || [];
+  setText("anDayCount", String(days.length));
+  const dbody = $("anDailyBody");
+  if (dbody) {
+    dbody.innerHTML = days.length
+      ? days
+          .map(
+            (d) => `<tr>
+          <td data-label="Date">${d.date}</td>
+          <td data-label="Trades">${d.trades}</td>
+          <td data-label="Closed">${d.closed}</td>
+          <td data-label="Win rate">${pct(d.win_rate)}</td>
+          <td data-label="Avg win" class="pos">${moneyOrDash(d.avg_win)}</td>
+          <td data-label="Avg loss" class="neg">${moneyOrDash(d.avg_loss)}</td>
+          <td data-label="Net PnL" class="${pnlClass(d.net_pnl)}">₹${money(d.net_pnl)}</td>
+          <td data-label="Symbols">${(d.symbols || []).slice(0, 12).join(", ") || "—"}${(d.symbols || []).length > 12 ? "…" : ""}</td>
+        </tr>`
+          )
+          .join("")
+      : `<tr><td colspan="8" class="empty-cell">No daily data yet.</td></tr>`;
+  }
+}
 
 function renderExecStats(session) {
   const root = $("execDeskList");

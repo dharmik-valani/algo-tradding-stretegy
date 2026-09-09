@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=desk41" />
+  <link rel="stylesheet" href="/static/styles.css?v=desk42" />
 </head>
 <body>
   <div class="app">
@@ -114,25 +114,28 @@
 
         <div class="panel compact-panel">
           <div class="panel-head">
-            <h2>Strategy-wise (top → down)</h2>
+            <h2>Strategy-wise (desk review)</h2>
             <span class="count-pill" id="anStratCount">0</span>
           </div>
           <div class="table-wrap">
-            <table class="data-table dense cards-on-mobile">
+            <table class="data-table dense cards-on-mobile desk-table">
               <thead>
                 <tr>
-                  <th>#</th>
                   <th>Strategy</th>
-                  <th>Trades</th>
-                  <th>Win rate</th>
-                  <th>Avg win</th>
-                  <th>Avg loss</th>
-                  <th>PF</th>
-                  <th>Net PnL</th>
+                  <th>Capital</th>
+                  <th>PnL</th>
+                  <th>Market</th>
+                  <th>Entry</th>
+                  <th>Exit</th>
+                  <th>Open</th>
+                  <th>Qty</th>
+                  <th>Stop</th>
+                  <th>Target</th>
+                  <th>Win</th>
                 </tr>
               </thead>
               <tbody id="anStrategyBody">
-                <tr><td colspan="8" class="empty-cell">No closed trades in this range.</td></tr>
+                <tr><td colspan="11" class="empty-cell">No strategies on the desk yet.</td></tr>
               </tbody>
             </table>
           </div>
@@ -537,6 +540,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=desk41"></script>
+  <script src="/static/app.js?v=desk42"></script>
 </body>
 </html>

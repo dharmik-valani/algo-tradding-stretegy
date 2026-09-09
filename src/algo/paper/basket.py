@@ -83,6 +83,28 @@ class BasketRunner:
                 n += 1
         return n
 
+    def closed_pnl_total(self) -> float:
+        """Authoritative day PnL = sum of closed paper fills (not a frozen settle snapshot)."""
+        total = 0.0
+        for b in self.brokers.values():
+            for t in getattr(b, "closed_trades", []) or []:
+                try:
+                    total += float(t.get("pnl") or 0)
+                except (TypeError, ValueError):
+                    pass
+        if abs(total) < 1e-12:
+            # Fallback: leg snapshots (post-settle review fields).
+            for leg in (getattr(self.strategy, "_legs", {}) or {}).values():
+                if not isinstance(leg, dict):
+                    continue
+                if int(leg.get("trades_today") or 0) < 1 and leg.get("exit") is None:
+                    continue
+                try:
+                    total += float(leg.get("leg_pnl") or 0)
+                except (TypeError, ValueError):
+                    pass
+        return round(total, 6)
+
     def _leg_status(self, symbol: str, leg: dict[str, Any], last: float | None) -> str:
         """Human-readable why a selected name is / isn't in a trade."""
         if leg.get("in_trade"):
@@ -298,7 +320,14 @@ class BasketRunner:
             quantity=sum(abs(b.position.quantity) for b in self.brokers.values()),
             avg_price=0.0,
         )
-        day_realized = float(self._day_pnl or 0) if self._desk_settled else float(realized)
+        day_realized = (
+            self.closed_pnl_total()
+            if self._desk_settled
+            else float(realized + unreal)
+        )
+        if self._desk_settled:
+            # Keep locked day figure in sync with closed fills (fixes stale settle snapshot).
+            self._day_pnl = float(day_realized)
         st = StrategyState(
             strategy_id=self.strategy.id,
             instance_id=self.instance_id,
@@ -363,7 +392,7 @@ class BasketRunner:
         for b in self.brokers.values():
             closed_all.extend(getattr(b, "closed_trades", []) or [])
         last_closed = closed_all[-1] if closed_all else None
-        live_day = day_realized if self._desk_settled else float(realized + unreal)
+        live_day = float(day_realized)
         deployed_open = round(
             sum(float(x.get("notional") or 0) for x in legs if x.get("in_trade")),
             2,
@@ -765,6 +794,8 @@ class BasketRunner:
             if missing or not getattr(self, "_settled_review_restored", False):
                 try:
                     self.restore_today_from_journal()
+                    if self._desk_settled:
+                        self._day_pnl = self.closed_pnl_total()
                     self._settled_review_restored = True
                 except Exception:
                     pass
@@ -816,7 +847,12 @@ class BasketRunner:
         if self._desk_settled:
             return
         realized = sum(b.realized_pnl for b in self.brokers.values())
-        self._day_pnl = float(realized)
+        # Prefer sum of closed fills — broker.realized can drift vs journal after partials/restores.
+        from_fills = 0.0
+        for b in self.brokers.values():
+            for t in getattr(b, "closed_trades", []) or []:
+                from_fills += float(t.get("pnl") or 0)
+        self._day_pnl = float(from_fills if abs(from_fills) > 1e-9 else realized)
         # Snapshot closed trades + leg review fields before refreshing brokers.
         preserved: dict[str, list[dict]] = {}
         for sym, b in self.brokers.items():

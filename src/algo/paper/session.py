@@ -125,6 +125,8 @@ class StrategyRunner:
         self.mark_price: float | None = None
         self._forming_bar: Bar | None = None
         self._desk_day = datetime.now(IST).date()
+        self.journal_session_id: str | None = None
+        self.open_trade_id: str | None = None
 
     def state(self) -> StrategyState:
         last = self.mark_price
@@ -312,7 +314,8 @@ class StrategyRunner:
         meta = signal.meta or {}
         if signal.action is SignalAction.BUY and pos_qty <= 0:
             qty = self.quantity + abs(min(pos_qty, 0))
-            self.broker.submit_market(
+            before = self.broker.realized_pnl
+            order = self.broker.submit_market(
                 strategy_id=self.strategy.id,
                 instrument_id=self.instrument_id,
                 symbol=self.symbol,
@@ -321,15 +324,34 @@ class StrategyRunner:
                 last_price=fill_px,
                 ts=bar.timestamp,
             )
-            if pos_qty < 0:
+            if order.status.value == "FILLED" and pos_qty < 0:
                 self.broker.annotate_last_closed(
                     stop=meta.get("sl") or meta.get("stop"),
                     target=meta.get("tp") or meta.get("target"),
                 )
+                self._journal_close(
+                    side="SHORT",
+                    qty=abs(pos_qty),
+                    exit_price=float(order.fill_price or fill_px),
+                    ts=bar.timestamp,
+                    pnl=self.broker.realized_pnl - before,
+                    reason=signal.reason,
+                    meta=meta,
+                )
+            elif order.status.value == "FILLED" and pos_qty == 0:
+                self._journal_open(
+                    side="LONG",
+                    qty=self.quantity,
+                    entry_price=float(order.fill_price or fill_px),
+                    ts=bar.timestamp,
+                    reason=signal.reason,
+                    meta=meta,
+                )
         elif signal.action is SignalAction.SELL and pos_qty >= 0:
             qty = self.quantity + max(pos_qty, 0)
             if qty > 0:
-                self.broker.submit_market(
+                before = self.broker.realized_pnl
+                order = self.broker.submit_market(
                     strategy_id=self.strategy.id,
                     instrument_id=self.instrument_id,
                     symbol=self.symbol,
@@ -338,14 +360,33 @@ class StrategyRunner:
                     last_price=fill_px,
                     ts=bar.timestamp,
                 )
-                if pos_qty > 0:
+                if order.status.value == "FILLED" and pos_qty > 0:
                     self.broker.annotate_last_closed(
                         stop=meta.get("sl") or meta.get("stop"),
                         target=meta.get("tp") or meta.get("target"),
                     )
+                    self._journal_close(
+                        side="LONG",
+                        qty=abs(pos_qty),
+                        exit_price=float(order.fill_price or fill_px),
+                        ts=bar.timestamp,
+                        pnl=self.broker.realized_pnl - before,
+                        reason=signal.reason,
+                        meta=meta,
+                    )
+                elif order.status.value == "FILLED" and pos_qty == 0:
+                    self._journal_open(
+                        side="SHORT",
+                        qty=self.quantity,
+                        entry_price=float(order.fill_price or fill_px),
+                        ts=bar.timestamp,
+                        reason=signal.reason,
+                        meta=meta,
+                    )
         elif signal.action is SignalAction.FLAT and pos_qty != 0:
             side = Side.SELL if pos_qty > 0 else Side.BUY
-            self.broker.submit_market(
+            before = self.broker.realized_pnl
+            order = self.broker.submit_market(
                 strategy_id=self.strategy.id,
                 instrument_id=self.instrument_id,
                 symbol=self.symbol,
@@ -359,6 +400,83 @@ class StrategyRunner:
                 target=meta.get("tp") or meta.get("target"),
                 quantity=abs(pos_qty),
             )
+            if order.status.value == "FILLED":
+                self._journal_close(
+                    side="LONG" if pos_qty > 0 else "SHORT",
+                    qty=abs(pos_qty),
+                    exit_price=float(order.fill_price or fill_px),
+                    ts=bar.timestamp,
+                    pnl=self.broker.realized_pnl - before,
+                    reason=signal.reason,
+                    meta=meta,
+                )
+
+    def _journal_open(
+        self,
+        *,
+        side: str,
+        qty: int,
+        entry_price: float,
+        ts: datetime,
+        reason: str,
+        meta: dict[str, Any],
+    ) -> None:
+        if not self.journal_session_id:
+            return
+        from algo.paper.journal import open_trade
+
+        try:
+            tid = open_trade(
+                session_id=self.journal_session_id,
+                strategy_id=self.strategy.id,
+                instance_id=self.instance_id,
+                symbol=self.symbol,
+                side=side,
+                quantity=qty,
+                entry_price=entry_price,
+                stop_price=meta.get("sl") or meta.get("stop"),
+                target_price=meta.get("tp") or meta.get("target"),
+                entry_at=ts,
+                reason=reason,
+                meta={**meta, "qty": qty},
+            )
+            self.open_trade_id = tid
+        except Exception as exc:
+            self._log(f"journal open failed: {exc}")
+
+    def _journal_close(
+        self,
+        *,
+        side: str,
+        qty: int,
+        exit_price: float,
+        ts: datetime,
+        pnl: float,
+        reason: str,
+        meta: dict[str, Any],
+    ) -> None:
+        if not self.journal_session_id:
+            return
+        from algo.paper.journal import close_trade
+
+        try:
+            close_trade(
+                trade_id=self.open_trade_id,
+                session_id=self.journal_session_id,
+                strategy_id=self.strategy.id,
+                instance_id=self.instance_id,
+                symbol=self.symbol,
+                side=side,
+                quantity=qty,
+                exit_price=exit_price,
+                exit_at=ts,
+                realized_pnl=pnl,
+                reason=reason,
+                meta=meta,
+            )
+        except Exception as exc:
+            self._log(f"journal close failed: {exc}")
+        self.open_trade_id = None
 
     def _log(self, message: str) -> None:
         self.logs.append(message)
@@ -477,6 +595,7 @@ class PaperSession:
                 starting_cash=starting_cash,
                 asset_kind=kind,
             )
+            runner.journal_session_id = self.journal_session_id
             runner.enabled = enabled
             self.runners[key] = runner
             self.message = f"Added {strategy.name} ({key})"
@@ -1032,8 +1151,7 @@ class PaperSession:
         self.started_at = utcnow()
         self.journal_session_id = start_journal_session(mode="replay", message="Paper replay")
         for r in self.runners.values():
-            if isinstance(r, BasketRunner):
-                r.journal_session_id = self.journal_session_id
+            r.journal_session_id = self.journal_session_id
         self._stop.clear()
         self.message = "Replay running on historical candles…"
         self._thread = threading.Thread(target=self._run_replay, args=(max_bars,), daemon=True)
@@ -1065,8 +1183,7 @@ class PaperSession:
         self.started_at = utcnow()
         self.journal_session_id = start_journal_session(mode="live", message="Paper live")
         for r in self.runners.values():
-            if isinstance(r, BasketRunner):
-                r.journal_session_id = self.journal_session_id
+            r.journal_session_id = self.journal_session_id
         self._stop.clear()
         if self._quotes is not None:
             try:
@@ -1388,8 +1505,8 @@ class PaperSession:
                 runners = list(self.runners.values())
             quotes = LiveQuoteProvider(self.settings, enable_dhan_feed=False)
             for runner in runners:
+                runner.journal_session_id = self.journal_session_id
                 if isinstance(runner, BasketRunner):
-                    runner.journal_session_id = self.journal_session_id
                     self.message = f"Replay basket {runner.strategy.name}…"
                     runner.run_replay(quotes, max_bars=max_bars or 400)
                     self.updated_at = utcnow()
@@ -1503,8 +1620,8 @@ class PaperSession:
                     if not runner.enabled:
                         continue
                     try:
+                        runner.journal_session_id = self.journal_session_id
                         if isinstance(runner, BasketRunner):
-                            runner.journal_session_id = self.journal_session_id
                             # Selection already done above; tick marks only.
                             labels.extend(runner.tick_live(quotes, skip_selection=True))
                             src = f"{quotes.feed_status}|{self._feed_phase}"
