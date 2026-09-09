@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import datetime, time as time_cls
+from datetime import date, datetime, time as time_cls
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -328,6 +328,10 @@ class PaperSession:
         }
         self._signals_installed = False
         self._runtime_tick = 0
+        # REST→WS feed policy: seed once per selected set, re-seed if coverage drops.
+        self._rest_seeded_day: date | None = None
+        self._rest_seeded_syms: frozenset[str] = frozenset()
+        self._feed_phase: str = "idle"  # idle | rest_ok | ws_live
 
     def available_strategies(self) -> list[dict]:
         return list_strategies()
@@ -1009,9 +1013,12 @@ class PaperSession:
             except Exception:
                 pass
         self._quotes = LiveQuoteProvider(self.settings)
+        self._rest_seeded_day = None
+        self._rest_seeded_syms = frozenset()
+        self._feed_phase = "idle"
         try:
-            # Let the websocket connect before the first poll hammers REST LTP.
-            self._quotes.wait_for_ws(timeout=8.0)
+            # Policy: REST verify/seed first, then soft-start WS for live stream.
+            probe = ["NIFTY", "RELIANCE"]
             with self._lock:
                 boot_syms: list[str] = []
                 for r in self.runners.values():
@@ -1021,15 +1028,23 @@ class PaperSession:
                         boot_syms.extend(r.selected or [])
                     else:
                         boot_syms.append(getattr(r, "symbol", "") or "")
-            if boot_syms:
-                self._quotes.ensure_subscribed(boot_syms)
-                # Seed marks via WS; one REST batch only if WS is empty (boot only).
-                self._quotes.prefetch_ltps(boot_syms, wait_ws_sec=4.0, allow_rest=True)
+            seed_list = list(dict.fromkeys([*probe, *[s for s in boot_syms if s]]))
+            seeded = self._quotes.seed_ltps_rest_first(seed_list, wait_ws_sec=2.0)
+            self._feed_phase = "rest_ok" if seeded else "idle"
+            if seeded:
+                self._rest_seeded_day = datetime.now(IST).date()
+                self._rest_seeded_syms = frozenset(seeded)
+            # Soft WS wait — do not treat socket-up alone as success.
+            self._quotes.wait_for_ws(timeout=5.0)
+            if seed_list and self._quotes.mark_coverage(seed_list) >= 0.5:
+                self._feed_phase = "ws_live"
         except Exception:
             pass
         feed = self._quotes.feed_status
+        seeded_n = len(self._rest_seeded_syms)
         self.message = (
-            f"Live paper via {feed} · poll {poll_seconds:.0f}s — virtual fills only (no Dhan orders)"
+            f"Live paper REST→WS ({self._feed_phase}, seeded {seeded_n}) via {feed} · "
+            f"poll {poll_seconds:.0f}s — virtual fills only (no Dhan orders)"
         )
         self._thread = threading.Thread(target=self._run_live, daemon=True)
         self._thread.start()
@@ -1244,6 +1259,20 @@ class PaperSession:
             self.running = False
             self.updated_at = utcnow()
 
+    def _collect_want_syms(self, runners: list[Any]) -> list[str]:
+        want_syms: list[str] = []
+        for runner in runners:
+            if not runner.enabled:
+                continue
+            if isinstance(runner, BasketRunner):
+                want_syms.extend(runner.selected or [])
+                for sym, broker in runner.brokers.items():
+                    if broker.position.quantity:
+                        want_syms.append(sym)
+            else:
+                want_syms.append(getattr(runner, "symbol", "") or "")
+        return [s for s in dict.fromkeys(want_syms) if s]
+
     def _run_live(self) -> None:
         try:
             while not self._stop.is_set():
@@ -1252,48 +1281,63 @@ class PaperSession:
                     break
                 with self._lock:
                     runners = list(self.runners.values())
-                # Subscribe only active trade legs (selected / open), not the full scan universe.
-                want_syms: list[str] = []
+
+                # 1) REST scan / selection first (may pick new basket names).
                 for runner in runners:
-                    if not runner.enabled:
+                    if not runner.enabled or not isinstance(runner, BasketRunner):
                         continue
-                    if isinstance(runner, BasketRunner):
-                        want_syms.extend(runner.selected or [])
-                        for sym, broker in runner.brokers.items():
-                            if broker.position.quantity:
-                                want_syms.append(sym)
-                    else:
-                        want_syms.append(getattr(runner, "symbol", "") or "")
-                want_syms = [s for s in dict.fromkeys(want_syms) if s]
-                try:
-                    # Replace want-set (not additive) so scan universe is dropped after pick.
-                    quotes.set_subscriptions(want_syms)
-                    ws_down = bool(
-                        quotes._ws is not None
-                        and (quotes._ws.rate_limited() or not quotes._ws.connected)
+                    try:
+                        runner.journal_session_id = self.journal_session_id
+                        runner._maybe_roll_trading_day()
+                        runner.ensure_selection(quotes)
+                    except Exception:
+                        pass
+
+                # 2) Rebuild want-set from selected + open legs only.
+                want_syms = self._collect_want_syms(runners)
+                today = datetime.now(IST).date()
+                want_key = frozenset(want_syms)
+                coverage = quotes.mark_coverage(want_syms) if want_syms else 1.0
+                ws_down = bool(
+                    quotes._ws is not None
+                    and (quotes._ws.rate_limited() or not quotes._ws.connected)
+                )
+                need_rest_seed = bool(want_syms) and (
+                    self._rest_seeded_day != today
+                    or want_key != self._rest_seeded_syms
+                    or (
+                        (coverage < 0.75 or ws_down)
+                        and (self._runtime_tick == 0 or self._runtime_tick % 3 == 0)
                     )
-                    if ws_down:
-                        # Slow REST refresh so SL/TP aren't stuck on frozen marks.
-                        # At most 12 symbols / poll; Quote API ≤1/s via client limiter.
-                        if self._runtime_tick % 3 == 0:
-                            quotes.prefetch_ltps(
-                                want_syms[:12], wait_ws_sec=0.0, allow_rest=True
-                            )
-                    else:
-                        quotes.prefetch_ltps(want_syms, wait_ws_sec=1.5, allow_rest=False)
-                        # Dhan WS can stay "connected" with only index/option ticks — equity
-                        # baskets then starve. Fill missing marks via REST every other poll.
-                        if self._runtime_tick % 2 == 0:
-                            quotes.prefetch_ltps(
-                                want_syms, wait_ws_sec=0.0, allow_rest=True
-                            )
+                )
+
+                try:
+                    if need_rest_seed and want_syms:
+                        # 3) REST LTP first (verify + seed), then subscribe WS.
+                        seeded = quotes.seed_ltps_rest_first(
+                            want_syms, wait_ws_sec=1.0 if not ws_down else 0.0
+                        )
+                        if seeded:
+                            self._rest_seeded_day = today
+                            self._rest_seeded_syms = frozenset(want_syms)
+                            self._feed_phase = "rest_ok"
+                            coverage = quotes.mark_coverage(want_syms)
+                    elif want_syms:
+                        # Already seeded — WS-only warm (no REST unless coverage falls).
+                        quotes.set_subscriptions(want_syms)
+                        quotes.prefetch_ltps(
+                            want_syms, wait_ws_sec=0.8, allow_rest=False
+                        )
+                    if want_syms and coverage >= 0.75 and not ws_down:
+                        self._feed_phase = "ws_live"
                 except Exception:
                     pass
+
                 # Adaptive cadence: more active symbols → slower poll (Dhan-safe).
                 sleep_for = suggested_poll_seconds(
                     len(want_syms), base=float(self.poll_seconds or 15.0)
                 )
-                src = quotes.feed_status
+                src = f"{quotes.feed_status}|{self._feed_phase}"
                 labels: list[str] = []
                 errors: list[str] = []
                 for runner in runners:
@@ -1302,8 +1346,9 @@ class PaperSession:
                     try:
                         if isinstance(runner, BasketRunner):
                             runner.journal_session_id = self.journal_session_id
-                            labels.extend(runner.tick_live(quotes))
-                            src = quotes.feed_status
+                            # Selection already done above; tick marks only.
+                            labels.extend(runner.tick_live(quotes, skip_selection=True))
+                            src = f"{quotes.feed_status}|{self._feed_phase}"
                         elif runner.strategy.id == "zen_credit_spread":
                             bar = self._live_zen_bar(runner)
                             runner.on_bar(bar)
@@ -1313,7 +1358,7 @@ class PaperSession:
                                 f"ZEN {runner.symbol} {a}"
                                 + (f" mark={mark:.1f}" if mark is not None else f" spot={bar.close:.1f}")
                             )
-                            src = quotes.feed_status
+                            src = f"{quotes.feed_status}|{self._feed_phase}"
                         elif runner.asset_kind == "option":
                             p = runner.strategy.params
                             bar, st = quotes.option_premium_bar(
@@ -1330,7 +1375,7 @@ class PaperSession:
                             labels.append(
                                 f"{runner.symbol}{p.get('option_type', 'CE')}@{int(st.get('strike', 0))}={bar.close:.1f}"
                             )
-                            src = quotes.feed_status
+                            src = f"{quotes.feed_status}|{self._feed_phase}"
                         else:
                             price, ts, used = quotes.get_ltp(
                                 runner.symbol, allow_rest=False, wait_ws_sec=0.5, max_stale_sec=180
@@ -1361,7 +1406,7 @@ class PaperSession:
                 elif errors:
                     # Soft degrade — keep last marks; short WS cool must not freeze the desk.
                     self.message = (
-                        f"Live paper holding last marks ({quotes.feed_status}) — {errors[0]}"
+                        f"Live paper holding last marks ({quotes.feed_status}|{self._feed_phase}) — {errors[0]}"
                     )
                 self._runtime_tick += 1
                 # Checkpoint often so a crash/laptop sleep can resume open trades.

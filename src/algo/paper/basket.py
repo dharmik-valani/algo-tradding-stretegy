@@ -310,8 +310,14 @@ class BasketRunner:
             )
         self._log(
             f"Selected {len(self.selected)}: {', '.join(self.selected) or 'none'} "
-            f"(from {len(snaps)} scanned) — WS will track selected only"
+            f"(from {len(snaps)} scanned) — REST seed then WS selected only"
         )
+        # Immediately REST-seed selected LTPs so the same poll can trade / show marks.
+        try:
+            seeded = quotes.seed_ltps_rest_first(self.selected, wait_ws_sec=1.0)
+            self._log(f"REST-seeded {len(seeded)}/{len(self.selected)} selected LTPs")
+        except Exception as exc:
+            self._log(f"REST seed after scan failed: {exc}")
 
     def _seed_opening_ranges(self, quotes: LiveQuoteProvider, params: dict[str, Any]) -> None:
         """Backfill 09:15→now range highs/lows so a 09:18 scan still gets a full first candle."""
@@ -379,20 +385,23 @@ class BasketRunner:
         )
         self._apply(symbol, broker, signal, fill_px, bar.timestamp)
 
-    def tick_live(self, quotes: LiveQuoteProvider) -> list[str]:
+    def tick_live(
+        self, quotes: LiveQuoteProvider, *, skip_selection: bool = False
+    ) -> list[str]:
         # Migrate older saved flatten_at=15:20 → 15:00 IST
         flat = str(self.strategy.params.get("flatten_at") or "").strip()
         if flat in {"15:20", "15:25", "15:30"}:
             self.strategy.params["flatten_at"] = "15:00"
-        self._maybe_roll_trading_day()
+        if not skip_selection:
+            self._maybe_roll_trading_day()
+            self.ensure_selection(quotes)
         self._maybe_eod_flatten(quotes)
-        self.ensure_selection(quotes)
         labels = []
-        # Prefer WS ticks already warmed by session.prefetch_ltps — no long waits here.
+        # Marks should already be REST-seeded + WS-subscribed by session.
         for sym in list(self.selected):
             try:
                 price, ts, src = quotes.get_ltp(
-                    sym, allow_rest=True, wait_ws_sec=0.25, max_stale_sec=180
+                    sym, allow_rest=False, wait_ws_sec=0.2, max_stale_sec=300
                 )
                 bar = Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=0)
                 self.on_symbol_bar(sym, bar)

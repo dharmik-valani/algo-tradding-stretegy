@@ -50,7 +50,7 @@ def suggested_poll_seconds(want_count: int, *, base: float = 15.0) -> float:
 
 
 class LiveQuoteProvider:
-    """Paper price feed — Dhan WebSocket first, REST LTP/OHLC fallback. No Yahoo."""
+    """Paper price feed — REST-first verify/seed, then WebSocket for live marks."""
 
     def __init__(
         self,
@@ -409,16 +409,88 @@ class LiveQuoteProvider:
                     raise
         return out
 
+    def mark_coverage(self, symbols: list[str], *, max_stale_sec: float = 180.0) -> float:
+        """Fraction of symbols that already have a usable mark (WS cache or remembered)."""
+        wanted = [s.upper() for s in symbols if s]
+        if not wanted:
+            return 1.0
+        ok = 0
+        for sym in wanted:
+            if self._cached_mark(sym, max_stale_sec=max_stale_sec) is not None:
+                ok += 1
+                continue
+            q = self._ws_quote(sym)
+            if q and q.get("ltp") is not None:
+                ok += 1
+        return ok / float(len(wanted))
+
+    def seed_ltps_rest_first(
+        self,
+        symbols: list[str],
+        *,
+        wait_ws_sec: float = 1.0,
+    ) -> dict[str, float]:
+        """Market policy: REST LTP batch first (verify + seed), then WS-subscribe for live.
+
+        Pre-market / open / post-scan should call this before relying on websocket ticks.
+        """
+        wanted = list(dict.fromkeys(s.upper() for s in symbols if s))
+        out: dict[str, float] = {}
+        if not wanted:
+            return out
+
+        if self._dhan is not None and not self._rest_cooling():
+            try:
+                prices = self._dhan_ltp_batch(wanted)
+                now = time.monotonic()
+                for sym, price in prices.items():
+                    self._rest_ltp_memo[sym] = (price, now)
+                    self._remember_mark(sym, float(price), "dhan-rest")
+                    out[sym] = float(price)
+                self._dhan_feed_ok = True
+                self._clear_rate_limit_on_success()
+            except Exception:
+                pass
+
+        # After REST seed, lock WS want-set to these symbols only.
+        self.set_subscriptions(wanted)
+        if wait_ws_sec <= 0:
+            return out
+
+        deadline = time.time() + wait_ws_sec
+        while time.time() < deadline:
+            pending = False
+            for sym in wanted:
+                q = self._ws_quote(sym)
+                if q and q.get("ltp") is not None:
+                    px = float(q["ltp"])
+                    self._remember_mark(sym, px, "dhan-ws")
+                    out[sym] = px
+                elif sym not in out:
+                    pending = True
+            if not pending:
+                break
+            time.sleep(0.12)
+        return out
+
     def prefetch_ltps(
         self,
         symbols: list[str],
         *,
         wait_ws_sec: float = 2.5,
         allow_rest: bool = False,
+        prefer_rest: bool = False,
     ) -> None:
-        """Warm WebSocket ticks for active symbols. Live path keeps allow_rest=False."""
+        """Warm marks for active symbols.
+
+        prefer_rest=True → REST batch first, then short WS wait (open / re-seed).
+        Default → WS wait first; REST only fills missing when allow_rest=True.
+        """
         wanted = [s.upper() for s in symbols if s]
         if not wanted:
+            return
+        if prefer_rest:
+            self.seed_ltps_rest_first(wanted, wait_ws_sec=wait_ws_sec)
             return
         self.ensure_subscribed(wanted)
         deadline = time.time() + max(wait_ws_sec, 0.0)
@@ -441,7 +513,7 @@ class LiveQuoteProvider:
             now = time.monotonic()
             for sym, price in prices.items():
                 self._rest_ltp_memo[sym] = (price, now)
-                self._remember_mark(sym, price, "dhan")
+                self._remember_mark(sym, price, "dhan-rest")
             self._dhan_feed_ok = True
             self._clear_rate_limit_on_success()
         except Exception:
@@ -490,37 +562,26 @@ class LiveQuoteProvider:
         if cached is not None:
             return cached
 
-        if allow_rest and not self._rest_cooling() and self._dhan is not None:
-            try:
-                px, ts = self._dhan_ltp(symbol)
-                self._rest_ltp_memo[symbol] = (px, time.monotonic())
-                self._remember_mark(symbol, px, "dhan")
-                self._dhan_feed_ok = True
-                self._clear_rate_limit_on_success()
-                return px, ts, "dhan"
-            except Exception:
-                pass
-
-        # Index underlyings: one REST seed if WS is down and we have no mark yet
-        # (keeps option SL/TP alive without waiting for a long reconnect).
+        # REST seed when WS is silent (connected-but-no-equity-ticks is common on Dhan).
+        # Always for indexes; for equities when allow_rest or never marked this session.
+        never_marked = symbol not in self._mark_cache
         if (
-            symbol in INDEX_LTP_KEYS
-            and self._dhan is not None
+            self._dhan is not None
             and not self._rest_cooling()
-            and (self._ws is None or not self._ws.connected)
+            and (allow_rest or never_marked or symbol in INDEX_LTP_KEYS)
         ):
             try:
                 px, ts = self._dhan_ltp(symbol)
                 self._rest_ltp_memo[symbol] = (px, time.monotonic())
-                self._remember_mark(symbol, px, "dhan")
+                self._remember_mark(symbol, px, "dhan-rest")
                 self._dhan_feed_ok = True
                 self._clear_rate_limit_on_success()
-                return px, ts, "dhan-seed"
+                return px, ts, "dhan-rest"
             except Exception:
                 pass
 
         raise ProviderError(
-            "No Dhan websocket mark yet — subscribed; waiting for next tick",
+            "No Dhan mark yet — REST/WS both empty; waiting for next poll",
             code="NO_TICK",
         )
 

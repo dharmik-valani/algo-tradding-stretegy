@@ -158,6 +158,55 @@ def build_deep_health(*, probe_ltp: bool = True) -> dict[str, Any]:
                     "source": src,
                     "ts": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
                 }
+                # Equity REST probe — index OK alone does not prove stock marks work.
+                equity_price = None
+                equity_src = None
+                try:
+                    if q is not None and hasattr(q, "seed_ltps_rest_first"):
+                        seeded = q.seed_ltps_rest_first(["RELIANCE"], wait_ws_sec=0.0)
+                        equity_price = seeded.get("RELIANCE")
+                        equity_src = "dhan-rest" if equity_price is not None else None
+                    if equity_price is None:
+                        from algo.paper.dhan_equity_ids import nse_eq_security_id
+                        from algo.paper.quotes import _extract_ltp
+                        from algo.providers.dhan.auth import current_token
+
+                        rid = nse_eq_security_id("RELIANCE")
+                        if rid:
+                            live_url = settings.yaml_config.get("dhan", {}).get(
+                                "base_url", "https://api.dhan.co/v2"
+                            )
+                            token = current_token(settings) or settings.dhan_access_token
+                            client = DhanClient(
+                                client_id=settings.dhan_client_id,
+                                access_token=token,
+                                base_url=live_url,
+                                timeout=getattr(settings, "timeout_seconds", 30.0) or 30.0,
+                            )
+                            try:
+                                payload = client.post_json(
+                                    "/marketfeed/ltp", {"NSE_EQ": [int(rid)]}
+                                )
+                                equity_price = _extract_ltp(payload, "NSE_EQ", rid)
+                                equity_src = "dhan-rest"
+                            finally:
+                                try:
+                                    client.close()
+                                except Exception:
+                                    pass
+                except Exception as eq_exc:
+                    checks["rest_ltp_equity"] = {"error": str(eq_exc)[:200]}
+                    issues.append(f"RELIANCE LTP probe failed: {eq_exc}")
+                    out["degraded"] = True
+                else:
+                    checks["rest_ltp_equity"] = {
+                        "symbol": "RELIANCE",
+                        "price": equity_price,
+                        "source": equity_src,
+                    }
+                    if equity_price is None:
+                        issues.append("RELIANCE LTP probe returned no price")
+                        out["degraded"] = True
         except Exception as exc:
             checks["rest_ltp"] = {"error": str(exc)[:240]}
             issues.append(f"NIFTY LTP probe failed: {exc}")
