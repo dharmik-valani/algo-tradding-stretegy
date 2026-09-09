@@ -800,7 +800,7 @@ function renderExecStats(session) {
           const legCap = Number(leg.capital != null ? leg.capital : invested / Math.max(basket.length, 1));
           const legPnl = Number(leg.leg_pnl != null ? leg.leg_pnl : (legOpen ? leg.unrealized : leg.realized) || 0);
           const legGen = legCap + legPnl;
-          const legMarket = legOpen && leg.last != null ? money(leg.last) : "—";
+          const legMarket = leg.last != null ? money(leg.last) : "—";
           const legEntry =
             leg.entry != null
               ? money(leg.entry)
@@ -813,13 +813,8 @@ function renderExecStats(session) {
           const legQty = Math.abs(Number(leg.qty) || Number(leg.filled_qty) || Number(leg.planned_qty) || 0);
           const legQtyLabel = legQty > 0 ? String(legQty) : "—";
           const tradedToday = Number(leg.trades_today || 0) >= 1;
-          const legHint = legOpen
-            ? "open"
-            : tradedToday
-              ? "done today"
-              : leg.exit != null
-                ? "last exit"
-                : (leg.status || "waiting");
+          // Entry column: price when filled; otherwise leave blank (status stays under symbol).
+          const legEntryHint = "";
           return `
           <tr class="desk-leg-row ${legOpen ? "has-open" : "is-flat"}" data-parent="${escapeHtml(id)}">
             <td data-label="Symbol" class="col-strategy">
@@ -836,7 +831,7 @@ function renderExecStats(session) {
             </td>
             <td data-label="PnL" class="mono ${pnlClass(legPnl)}">₹${moneyShort(legPnl)}</td>
             <td data-label="Market" class="mono">${legMarket}</td>
-            <td data-label="Entry" class="mono">${levelCell(legEntry, legOpen ? "" : (leg.exit != null ? "" : legHint))}</td>
+            <td data-label="Entry" class="mono">${levelCell(legEntry, legEntryHint)}</td>
             <td data-label="Exit" class="mono">${levelCell(legExit, legOpen ? "open" : (leg.exit != null ? "exited" : ""))}</td>
             <td data-label="Open" class="mono" title="0 = flat, 1 = in trade">${legOpen ? "1" : "0"}</td>
             <td data-label="Qty" class="mono" title="Trade-wise share quantity">${legQtyLabel}</td>
@@ -854,7 +849,7 @@ function renderExecStats(session) {
 
   root.innerHTML = `
     <p class="hint desk-legend tight">
-      After 09:30 scan, ▶ shows basket symbols. Live fills appear on those sub-rows with Qty.
+      ▶ basket symbols show live MARKET while waiting. ENTRY/EXIT/STOP/TARGET fill only after a paper trade opens.
       Open = in-trade count · Qty = shares · each symbol once/day.
     </p>
     <div class="table-wrap desk-table-wrap">

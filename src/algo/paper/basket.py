@@ -112,8 +112,8 @@ class BasketRunner:
             closed = list(getattr(broker, "closed_trades", []) or [])
             last_closed = closed[-1] if closed else None
             in_trade = bool(leg.get("in_trade")) and not self._desk_settled
-            # After settle / when flat: do not surface stale LTPs on the desk.
-            show_px = None if (self._desk_settled or not in_trade) else px
+            # Hide marks only after EOD settle; while WAITING show live LTP so the desk is readable.
+            show_px = None if self._desk_settled else px
             filled_qty = 0 if self._desk_settled else int(pos.quantity or 0)
             last_qty = int((last_closed or {}).get("quantity") or 0) if last_closed else 0
             planned_qty = int(leg.get("qty") or 0) if not self._desk_settled else 0
@@ -392,7 +392,7 @@ class BasketRunner:
         for sym in list(self.selected):
             try:
                 price, ts, src = quotes.get_ltp(
-                    sym, allow_rest=False, wait_ws_sec=0.4, max_stale_sec=180
+                    sym, allow_rest=True, wait_ws_sec=0.25, max_stale_sec=180
                 )
                 bar = Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=0)
                 self.on_symbol_bar(sym, bar)

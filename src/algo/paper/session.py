@@ -1280,7 +1280,13 @@ class PaperSession:
                                 want_syms[:12], wait_ws_sec=0.0, allow_rest=True
                             )
                     else:
-                        quotes.prefetch_ltps(want_syms, wait_ws_sec=2.0, allow_rest=False)
+                        quotes.prefetch_ltps(want_syms, wait_ws_sec=1.5, allow_rest=False)
+                        # Dhan WS can stay "connected" with only index/option ticks — equity
+                        # baskets then starve. Fill missing marks via REST every other poll.
+                        if self._runtime_tick % 2 == 0:
+                            quotes.prefetch_ltps(
+                                want_syms, wait_ws_sec=0.0, allow_rest=True
+                            )
                 except Exception:
                     pass
                 # Adaptive cadence: more active symbols → slower poll (Dhan-safe).
