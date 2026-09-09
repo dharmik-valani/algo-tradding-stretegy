@@ -725,22 +725,21 @@ function renderExecStats(session) {
       let qtyCell;
       let qtyTitle;
       if (isBasket) {
-        stocks = settled
-          ? `0/${maxTrades}`
-          : `${inTrade}<div class="meta pnl-sub">${tradesUsed}/${maxTrades} day</div>`;
+        stocks = `${settled ? 0 : inTrade}<div class="meta pnl-sub">${tradesUsed}/${maxTrades} day</div>`;
         posTitle = `Open legs · day trades used/max (cap ${maxTrades}/strategy/day)`;
         const openQtySum = active.reduce((n, l) => n + Math.abs(Number(l.qty) || 0), 0);
         const doneQtySum = basket
           .filter((l) => !l.in_trade && Number(l.trades_today || 0) >= 1)
           .reduce((n, l) => n + Math.abs(Number(l.qty) || Number(l.filled_qty) || 0), 0);
-        qtyCell = settled
-          ? "—"
-          : openQtySum > 0
+        qtyCell =
+          openQtySum > 0
             ? String(openQtySum)
             : doneQtySum > 0
               ? String(doneQtySum)
               : "—";
-        qtyTitle = "Sum of share qty on open legs (or last exits if flat)";
+        qtyTitle = settled
+          ? "Sum of share qty on today's closed legs (review until next session)"
+          : "Sum of share qty on open legs (or last exits if flat)";
       } else {
         stocks = isOpen ? "1" : "0";
         posTitle = "Open trade count (0 or 1 — once per day)";
@@ -760,12 +759,46 @@ function renderExecStats(session) {
       let exitPx = "—";
       let sl = "—";
       let tp = "—";
-      let levelsHint = settled ? "settled" : "no open trade";
+      let levelsHint = settled ? "settled day" : "no open trade";
       let entryAt = null;
       let exitAt = null;
 
-      if (settled) {
-        levelsHint = "settled · fresh desk";
+      if (settled && isBasket) {
+        // Keep today's basket review visible after EOD — expand legs for full detail.
+        const doneLegs = basket.filter(
+          (l) => Number(l.trades_today || 0) >= 1 || l.exit != null || l.entry != null
+        );
+        if (doneLegs.length === 1) {
+          const d0 = doneLegs[0];
+          market = d0.last != null ? money(d0.last) : d0.exit != null ? money(d0.exit) : "—";
+          entry = d0.entry != null ? money(d0.entry) : "—";
+          exitPx = d0.exit != null ? money(d0.exit) : "—";
+          sl = d0.stop != null ? money(d0.stop) : "—";
+          tp = d0.target != null ? money(d0.target) : "—";
+          levelsHint = "settled";
+          entryAt = d0.entry_at || null;
+          exitAt = d0.exit_at || null;
+        } else if (doneLegs.length > 1) {
+          market = `${doneLegs.length} done`;
+          entry = "multi";
+          exitPx = "multi";
+          sl = "multi";
+          tp = "multi";
+          levelsHint = "settled · expand for legs";
+        } else {
+          levelsHint = "settled · no fills";
+        }
+      } else if (settled && !isBasket && lc && (lc.exit != null || lc.entry != null)) {
+        market = s.last_price != null ? money(s.last_price) : lc.exit != null ? money(lc.exit) : "—";
+        entry = lc.entry != null ? money(lc.entry) : "—";
+        exitPx = lc.exit != null ? money(lc.exit) : "—";
+        sl = lc.stop != null ? money(lc.stop) : s.stop_price != null ? money(s.stop_price) : "—";
+        tp = lc.target != null ? money(lc.target) : s.target_price != null ? money(s.target_price) : "—";
+        levelsHint = "settled";
+        entryAt = lc.entry_at || tv.entry_at || null;
+        exitAt = lc.exit_at || tv.exit_at || null;
+      } else if (settled) {
+        levelsHint = "settled";
       } else if (isBasket) {
         if (active.length === 1) {
           market = money(active[0].last);
@@ -973,6 +1006,7 @@ function renderExecStats(session) {
     <p class="hint desk-legend tight">
       ▶ Capital = money in trades (qty × entry). PnL = day result.
       Baskets: max ${10} trades/strategy/day — after that, no new entries. 1 trade/symbol/day.
+      After flatten, today's entry/exit/qty/SL/TP/PnL stay visible until next session.
       Entry/Exit show fill time (IST). Click leg symbol or Chart for 1m SL/TP overlay.
       Win = wins÷(wins+losses) on closed trades.
     </p>

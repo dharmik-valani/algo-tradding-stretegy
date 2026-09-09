@@ -160,20 +160,21 @@ class BasketRunner:
                 if not leg.get("qty") and last_closed.get("quantity"):
                     leg["qty"] = int(last_closed.get("quantity") or 0)
             status = self._leg_status(sym, leg, px)
-            # Hide marks only after EOD settle; while WAITING show live LTP so the desk is readable.
-            show_px = None if self._desk_settled else px
+            # After EOD settle we still show today's closed-trade review (qty/PnL/SL/TP)
+            # until the next IST session rolls. Only live open-position marks go quiet.
             filled_qty = 0 if self._desk_settled else int(pos.quantity or 0)
-            last_qty = int((last_closed or {}).get("quantity") or 0) if last_closed else 0
-            planned_qty = int(leg.get("qty") or 0) if not self._desk_settled else 0
+            last_qty = int((last_closed or {}).get("quantity") or leg.get("qty") or 0) if (
+                last_closed or leg.get("qty")
+            ) else 0
+            planned_qty = int(leg.get("qty") or 0)
             # Prefer live position qty; else last closed fill; else planned tier qty.
-            show_qty = abs(filled_qty) if filled_qty else (last_qty if not in_trade and last_qty else planned_qty)
-            # Keep SL/TP visible after exit (review) — only blank after EOD desk settle.
-            show_stop = None if self._desk_settled else (
+            show_qty = abs(filled_qty) if filled_qty else (last_qty if last_qty else planned_qty)
+            show_stop = (
                 leg.get("stop")
                 if leg.get("stop") is not None
                 else (last_closed or {}).get("stop")
             )
-            show_target = None if self._desk_settled else (
+            show_target = (
                 leg.get("target")
                 if leg.get("target") is not None
                 else (last_closed or {}).get("target")
@@ -187,8 +188,24 @@ class BasketRunner:
                     else (float(leg["entry"]) if leg.get("entry") is not None else None)
                 )
             )
+            exit_px = None if in_trade else (
+                (last_closed or {}).get("exit")
+                if (last_closed or {}).get("exit") is not None
+                else leg.get("exit")
+            )
+            # Market: live LTP while session is open; after settle prefer exit / last mark.
+            if self._desk_settled:
+                show_px = (
+                    float(exit_px)
+                    if exit_px is not None
+                    else (float(px) if px is not None else (float(entry_px) if entry_px is not None else None))
+                )
+            else:
+                show_px = px
             # Actual money used in the trade = |qty| × entry (not the full capital slice).
-            notional_qty = abs(filled_qty) if filled_qty else (last_qty if last_closed else 0)
+            notional_qty = abs(filled_qty) if filled_qty else (last_qty if (last_closed or planned_qty) else 0)
+            if not notional_qty and entry_px is not None and show_qty:
+                notional_qty = abs(int(show_qty))
             notional = (
                 round(float(notional_qty) * float(entry_px), 2)
                 if entry_px is not None and notional_qty
@@ -205,6 +222,14 @@ class BasketRunner:
                 entry_at = entry_at.isoformat()
             if hasattr(exit_at, "isoformat"):
                 exit_at = exit_at.isoformat()
+            closed_pnl = float((last_closed or {}).get("pnl") or 0) if last_closed else float(
+                broker.realized_pnl or 0
+            )
+            if last_closed is None and leg.get("leg_pnl") is not None and not in_trade:
+                try:
+                    closed_pnl = float(leg.get("leg_pnl") or 0)
+                except (TypeError, ValueError):
+                    pass
             legs.append(
                 {
                     "symbol": sym,
@@ -213,7 +238,7 @@ class BasketRunner:
                     "planned_qty": planned_qty,
                     "avg": pos.avg_price if in_trade else None,
                     "last": show_px,
-                    "realized": 0.0 if self._desk_settled else broker.realized_pnl,
+                    "realized": closed_pnl if self._desk_settled else broker.realized_pnl,
                     "unrealized": 0.0 if self._desk_settled else broker.unrealized_pnl(px),
                     "stop": show_stop,
                     "target": show_target,
@@ -224,19 +249,23 @@ class BasketRunner:
                     "trades_today": int(leg.get("trades_today") or 0),
                     "side": leg.get("side"),
                     "reject_reason": leg.get("reject_reason"),
-                    "status": "settled" if self._desk_settled else status,
+                    "status": (
+                        f"done · settled"
+                        if self._desk_settled and (last_closed or int(leg.get("trades_today") or 0) >= 1)
+                        else ("settled" if self._desk_settled else status)
+                    ),
                     "capital": round(per_leg_cash, 2),
                     "allocated": round(per_leg_cash, 2),
                     "notional": notional,
-                    "deployed": notional if (in_trade or last_closed) else 0.0,
-                    "entry": (pos.avg_price if in_trade else (last_closed or {}).get("entry")),
-                    "exit": None if in_trade else (last_closed or {}).get("exit"),
+                    "deployed": notional if (in_trade or last_closed or int(leg.get("trades_today") or 0) >= 1) else 0.0,
+                    "entry": entry_px,
+                    "exit": exit_px,
                     "entry_at": entry_at,
                     "exit_at": exit_at,
                     "leg_pnl": (
                         float(broker.unrealized_pnl(px))
                         if in_trade
-                        else (0.0 if self._desk_settled else float((last_closed or {}).get("pnl") or broker.realized_pnl or 0))
+                        else closed_pnl
                     ),
                     "last_closed": last_closed,
                     "leg_win": (
@@ -245,13 +274,20 @@ class BasketRunner:
                         else (
                             False
                             if last_closed and float(last_closed.get("pnl") or 0) < 0
-                            else None
+                            else (
+                                True
+                                if (not last_closed and closed_pnl > 0 and int(leg.get("trades_today") or 0) >= 1)
+                                else (
+                                    False
+                                    if (not last_closed and closed_pnl < 0 and int(leg.get("trades_today") or 0) >= 1)
+                                    else None
+                                )
+                            )
                         )
                     ),
                 }
             )
-        if self._desk_settled:
-            last_px = None
+        # Keep last mark available for review after settle (do not force None).
         # Aggregate cash = starting − deployed notionals approx: sum of broker cashes / n
         if self.brokers:
             cash = sum(b.cash for b in self.brokers.values())
@@ -262,6 +298,7 @@ class BasketRunner:
             quantity=sum(abs(b.position.quantity) for b in self.brokers.values()),
             avg_price=0.0,
         )
+        day_realized = float(self._day_pnl or 0) if self._desk_settled else float(realized)
         st = StrategyState(
             strategy_id=self.strategy.id,
             instance_id=self.instance_id,
@@ -271,9 +308,9 @@ class BasketRunner:
             asset_kind="stock",
             timeframe=self.timeframe,
             quantity=self.qty,
-            cash=cash if not self._desk_settled else self.starting_cash + float(self._day_pnl or 0),
+            cash=cash if not self._desk_settled else self.starting_cash + day_realized,
             starting_cash=self.starting_cash,
-            realized_pnl=0.0 if self._desk_settled else realized,
+            realized_pnl=day_realized if self._desk_settled else realized,
             unrealized_pnl=0.0 if self._desk_settled else unreal,
             last_price=last_px,
             last_signal=self.last_signal,
@@ -309,17 +346,24 @@ class BasketRunner:
         else:
             st.note = self.last_signal or "HOLD"
         if self._desk_settled:
-            st.note = f"settled · day PnL ₹{float(self._day_pnl or 0):,.0f}"
+            done_n = sum(
+                1
+                for x in legs
+                if int(x.get("trades_today") or 0) >= 1 or x.get("exit") is not None
+            )
+            st.note = f"settled · {done_n} trades · day PnL ₹{day_realized:,.0f}"
             st.legs_in_trade = 0
-            st.last_price = None
-            st.entry_price = None
-            st.stop_price = None
-            st.target_price = None
+            # Keep representative levels from last closed for parent row / expand hint.
+            if last_px is None:
+                for x in reversed(legs):
+                    if x.get("last") is not None:
+                        st.last_price = x.get("last")
+                        break
         closed_all: list[dict] = []
         for b in self.brokers.values():
             closed_all.extend(getattr(b, "closed_trades", []) or [])
         last_closed = closed_all[-1] if closed_all else None
-        live_day = float(self._day_pnl or 0) if self._desk_settled else float(realized + unreal)
+        live_day = day_realized if self._desk_settled else float(realized + unreal)
         deployed_open = round(
             sum(float(x.get("notional") or 0) for x in legs if x.get("in_trade")),
             2,
@@ -338,7 +382,7 @@ class BasketRunner:
             "stop": st.stop_price,
             "target": st.target_price,
             "in_trade": bool(active) and not self._desk_settled,
-            "realized_pnl": 0.0 if self._desk_settled else float(realized or 0),
+            "realized_pnl": live_day if self._desk_settled else float(realized or 0),
             "unrealized_pnl": 0.0 if self._desk_settled else float(unreal or 0),
             "last_closed": last_closed,
             "closed_count": len(closed_all),
@@ -715,6 +759,15 @@ class BasketRunner:
                 pass
             self._journal_restored = True
         self._maybe_eod_flatten(quotes)
+        # If settle wiped review fills (older builds) or journal has richer rows, re-hydrate.
+        if self._desk_settled:
+            missing = not any(getattr(b, "closed_trades", None) for b in self.brokers.values())
+            if missing or not getattr(self, "_settled_review_restored", False):
+                try:
+                    self.restore_today_from_journal()
+                    self._settled_review_restored = True
+                except Exception:
+                    pass
         labels = []
         # Marks should already be REST-seeded + WS-subscribed by session.
         for sym in list(self.selected):
@@ -756,23 +809,59 @@ class BasketRunner:
         self._desk_day = today
 
     def _settle_desk_display(self) -> None:
-        """After EOD: lock day PnL, zero Execute row PnL (journal kept)."""
+        """After EOD: lock day PnL and reset open positions — keep today's closed-trade review.
+
+        Execute legs stay visible (entry/exit/qty/SL/TP/PnL/capital) until the next IST day rolls.
+        """
         if self._desk_settled:
             return
         realized = sum(b.realized_pnl for b in self.brokers.values())
         self._day_pnl = float(realized)
+        # Snapshot closed trades + leg review fields before refreshing brokers.
+        preserved: dict[str, list[dict]] = {}
+        for sym, b in self.brokers.items():
+            preserved[str(sym).upper()] = list(getattr(b, "closed_trades", []) or [])
+        legs_map = getattr(self.strategy, "_legs", {}) or {}
+        for sym, trades in preserved.items():
+            if not trades:
+                continue
+            last = trades[-1]
+            leg = legs_map.get(sym) if isinstance(legs_map, dict) else None
+            if not isinstance(leg, dict):
+                continue
+            if last.get("entry") is not None:
+                leg["entry"] = last.get("entry")
+            if last.get("exit") is not None:
+                leg["exit"] = last.get("exit")
+            if last.get("stop") is not None:
+                leg["stop"] = last.get("stop")
+            if last.get("target") is not None:
+                leg["target"] = last.get("target")
+            if last.get("quantity") is not None:
+                leg["qty"] = int(last.get("quantity") or 0)
+            if last.get("entry_at"):
+                leg["entry_at"] = last.get("entry_at")
+            if last.get("exit_at"):
+                leg["exit_at"] = last.get("exit_at")
+            if last.get("pnl") is not None:
+                leg["leg_pnl"] = float(last.get("pnl") or 0)
+            leg["trades_today"] = max(int(leg.get("trades_today") or 0), 1)
+            leg["in_trade"] = False
         n = max(len(self.selected) or 1, 1)
         fresh: dict[str, PaperBroker] = {}
         for sym in self.selected:
+            sym_u = str(sym).upper()
             b = PaperBroker(starting_cash=self.starting_cash / n)
-            b.bind(self.strategy.id, f"NSE:EQ:{sym}", sym)
-            fresh[sym] = b
+            b.bind(self.strategy.id, f"NSE:EQ:{sym_u}", sym_u)
+            # Keep today's closed fills so desk review + win cells still work post-settle.
+            b.closed_trades = list(preserved.get(sym_u) or [])
+            fresh[sym_u] = b
         self.brokers = fresh
         self.open_trade_ids = {}
         self._desk_settled = True
         self._log(
-            f"Desk settled — day PnL ₹{self._day_pnl:,.2f} shown as Generated; "
-            f"Execute row PnL cleared to 0 (journal kept)"
+            f"Desk settled — day PnL ₹{self._day_pnl:,.2f} locked; "
+            f"today's entry/exit/qty/SL/TP kept for review until next session"
         )
 
     def _eod_exit_ts(self, flat_raw: str) -> datetime:
