@@ -194,6 +194,17 @@ class BasketRunner:
                 if entry_px is not None and notional_qty
                 else 0.0
             )
+            entry_at = None
+            exit_at = None
+            if in_trade:
+                entry_at = getattr(broker, "position_entry_at", None) or leg.get("entry_at")
+            else:
+                entry_at = (last_closed or {}).get("entry_at") or leg.get("entry_at")
+                exit_at = (last_closed or {}).get("exit_at") or leg.get("exit_at")
+            if hasattr(entry_at, "isoformat"):
+                entry_at = entry_at.isoformat()
+            if hasattr(exit_at, "isoformat"):
+                exit_at = exit_at.isoformat()
             legs.append(
                 {
                     "symbol": sym,
@@ -220,6 +231,8 @@ class BasketRunner:
                     "deployed": notional if (in_trade or last_closed) else 0.0,
                     "entry": (pos.avg_price if in_trade else (last_closed or {}).get("entry")),
                     "exit": None if in_trade else (last_closed or {}).get("exit"),
+                    "entry_at": entry_at,
+                    "exit_at": exit_at,
                     "leg_pnl": (
                         float(broker.unrealized_pnl(px))
                         if in_trade
@@ -446,6 +459,14 @@ class BasketRunner:
                 leg["target"] = float(target) if target is not None else leg.get("target")
                 leg["side"] = "short" if str(t.get("side") or "").upper() == "SHORT" else "long"
                 leg["entry"] = t.get("entry_price")
+                entry_at = t.get("entry_at")
+                exit_at = t.get("exit_at")
+                if hasattr(entry_at, "isoformat"):
+                    entry_at = entry_at.isoformat()
+                if hasattr(exit_at, "isoformat"):
+                    exit_at = exit_at.isoformat()
+                leg["entry_at"] = entry_at
+                leg["exit_at"] = exit_at
                 broker.closed_trades = [
                     {
                         "pnl": float(t.get("realized_pnl") or 0),
@@ -455,6 +476,8 @@ class BasketRunner:
                         "side": "short" if str(t.get("side") or "").upper() == "SHORT" else "long",
                         "stop": float(stop) if stop is not None else None,
                         "target": float(target) if target is not None else None,
+                        "entry_at": entry_at,
+                        "exit_at": exit_at,
                     }
                 ]
                 # Drop orphan open journal ids so we don't manage ghost positions.
@@ -485,6 +508,18 @@ class BasketRunner:
                 leg["target"] = float(target) if target is not None else None
                 leg["side"] = "short" if side == "SHORT" else "long"
                 leg["entry"] = entry
+                entry_at = t.get("entry_at")
+                if hasattr(entry_at, "isoformat"):
+                    entry_at = entry_at.isoformat()
+                leg["entry_at"] = entry_at
+                leg["exit_at"] = None
+                if entry_at:
+                    try:
+                        broker.position_entry_at = datetime.fromisoformat(
+                            str(entry_at).replace("Z", "+00:00")
+                        )
+                    except Exception:
+                        broker.position_entry_at = None
                 if t.get("id"):
                     self.open_trade_ids[sym] = str(t["id"])
                 restored += 1
@@ -868,6 +903,10 @@ class BasketRunner:
             if order.status.value == "FILLED" and pos <= 0 and meta.get("structure") == "long_orb":
                 if autosize:
                     self._log(f"{symbol} BUY sized qty={qty} @ {order.fill_price or fill_px:.2f}")
+                legs_map = getattr(self.strategy, "_legs", {}) or {}
+                if isinstance(legs_map.get(symbol), dict):
+                    legs_map[symbol]["entry_at"] = ts.isoformat()
+                    legs_map[symbol]["exit_at"] = None
                 if self.journal_session_id:
                     tid = open_trade(
                         session_id=self.journal_session_id,
@@ -938,6 +977,10 @@ class BasketRunner:
             if order.status.value == "FILLED" and pos == 0 and meta.get("structure") == "short_orb":
                 if autosize:
                     self._log(f"{symbol} SHORT sized qty={qty} @ {order.fill_price or fill_px:.2f}")
+                legs_map = getattr(self.strategy, "_legs", {}) or {}
+                if isinstance(legs_map.get(symbol), dict):
+                    legs_map[symbol]["entry_at"] = ts.isoformat()
+                    legs_map[symbol]["exit_at"] = None
                 if self.journal_session_id:
                     tid = open_trade(
                         session_id=self.journal_session_id,
@@ -1057,6 +1100,17 @@ class BasketRunner:
                 leg["target"] = float(target)
             if qty is not None:
                 leg["qty"] = int(qty)
+            # Mirror fill times from the closed trade onto the leg for desk display.
+            closed = list(getattr(broker, "closed_trades", []) or [])
+            if closed:
+                last = closed[-1]
+                if last.get("entry_at"):
+                    leg["entry_at"] = last.get("entry_at")
+                if last.get("exit_at"):
+                    leg["exit_at"] = last.get("exit_at")
+            elif getattr(broker, "position_entry_at", None) is not None:
+                leg["entry_at"] = broker.position_entry_at.isoformat()
+                leg["exit_at"] = None
 
     def _entry_qty(self, broker: PaperBroker, fill_px: float, signal) -> int:
         """Tiered qty (brother strategies), fixed qty, or cash-fit for *_cash."""

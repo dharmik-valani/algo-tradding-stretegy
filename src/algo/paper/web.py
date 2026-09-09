@@ -613,6 +613,37 @@ def feed_diagnostics() -> dict:
     return out
 
 
+@app.get("/api/bars")
+def market_bars(
+    symbol: str = Query(..., min_length=1),
+    interval: str = Query("1m"),
+    range_: str = Query("1d", alias="range"),
+) -> dict:
+    """Intraday OHLC bars for desk trade chart overlays (Dhan charts via live quotes)."""
+    from algo.paper import session as session_mod
+
+    sess = session_mod._SESSION
+    if sess is None or sess._quotes is None:
+        raise HTTPException(status_code=503, detail="quotes provider not ready — start live first")
+    sym = symbol.strip().upper()
+    try:
+        bars = sess._quotes.load_public_bars(sym, interval=interval, range_=range_)
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    out = []
+    for b in bars[-500:]:
+        out.append(
+            {
+                "t": b.timestamp.isoformat() if b.timestamp else None,
+                "o": float(b.open),
+                "h": float(b.high),
+                "l": float(b.low),
+                "c": float(b.close),
+                "v": float(b.volume or 0),
+            }
+        )
+    return {"ok": True, "symbol": sym, "interval": interval, "range": range_, "bars": out}
+
 @app.post("/api/session/reset")
 def session_reset() -> dict:
     return reset_session().snapshot().model_dump(mode="json")

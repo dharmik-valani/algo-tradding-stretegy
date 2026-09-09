@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=desk39" />
+  <link rel="stylesheet" href="/static/styles.css?v=desk40" />
 </head>
 <body>
   <div class="app">
@@ -519,6 +519,24 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=desk39"></script>
+  <div id="tradeChartModal" class="modal hidden" aria-hidden="true">
+    <div class="modal-backdrop" data-close-trade-chart></div>
+    <div class="modal-card trade-chart-card" role="dialog" aria-modal="true" aria-labelledby="tradeChartTitle">
+      <div class="modal-head">
+        <div>
+          <h2 id="tradeChartTitle">Trade chart</h2>
+          <p class="meta" id="tradeChartSub"></p>
+        </div>
+        <button type="button" class="ghost" data-close-trade-chart>Close</button>
+      </div>
+      <p class="hint tight" id="tradeChartStatus">—</p>
+      <div class="trade-chart-wrap">
+        <canvas id="tradeChartCanvas" width="720" height="360" aria-label="Trade candlestick chart"></canvas>
+      </div>
+      <p class="hint tight">Green band = toward target · red band = toward stop · vertical IN/OUT = fill times. Not a TradingView screenshot — live 1m bars with your paper levels.</p>
+    </div>
+  </div>
+
+  <script src="/static/app.js?v=desk40"></script>
 </body>
 </html>

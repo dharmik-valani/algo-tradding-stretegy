@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 from algo.paper.models import (
     Fill,
@@ -15,19 +16,23 @@ from algo.paper.models import (
 
 
 class PaperBroker:
-    """Virtual cash account. Never talks to Dhan order APIs."""
+    """Virtual broker — never hits Dhan /orders."""
 
     def __init__(
         self,
         *,
         starting_cash: float = 100_000.0,
         fee_bps: float = 1.0,
-        slippage_bps: float = 2.0,
+        slippage_bps: float = 1.0,
     ) -> None:
-        self.starting_cash = starting_cash
-        self.cash = starting_cash
-        self.fee_bps = fee_bps
-        self.slippage_bps = slippage_bps
+        self.starting_cash = float(starting_cash)
+        self.cash = float(starting_cash)
+        self.fee_bps = float(fee_bps)
+        self.slippage_bps = float(slippage_bps)
+        self.realized_pnl = 0.0
+        self.orders: list[Order] = []
+        self.fills: list[Fill] = []
+        self.closed_trades: list[dict] = []
         self.position = Position(
             strategy_id="",
             instrument_id="",
@@ -35,10 +40,7 @@ class PaperBroker:
             quantity=0,
             avg_price=0.0,
         )
-        self.fills: list[Fill] = []
-        self.orders: list[Order] = []
-        self.closed_trades: list[dict] = []
-        self.realized_pnl = 0.0
+        self.position_entry_at: datetime | None = None
 
     def bind(self, strategy_id: str, instrument_id: str, symbol: str) -> None:
         self.position.strategy_id = strategy_id
@@ -88,11 +90,9 @@ class PaperBroker:
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = f"insufficient cash (need {cost:.2f}, have {self.cash:.2f})"
                 return order
-            # average into long, or reduce short
-            self._apply_buy(quantity, fill_price, fee)
+            self._apply_buy(quantity, fill_price, fee, ts=ts)
         else:
-            # sell / short: for v1 only allow closing or opening short if flat/long
-            self._apply_sell(quantity, fill_price, fee)
+            self._apply_sell(quantity, fill_price, fee, ts=ts)
 
         order.status = OrderStatus.FILLED
         order.filled_at = ts
@@ -132,30 +132,44 @@ class PaperBroker:
         state.orders = list(self.orders[-50:])
         return state
 
-    def _apply_buy(self, qty: int, price: float, fee: float) -> None:
+    def _apply_buy(self, qty: int, price: float, fee: float, *, ts: datetime) -> None:
         pos = self.position
         notional = price * qty
         self.cash -= notional + fee
         if pos.quantity >= 0:
+            was_flat = pos.quantity == 0
             new_qty = pos.quantity + qty
             if new_qty == 0:
                 pos.avg_price = 0.0
+                self.position_entry_at = None
             else:
                 pos.avg_price = ((pos.avg_price * pos.quantity) + notional) / new_qty
+                if was_flat:
+                    self.position_entry_at = ts
             pos.quantity = new_qty
         else:
             # covering short
             cover = min(qty, abs(pos.quantity))
             pnl = (pos.avg_price - price) * cover
             self.realized_pnl += pnl
-            self._record_closed_trade(pnl=pnl, quantity=cover, entry=pos.avg_price, exit_=price, side="cover")
+            self._record_closed_trade(
+                pnl=pnl,
+                quantity=cover,
+                entry=pos.avg_price,
+                exit_=price,
+                side="cover",
+                entry_at=self.position_entry_at,
+                exit_at=ts,
+            )
             pos.quantity += qty
             if pos.quantity == 0:
                 pos.avg_price = 0.0
+                self.position_entry_at = None
             elif pos.quantity > 0:
                 pos.avg_price = price
+                self.position_entry_at = ts
 
-    def _apply_sell(self, qty: int, price: float, fee: float) -> None:
+    def _apply_sell(self, qty: int, price: float, fee: float, *, ts: datetime) -> None:
         pos = self.position
         notional = price * qty
         self.cash += notional - fee
@@ -163,21 +177,32 @@ class PaperBroker:
             close = min(qty, pos.quantity)
             pnl = (price - pos.avg_price) * close
             self.realized_pnl += pnl
-            self._record_closed_trade(pnl=pnl, quantity=close, entry=pos.avg_price, exit_=price, side="long")
+            self._record_closed_trade(
+                pnl=pnl,
+                quantity=close,
+                entry=pos.avg_price,
+                exit_=price,
+                side="long",
+                entry_at=self.position_entry_at,
+                exit_at=ts,
+            )
             pos.quantity -= close
             leftover = qty - close
             if pos.quantity == 0:
                 pos.avg_price = 0.0
+                self.position_entry_at = None
             if leftover > 0:
                 pos.quantity = -leftover
                 pos.avg_price = price
+                self.position_entry_at = ts
         else:
             # add to short or open short
+            was_flat = pos.quantity == 0
             new_qty = pos.quantity - qty
-            if pos.quantity == 0:
+            if was_flat:
                 pos.avg_price = price
+                self.position_entry_at = ts
             else:
-                # average short entry
                 old_abs = abs(pos.quantity)
                 pos.avg_price = ((pos.avg_price * old_abs) + notional) / (old_abs + qty)
             pos.quantity = new_qty
@@ -192,8 +217,10 @@ class PaperBroker:
         side: str,
         stop: float | None = None,
         target: float | None = None,
+        entry_at: datetime | None = None,
+        exit_at: datetime | None = None,
     ) -> None:
-        row: dict = {
+        row: dict[str, Any] = {
             "pnl": round(pnl, 4),
             "quantity": quantity,
             "entry": round(entry, 4),
@@ -204,6 +231,10 @@ class PaperBroker:
             row["stop"] = round(float(stop), 4)
         if target is not None:
             row["target"] = round(float(target), 4)
+        if entry_at is not None:
+            row["entry_at"] = entry_at.isoformat()
+        if exit_at is not None:
+            row["exit_at"] = exit_at.isoformat()
         self.closed_trades.append(row)
 
     def annotate_last_closed(
@@ -212,8 +243,10 @@ class PaperBroker:
         stop: float | None = None,
         target: float | None = None,
         quantity: int | None = None,
+        entry_at: datetime | str | None = None,
+        exit_at: datetime | str | None = None,
     ) -> None:
-        """Attach SL/TP (and qty if needed) onto the most recent closed trade for desk review."""
+        """Attach SL/TP (and qty/times if needed) onto the most recent closed trade for desk review."""
         if not self.closed_trades:
             return
         row = self.closed_trades[-1]
@@ -223,6 +256,10 @@ class PaperBroker:
             row["target"] = round(float(target), 4)
         if quantity is not None:
             row["quantity"] = int(quantity)
+        if entry_at is not None:
+            row["entry_at"] = entry_at.isoformat() if hasattr(entry_at, "isoformat") else str(entry_at)
+        if exit_at is not None:
+            row["exit_at"] = exit_at.isoformat() if hasattr(exit_at, "isoformat") else str(exit_at)
 
 
 def utcnow() -> datetime:

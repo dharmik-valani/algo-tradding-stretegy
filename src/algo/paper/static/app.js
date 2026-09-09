@@ -82,6 +82,35 @@ function formatIstStack(iso, withSeconds = true) {
   return `<span class="dt-stack"><span class="dt-date">${escapeHtml(date)}</span><span class="dt-time">${escapeHtml(time)}</span></span>`;
 }
 
+/** HH:mm (IST) for desk Entry/Exit cells. */
+function formatIstTime(iso) {
+  if (!iso) return "";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) {
+    const m = String(iso).match(/(\d{2}:\d{2})/);
+    return m ? m[1] : "";
+  }
+  const parts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  }).formatToParts(d);
+  const get = (t) => parts.find((p) => p.type === t)?.value || "";
+  return `${get("hour")}:${get("minute")}`;
+}
+
+function levelCell(value, hint, timeIso) {
+  const time = formatIstTime(timeIso);
+  const timeLine = time
+    ? `<div class="meta pnl-sub" title="IST fill time">${escapeHtml(time)} IST</div>`
+    : "";
+  if (value == null || value === "" || value === "—") {
+    return `<div>—</div>${hint ? `<div class="meta pnl-sub">${escapeHtml(hint)}</div>` : ""}${timeLine}`;
+  }
+  return `<div>${value}</div>${hint ? `<div class="meta pnl-sub">${escapeHtml(hint)}</div>` : ""}${timeLine}`;
+}
+
 function pct(n) {
   if (n == null || Number.isNaN(n)) return "—";
   return `${Number(n).toFixed(1)}%`;
@@ -648,13 +677,6 @@ function renderAnalytics() {
 
 let deskExpanded = new Set();
 
-function levelCell(value, hint) {
-  if (value == null || value === "" || value === "—") {
-    return `<div>—</div>${hint ? `<div class="meta pnl-sub">${escapeHtml(hint)}</div>` : ""}`;
-  }
-  return `<div>${value}</div>${hint ? `<div class="meta pnl-sub">${escapeHtml(hint)}</div>` : ""}`;
-}
-
 function renderExecStats(session) {
   const root = $("execDeskList");
   if (!root) return;
@@ -739,6 +761,8 @@ function renderExecStats(session) {
       let sl = "—";
       let tp = "—";
       let levelsHint = settled ? "settled" : "no open trade";
+      let entryAt = null;
+      let exitAt = null;
 
       if (settled) {
         levelsHint = "settled · fresh desk";
@@ -750,6 +774,7 @@ function renderExecStats(session) {
           sl = active[0].stop != null ? money(active[0].stop) : "—";
           tp = active[0].target != null ? money(active[0].target) : "—";
           levelsHint = "open";
+          entryAt = active[0].entry_at || null;
         } else if (active.length > 1) {
           market = `${active.length} open`;
           entry = "multi";
@@ -764,6 +789,8 @@ function renderExecStats(session) {
           sl = lc.stop != null ? money(lc.stop) : (s.stop_price != null ? money(s.stop_price) : "—");
           tp = lc.target != null ? money(lc.target) : (s.target_price != null ? money(s.target_price) : "—");
           levelsHint = "last exit";
+          entryAt = lc.entry_at || tv.entry_at || null;
+          exitAt = lc.exit_at || tv.exit_at || null;
         }
       } else if (isOpen && s.entry_price != null) {
         market = s.last_price != null ? money(s.last_price) : "—";
@@ -772,6 +799,7 @@ function renderExecStats(session) {
         sl = s.stop_price != null ? money(s.stop_price) : "—";
         tp = s.target_price != null ? money(s.target_price) : "—";
         levelsHint = "open";
+        entryAt = tv.entry_at || null;
       } else if (lc && (lc.exit != null || lc.entry != null)) {
         market = s.last_price != null ? money(s.last_price) : "—";
         entry = lc.entry != null ? money(lc.entry) : (s.entry_price != null ? money(s.entry_price) : "—");
@@ -793,6 +821,8 @@ function renderExecStats(session) {
                 ? money(tv.target)
                 : "—";
         levelsHint = "last exit";
+        entryAt = lc.entry_at || tv.entry_at || null;
+        exitAt = lc.exit_at || tv.exit_at || null;
       }
 
       const pnlSub = settled
@@ -848,10 +878,10 @@ function renderExecStats(session) {
         </td>
         <td data-label="Market" class="mono" title="Live mark only while in trade">${market}</td>
         <td data-label="Entry" class="mono" title="Fill price when trade opens">
-          ${levelCell(entry, levelsHint === "open" ? "" : levelsHint)}
+          ${levelCell(entry, levelsHint === "open" ? "" : levelsHint, entryAt)}
         </td>
         <td data-label="Exit" class="mono" title="Fill price when trade closes">
-          ${levelCell(exitPx, levelsHint === "last exit" ? "last exit" : (isOpen ? "open" : ""))}
+          ${levelCell(exitPx, levelsHint === "last exit" ? "last exit" : (isOpen ? "open" : ""), exitAt)}
         </td>
         <td data-label="Open" class="mono" title="${escapeHtml(posTitle)}">${stocks}</td>
         <td data-label="Qty" class="mono" title="${escapeHtml(qtyTitle)}">${qtyCell}</td>
@@ -890,28 +920,47 @@ function renderExecStats(session) {
           const tradedToday = Number(leg.trades_today || 0) >= 1;
           const legWin =
             leg.leg_win === true ? "W" : leg.leg_win === false ? "L" : tradedToday ? "—" : "—";
-          // Entry column: price when filled; otherwise leave blank (status stays under symbol).
           const legEntryHint = "";
+          const canChart = !!(leg.entry != null || leg.exit != null || legOpen);
+          const chartBtn = canChart
+            ? `<button type="button" class="desk-btn ghost desk-chart-btn" data-chart-leg="1" title="Open trade chart">Chart</button>`
+            : `<span class="meta">leg</span>`;
+          const tradePayload = encodeURIComponent(
+            JSON.stringify({
+              symbol: leg.symbol || "",
+              side: leg.side || "",
+              entry: leg.entry,
+              exit: leg.exit,
+              stop: leg.stop,
+              target: leg.target,
+              entry_at: leg.entry_at || null,
+              exit_at: leg.exit_at || null,
+              qty: leg.qty,
+              pnl: leg.leg_pnl,
+              in_trade: legOpen,
+              strategy: s.name,
+            })
+          );
           return `
-          <tr class="desk-leg-row ${legOpen ? "has-open" : "is-flat"}" data-parent="${escapeHtml(id)}">
+          <tr class="desk-leg-row ${legOpen ? "has-open" : "is-flat"} ${canChart ? "is-chartable" : ""}" data-parent="${escapeHtml(id)}" data-trade="${tradePayload}">
             <td data-label="Symbol" class="col-strategy">
               <div class="row-title leg-indent">
                 <span class="badge ${legOpen ? "on" : ""}">${legOpen ? "open" : tradedToday ? "done" : "wait"}</span>
-                <span class="strat-name">${escapeHtml(leg.symbol || "")}</span>
+                <span class="strat-name desk-leg-sym" title="Click for trade chart">${escapeHtml(leg.symbol || "")}</span>
               </div>
               <div class="meta">${escapeHtml(leg.status || "")}${leg.side ? ` · ${escapeHtml(String(leg.side))}` : ""}${tradedToday && !legOpen ? " · 1/day" : ""}</div>
             </td>
             <td data-label="Capital" class="mono">${capitalCell(legCap, legUsed, { usedLabel: legOpen ? "in use" : "used" })}</td>
             <td data-label="PnL" class="mono ${pnlClass(legPnl)}">₹${moneyShort(legPnl)}</td>
             <td data-label="Market" class="mono">${legMarket}</td>
-            <td data-label="Entry" class="mono">${levelCell(legEntry, legEntryHint)}</td>
-            <td data-label="Exit" class="mono">${levelCell(legExit, legOpen ? "open" : (leg.exit != null ? "exited" : ""))}</td>
+            <td data-label="Entry" class="mono">${levelCell(legEntry, legEntryHint, leg.entry_at)}</td>
+            <td data-label="Exit" class="mono">${levelCell(legExit, legOpen ? "open" : (leg.exit != null ? "exited" : ""), leg.exit_at)}</td>
             <td data-label="Open" class="mono" title="0 = flat, 1 = in trade">${legOpen ? "1" : "0"}</td>
             <td data-label="Qty" class="mono" title="Trade-wise share quantity">${legQtyLabel}</td>
             <td data-label="Stop" class="mono">${legSl}</td>
             <td data-label="Target" class="mono">${legTp}</td>
             <td data-label="Win" class="mono" title="This leg's closed trade result">${legWin}</td>
-            <td data-label="Actions" class="desk-actions-cell"><span class="meta">leg</span></td>
+            <td data-label="Actions" class="desk-actions-cell">${chartBtn}</td>
           </tr>`;
         })
         .join("");
@@ -924,6 +973,7 @@ function renderExecStats(session) {
     <p class="hint desk-legend tight">
       ▶ Capital = money in trades (qty × entry). PnL = day result.
       Baskets: max ${10} trades/strategy/day — after that, no new entries. 1 trade/symbol/day.
+      Entry/Exit show fill time (IST). Click leg symbol or Chart for 1m SL/TP overlay.
       Win = wins÷(wins+losses) on closed trades.
     </p>
     <div class="table-wrap desk-table-wrap">
@@ -956,6 +1006,24 @@ function renderExecStats(session) {
       if (deskExpanded.has(sid)) deskExpanded.delete(sid);
       else deskExpanded.add(sid);
       renderExecStats(lastSession);
+    });
+  });
+
+  root.querySelectorAll(".desk-leg-row.is-chartable").forEach((row) => {
+    const openChart = (e) => {
+      if (e) e.stopPropagation();
+      try {
+        const raw = row.getAttribute("data-trade");
+        if (!raw) return;
+        openTradeChart(JSON.parse(decodeURIComponent(raw)));
+      } catch (err) {
+        alert(err.message || "Could not open chart");
+      }
+    };
+    row.querySelector(".desk-chart-btn")?.addEventListener("click", openChart);
+    row.querySelector(".desk-leg-sym")?.addEventListener("click", (e) => {
+      e.stopPropagation();
+      openChart(e);
     });
   });
 
@@ -1802,6 +1870,201 @@ $("btnDhanRenew")?.addEventListener("click", async () => {
   } catch (err) {
     alert(err.message);
   }
+});
+
+async function openTradeChart(trade) {
+  const modal = $("tradeChartModal");
+  const canvas = $("tradeChartCanvas");
+  const title = $("tradeChartTitle");
+  const sub = $("tradeChartSub");
+  const status = $("tradeChartStatus");
+  if (!modal || !canvas) {
+    alert("Chart UI missing — hard refresh the page.");
+    return;
+  }
+  const sym = String(trade.symbol || "").toUpperCase();
+  title.textContent = `${sym} · trade chart`;
+  const side = trade.side || (trade.in_trade ? "open" : "closed");
+  sub.textContent = [
+    trade.strategy,
+    side,
+    trade.entry != null ? `entry ₹${money(trade.entry)}` : null,
+    trade.exit != null ? `exit ₹${money(trade.exit)}` : null,
+    formatIstTime(trade.entry_at) ? `@ ${formatIstTime(trade.entry_at)}` : null,
+    formatIstTime(trade.exit_at) ? `→ ${formatIstTime(trade.exit_at)}` : null,
+  ]
+    .filter(Boolean)
+    .join(" · ");
+  status.textContent = "Loading 1m bars…";
+  modal.classList.remove("hidden");
+  modal.setAttribute("aria-hidden", "false");
+
+  try {
+    const data = await api(`/api/bars?symbol=${encodeURIComponent(sym)}&interval=1m&range=1d`);
+    const bars = data.bars || [];
+    if (!bars.length) {
+      status.textContent = "No bars returned (feed/token may be cooling).";
+      drawTradeChart(canvas, [], trade);
+      return;
+    }
+    status.textContent = `${bars.length} × 1m bars · entry/exit/SL/TP overlay`;
+    drawTradeChart(canvas, bars, trade);
+  } catch (err) {
+    status.textContent = err.message || "Failed to load bars";
+    drawTradeChart(canvas, [], trade);
+  }
+}
+
+function closeTradeChart() {
+  const modal = $("tradeChartModal");
+  if (!modal) return;
+  modal.classList.add("hidden");
+  modal.setAttribute("aria-hidden", "true");
+}
+
+function drawTradeChart(canvas, bars, trade) {
+  const ctx = canvas.getContext("2d");
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 720;
+  const cssH = canvas.clientHeight || 360;
+  canvas.width = Math.floor(cssW * dpr);
+  canvas.height = Math.floor(cssH * dpr);
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+  ctx.fillStyle = "#0f1419";
+  ctx.fillRect(0, 0, cssW, cssH);
+
+  const pad = { l: 12, r: 64, t: 16, b: 28 };
+  const plotW = cssW - pad.l - pad.r;
+  const plotH = cssH - pad.t - pad.b;
+
+  const levels = [trade.entry, trade.exit, trade.stop, trade.target]
+    .map((x) => (x == null || Number.isNaN(Number(x)) ? null : Number(x)))
+    .filter((x) => x != null);
+  if (!bars.length && !levels.length) {
+    ctx.fillStyle = "#8b98a5";
+    ctx.font = "13px sans-serif";
+    ctx.fillText("No chart data", pad.l, pad.t + 20);
+    return;
+  }
+
+  let lo = levels.length ? Math.min(...levels) : Infinity;
+  let hi = levels.length ? Math.max(...levels) : -Infinity;
+  for (const b of bars) {
+    lo = Math.min(lo, Number(b.l), Number(b.o), Number(b.c));
+    hi = Math.max(hi, Number(b.h), Number(b.o), Number(b.c));
+  }
+  if (!Number.isFinite(lo) || !Number.isFinite(hi) || hi <= lo) {
+    lo = (levels[0] || 100) * 0.99;
+    hi = (levels[0] || 100) * 1.01;
+  }
+  const padPx = (hi - lo) * 0.08 || 1;
+  lo -= padPx;
+  hi += padPx;
+  const yOf = (px) => pad.t + ((hi - px) / (hi - lo)) * plotH;
+  const n = Math.max(bars.length, 1);
+  const slot = plotW / n;
+
+  // Profit / loss zones (TradingView-style bands between entry↔target / entry↔stop).
+  const entry = trade.entry != null ? Number(trade.entry) : null;
+  const stop = trade.stop != null ? Number(trade.stop) : null;
+  const target = trade.target != null ? Number(trade.target) : null;
+  const isShort = String(trade.side || "").toLowerCase().includes("short");
+  if (entry != null && target != null) {
+    const y1 = yOf(entry);
+    const y2 = yOf(target);
+    ctx.fillStyle = "rgba(34, 197, 94, 0.12)";
+    ctx.fillRect(pad.l, Math.min(y1, y2), plotW, Math.abs(y2 - y1));
+  }
+  if (entry != null && stop != null) {
+    const y1 = yOf(entry);
+    const y2 = yOf(stop);
+    ctx.fillStyle = "rgba(239, 68, 68, 0.12)";
+    ctx.fillRect(pad.l, Math.min(y1, y2), plotW, Math.abs(y2 - y1));
+  }
+
+  // Candles
+  bars.forEach((b, i) => {
+    const x = pad.l + i * slot + slot / 2;
+    const o = Number(b.o);
+    const h = Number(b.h);
+    const l = Number(b.l);
+    const c = Number(b.c);
+    const up = c >= o;
+    ctx.strokeStyle = up ? "#22c55e" : "#ef4444";
+    ctx.fillStyle = up ? "#22c55e" : "#ef4444";
+    ctx.beginPath();
+    ctx.moveTo(x, yOf(h));
+    ctx.lineTo(x, yOf(l));
+    ctx.stroke();
+    const bodyTop = yOf(Math.max(o, c));
+    const bodyH = Math.max(1, Math.abs(yOf(o) - yOf(c)));
+    const bw = Math.max(1, slot * 0.6);
+    ctx.fillRect(x - bw / 2, bodyTop, bw, bodyH);
+  });
+
+  const drawLevel = (px, color, label) => {
+    if (px == null || Number.isNaN(Number(px))) return;
+    const y = yOf(Number(px));
+    ctx.strokeStyle = color;
+    ctx.setLineDash([4, 3]);
+    ctx.beginPath();
+    ctx.moveTo(pad.l, y);
+    ctx.lineTo(pad.l + plotW, y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = color;
+    ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
+    ctx.fillText(`${label} ${Number(px).toFixed(2)}`, pad.l + plotW + 4, y + 4);
+  };
+  drawLevel(entry, "#e7e9ea", "E");
+  drawLevel(trade.exit, "#38bdf8", "X");
+  drawLevel(stop, "#ef4444", "SL");
+  drawLevel(target, "#22c55e", "TP");
+
+  // Entry / exit time markers on x-axis
+  const markTime = (iso, color, tag) => {
+    if (!iso || !bars.length) return;
+    const t = new Date(iso).getTime();
+    if (Number.isNaN(t)) return;
+    let best = 0;
+    let bestDiff = Infinity;
+    bars.forEach((b, i) => {
+      const bt = new Date(b.t).getTime();
+      const d = Math.abs(bt - t);
+      if (d < bestDiff) {
+        bestDiff = d;
+        best = i;
+      }
+    });
+    const x = pad.l + best * slot + slot / 2;
+    ctx.strokeStyle = color;
+    ctx.beginPath();
+    ctx.moveTo(x, pad.t);
+    ctx.lineTo(x, pad.t + plotH);
+    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.font = "10px sans-serif";
+    ctx.fillText(tag, x + 2, pad.t + 12);
+  };
+  markTime(trade.entry_at, "#e7e9ea", "IN");
+  markTime(trade.exit_at, "#38bdf8", "OUT");
+
+  // Side caption
+  ctx.fillStyle = "#8b98a5";
+  ctx.font = "11px sans-serif";
+  ctx.fillText(
+    `${isShort ? "SHORT" : "LONG"}${trade.pnl != null ? ` · PnL ₹${money(trade.pnl)}` : ""}`,
+    pad.l,
+    cssH - 8
+  );
+}
+
+$("tradeChartModal")?.querySelectorAll("[data-close-trade-chart]").forEach((el) => {
+  el.addEventListener("click", closeTradeChart);
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape") closeTradeChart();
 });
 
 boot().catch((err) => {

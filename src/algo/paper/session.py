@@ -228,6 +228,14 @@ class StrategyRunner:
             "session_open": p_all.get("session_open"),
             "last_closed": last_closed,
             "closed_count": len(closed),
+            "entry_at": (
+                (getattr(self.broker, "position_entry_at", None).isoformat()
+                 if getattr(self.broker, "position_entry_at", None) is not None
+                 else None)
+                if in_trade
+                else ((last_closed or {}).get("entry_at") if last_closed else None)
+            ),
+            "exit_at": None if in_trade else ((last_closed or {}).get("exit_at") if last_closed else None),
         }
         qty_n = int(st.trade_view["qty"] or 0)
         entry_n = float(st.entry_price) if st.entry_price is not None else None
@@ -1158,8 +1166,28 @@ class PaperSession:
                     "side": "long",
                     "stop": float(stop) if stop is not None else None,
                     "target": float(target) if target is not None else None,
+                    "entry_at": (
+                        t.get("entry_at").isoformat()
+                        if hasattr(t.get("entry_at"), "isoformat")
+                        else t.get("entry_at")
+                    ),
+                    "exit_at": (
+                        t.get("exit_at").isoformat()
+                        if hasattr(t.get("exit_at"), "isoformat")
+                        else t.get("exit_at")
+                    ),
                 }
             ]
+            et = t.get("entry_at")
+            if et is not None:
+                try:
+                    setattr(
+                        strat,
+                        "_entry_time",
+                        et if hasattr(et, "isoformat") else datetime.fromisoformat(str(et).replace("Z", "+00:00")),
+                    )
+                except Exception:
+                    pass
             runner._log(f"Restored closed option trade today — 1/day locked")
         elif opens:
             t = opens[0]
@@ -1170,6 +1198,14 @@ class PaperSession:
             qty = int(t.get("quantity") or runner.quantity or 0)
             runner.broker.position.quantity = qty
             runner.broker.position.avg_price = entry
+            et = t.get("entry_at")
+            if et is not None:
+                try:
+                    parsed = et if hasattr(et, "isoformat") else datetime.fromisoformat(str(et).replace("Z", "+00:00"))
+                    setattr(strat, "_entry_time", parsed)
+                    runner.broker.position_entry_at = parsed
+                except Exception:
+                    pass
             runner._log(f"Restored open option trade qty={qty}")
 
     def stop(self) -> None:
