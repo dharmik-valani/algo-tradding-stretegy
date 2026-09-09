@@ -125,6 +125,14 @@ class BasketRunner:
                     last_closed["target"] = leg.get("target")
                 if not last_closed.get("quantity") and leg.get("qty"):
                     last_closed["quantity"] = int(leg.get("qty") or 0)
+                # Never allow same-day re-entry once a closed fill exists.
+                leg["trades_today"] = max(int(leg.get("trades_today") or 0), 1)
+                if leg.get("stop") is None and last_closed.get("stop") is not None:
+                    leg["stop"] = last_closed.get("stop")
+                if leg.get("target") is None and last_closed.get("target") is not None:
+                    leg["target"] = last_closed.get("target")
+                if not leg.get("qty") and last_closed.get("quantity"):
+                    leg["qty"] = int(last_closed.get("quantity") or 0)
             # Prefer live position qty; else last closed fill; else planned tier qty.
             show_qty = abs(filled_qty) if filled_qty else (last_qty if not in_trade and last_qty else planned_qty)
             # Keep SL/TP visible after exit (review) — only blank after EOD desk settle.
@@ -480,6 +488,11 @@ class BasketRunner:
             self._log(f"REST-seeded {len(seeded)}/{len(self.selected)} selected LTPs")
         except Exception as exc:
             self._log(f"REST seed after scan failed: {exc}")
+        # Re-apply same-day journal locks after select_symbols rebuilds empty legs.
+        try:
+            self.restore_today_from_journal()
+        except Exception as exc:
+            self._log(f"post-scan journal restore failed: {exc}")
 
     def _seed_opening_ranges(self, quotes: LiveQuoteProvider, params: dict[str, Any]) -> None:
         """Backfill 09:15→now range highs/lows so a 09:18 scan still gets a full first candle."""
@@ -557,6 +570,12 @@ class BasketRunner:
         if not skip_selection:
             self._maybe_roll_trading_day()
             self.ensure_selection(quotes)
+        if not getattr(self, "_journal_restored", False):
+            try:
+                self.restore_today_from_journal()
+            except Exception:
+                pass
+            self._journal_restored = True
         self._maybe_eod_flatten(quotes)
         labels = []
         # Marks should already be REST-seeded + WS-subscribed by session.
