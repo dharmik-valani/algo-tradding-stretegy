@@ -421,6 +421,9 @@ class StrategyRunner:
             review_qty = abs(int(self.broker.position.quantity or 0)) or int(st.quantity or 0)
         elif last_closed and last_closed.get("quantity"):
             review_qty = int(last_closed["quantity"])
+        else:
+            # Always expose configured lot size on the desk (even on no-fill days).
+            review_qty = int(self.quantity or st.quantity or 0)
         day_realized = (
             self.closed_pnl_total()
             if self._desk_settled

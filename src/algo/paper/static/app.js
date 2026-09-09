@@ -687,13 +687,21 @@ function renderAnalyticsDeskRows(strategies) {
           !!(lc && (lc.exit != null || lc.entry != null)) || Number(tv.closed_count || 0) > 0;
         stocks = isOpen ? "1" : "0";
         posTitle = traded ? "Open trade count" : "No fill today";
+        const configuredQty = Number(s.quantity) || 0;
         const q = isOpen
-          ? Math.abs(posQty) || Number(tv.qty) || Number(s.quantity) || 0
-          : lc && lc.quantity
-            ? Number(lc.quantity)
-            : Number(tv.qty) || 0;
-        qtyCell = q > 0 && (isOpen || traded) ? String(q) : "—";
-        qtyTitle = traded ? "Filled qty" : "Qty blank until a fill";
+          ? Math.abs(posQty) || Number(tv.qty) || configuredQty
+          : traded
+            ? Number(lc?.quantity) || Number(tv.qty) || configuredQty
+            : Number(tv.qty) || configuredQty;
+        qtyCell =
+          q > 0
+            ? traded || isOpen
+              ? String(q)
+              : `${q}<div class="meta pnl-sub">lot</div>`
+            : "—";
+        qtyTitle = traded || isOpen
+          ? "Filled qty (open or last exit)"
+          : "Configured lot size (no fill today)";
       }
 
       let market = "—";
@@ -1055,15 +1063,21 @@ function renderExecStats(session) {
         posTitle = traded
           ? "Open trade count (0 after exit — 1 trade/day)"
           : "No fill today — Open stays 0";
+        const configuredQty = Number(s.quantity) || 0;
         const q = isOpen
-          ? Math.abs(posQty) || Number(tv.qty) || Number(s.quantity) || 0
-          : lc && lc.quantity
-            ? Number(lc.quantity)
-            : Number(tv.qty) || 0;
-        qtyCell = q > 0 && (isOpen || traded) ? String(q) : "—";
-        qtyTitle = traded
+          ? Math.abs(posQty) || Number(tv.qty) || configuredQty
+          : traded
+            ? Number(lc?.quantity) || Number(tv.qty) || configuredQty
+            : Number(tv.qty) || configuredQty;
+        qtyCell =
+          q > 0
+            ? traded || isOpen
+              ? String(q)
+              : `${q}<div class="meta pnl-sub">lot</div>`
+            : "—";
+        qtyTitle = traded || isOpen
           ? "Filled qty (open or last exit)"
-          : "Qty blank until a fill (not the configured lot size)";
+          : "Configured lot size (no fill today)";
       }
 
       // Market = live mark; after exit keep entry/exit/SL/TP for review (1 trade/day).
