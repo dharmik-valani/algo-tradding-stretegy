@@ -4,15 +4,20 @@ from typing import Any
 
 
 def summarize_closed_trades(trades: list[dict[str, Any]]) -> dict[str, Any]:
-    """Win rate / avg win / avg loss from closed round-trips."""
+    """Win rate from closed round-trips.
+
+    win_rate = wins / (wins + losses) × 100
+    Breakeven (pnl == 0) is tracked but excluded from the win-rate denominator
+    so a flat scratch does not look like a loss.
+    """
     pnls = [float(t.get("pnl", 0) or 0) for t in trades]
     wins = [p for p in pnls if p > 0]
     losses = [p for p in pnls if p < 0]
     flats = [p for p in pnls if p == 0]
-    n = len(pnls)
-    win_rate = (len(wins) / n * 100.0) if n else None
+    decided = len(wins) + len(losses)
+    win_rate = (len(wins) / decided * 100.0) if decided else None
     return {
-        "trades": n,
+        "trades": len(pnls),
         "wins": len(wins),
         "losses": len(losses),
         "breakeven": len(flats),

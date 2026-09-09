@@ -146,6 +146,22 @@ class BasketRunner:
                 if leg.get("target") is not None
                 else (last_closed or {}).get("target")
             )
+            entry_px = (
+                float(pos.avg_price)
+                if in_trade and pos.avg_price
+                else (
+                    float((last_closed or {}).get("entry"))
+                    if (last_closed or {}).get("entry") is not None
+                    else (float(leg["entry"]) if leg.get("entry") is not None else None)
+                )
+            )
+            # Actual money used in the trade = |qty| × entry (not the full capital slice).
+            notional_qty = abs(filled_qty) if filled_qty else (last_qty if last_closed else 0)
+            notional = (
+                round(float(notional_qty) * float(entry_px), 2)
+                if entry_px is not None and notional_qty
+                else 0.0
+            )
             legs.append(
                 {
                     "symbol": sym,
@@ -167,6 +183,9 @@ class BasketRunner:
                     "reject_reason": leg.get("reject_reason"),
                     "status": "settled" if self._desk_settled else status,
                     "capital": round(per_leg_cash, 2),
+                    "allocated": round(per_leg_cash, 2),
+                    "notional": notional,
+                    "deployed": notional if (in_trade or last_closed) else 0.0,
                     "entry": (pos.avg_price if in_trade else (last_closed or {}).get("entry")),
                     "exit": None if in_trade else (last_closed or {}).get("exit"),
                     "leg_pnl": (
@@ -175,6 +194,15 @@ class BasketRunner:
                         else (0.0 if self._desk_settled else float((last_closed or {}).get("pnl") or broker.realized_pnl or 0))
                     ),
                     "last_closed": last_closed,
+                    "leg_win": (
+                        True
+                        if last_closed and float(last_closed.get("pnl") or 0) > 0
+                        else (
+                            False
+                            if last_closed and float(last_closed.get("pnl") or 0) < 0
+                            else None
+                        )
+                    ),
                 }
             )
         if self._desk_settled:
@@ -247,6 +275,18 @@ class BasketRunner:
             closed_all.extend(getattr(b, "closed_trades", []) or [])
         last_closed = closed_all[-1] if closed_all else None
         live_day = float(self._day_pnl or 0) if self._desk_settled else float(realized + unreal)
+        deployed_open = round(
+            sum(float(x.get("notional") or 0) for x in legs if x.get("in_trade")),
+            2,
+        )
+        deployed_day = round(
+            sum(
+                float(x.get("notional") or 0)
+                for x in legs
+                if x.get("in_trade") or int(x.get("trades_today") or 0) >= 1 or x.get("exit") is not None
+            ),
+            2,
+        )
         st.trade_view = {
             "market": st.last_price,
             "entry": st.entry_price,
@@ -259,6 +299,10 @@ class BasketRunner:
             "closed_count": len(closed_all),
             "open_count": 0 if self._desk_settled else len(active),
             "invested": float(self.starting_cash),
+            "allocated": float(self.starting_cash),
+            "deployed": deployed_open,
+            "deployed_day": deployed_day,
+            "free": round(float(self.starting_cash) - deployed_open, 2),
             "equity": float(self.starting_cash) + live_day,
             "day_pnl": live_day,
             "desk_settled": bool(self._desk_settled),

@@ -229,6 +229,20 @@ class StrategyRunner:
             "last_closed": last_closed,
             "closed_count": len(closed),
         }
+        qty_n = int(st.trade_view["qty"] or 0)
+        entry_n = float(st.entry_price) if st.entry_price is not None else None
+        if entry_n is None and last_closed and last_closed.get("entry") is not None:
+            entry_n = float(last_closed["entry"])
+        notional = round(qty_n * entry_n, 2) if entry_n is not None and qty_n else 0.0
+        st.trade_view.update(
+            {
+                "allocated": float(st.starting_cash or 0),
+                "notional": notional,
+                "deployed": notional if in_trade else 0.0,
+                "deployed_day": notional if (in_trade or last_closed) else 0.0,
+                "free": round(float(st.starting_cash or 0) - (notional if in_trade else 0.0), 2),
+            }
+        )
         if not in_trade and last_closed:
             # Desk shows last closed levels so PnL isn't "mystery money".
             st.note = st.note or self.last_signal or "HOLD"

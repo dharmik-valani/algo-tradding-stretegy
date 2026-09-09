@@ -386,12 +386,13 @@ def report_summary(
         w = [v for v in vals if v > 0]
         l = [v for v in vals if v < 0]
         n = len(vals)
+        decided = len(w) + len(l)
         return {
             "trades": n,
             "wins": len(w),
             "losses": len(l),
             "breakeven": n - len(w) - len(l),
-            "win_rate": round(len(w) / n * 100, 2) if n else None,
+            "win_rate": round(len(w) / decided * 100, 2) if decided else None,
             "avg_win": round(sum(w) / len(w), 2) if w else None,
             "avg_loss": round(sum(l) / len(l), 2) if l else None,
             "net_pnl": round(sum(vals), 2) if vals else 0.0,
@@ -531,7 +532,9 @@ def daily_report(
                 "open": b["open"],
                 "wins": b["wins"],
                 "losses": b["losses"],
-                "win_rate": round(b["wins"] / closed * 100, 2) if closed else None,
+                "win_rate": round(b["wins"] / (b["wins"] + b["losses"]) * 100, 2)
+                if (b["wins"] + b["losses"])
+                else None,
                 "avg_win": round(sum(w) / len(w), 2) if w else None,
                 "avg_loss": round(sum(l) / len(l), 2) if l else None,
                 "net_pnl": round(b["net_pnl"], 2),

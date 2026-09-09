@@ -87,6 +87,30 @@ function pct(n) {
   return `${Number(n).toFixed(1)}%`;
 }
 
+/** Win cell: rate + W/L counts when available. */
+function winCell(a) {
+  if (!a || (a.win_rate == null && a.wins == null && a.losses == null)) return "—";
+  const wr = a.win_rate != null ? pct(a.win_rate) : "—";
+  const w = Number(a.wins || 0);
+  const l = Number(a.losses || 0);
+  if (!w && !l && a.win_rate == null) return "—";
+  const sub = w + l > 0 ? `${w}W/${l}L` : "";
+  return sub
+    ? `<div>${wr}</div><div class="meta pnl-sub" title="Wins / losses on closed trades (breakeven excluded)">${sub}</div>`
+    : wr;
+}
+
+function capitalCell(allocated, used, { usedLabel = "used" } = {}) {
+  const alloc = allocated != null && !Number.isNaN(Number(allocated)) ? Number(allocated) : null;
+  const dep = used != null && !Number.isNaN(Number(used)) ? Number(used) : 0;
+  if (alloc == null) return "—";
+  const usedLine =
+    dep > 0
+      ? `<div class="meta pnl-sub" title="Actual ₹ put into trades = qty × entry">${usedLabel} ₹${moneyShort(dep)}</div>`
+      : `<div class="meta pnl-sub" title="No shares bought/sold yet from this capital">used ₹0</div>`;
+  return `<div title="Paper capital allocated ₹${money(alloc)}">₹${moneyShort(alloc)}</div>${usedLine}`;
+}
+
 function pnlClass(n) {
   if (n > 0) return "pos";
   if (n < 0) return "neg";
@@ -791,7 +815,13 @@ function renderExecStats(session) {
           </div>
           <div class="meta">${nameSub}${canExpand ? ` · ${basket.length} symbols` : " · 1 trade/day"}</div>
         </td>
-        <td data-label="Capital" class="mono" title="Paper capital ₹${money(invested)}">₹${moneyShort(invested)}</td>
+        <td data-label="Capital" class="mono">${capitalCell(
+          invested,
+          Number(tv.deployed != null ? tv.deployed : tv.deployed_day) ||
+            (!isBasket && Number(tv.notional || 0)) ||
+            0,
+          { usedLabel: isOpen ? "in use" : "used today" }
+        )}</td>
         <td data-label="Generated" class="mono ${pnlClass(dayPnl)}" title="Capital + day PnL · ₹${money(generated)}">
           <div>₹${moneyShort(generated)}</div>
           <div class="meta pnl-sub">day ₹${moneyShort(dayPnl)}</div>
@@ -811,7 +841,7 @@ function renderExecStats(session) {
         <td data-label="Qty" class="mono" title="${escapeHtml(qtyTitle)}">${qtyCell}</td>
         <td data-label="Stop" class="mono">${sl}</td>
         <td data-label="Target" class="mono">${tp}</td>
-        <td data-label="Win" class="mono">${pct(a.win_rate)}</td>
+        <td data-label="Win" class="mono" title="Win rate = wins ÷ (wins + losses) on closed paper trades">${winCell(a)}</td>
         <td data-label="Actions" class="desk-actions-cell">
           <div class="desk-row-actions">
             <button type="button" data-act="${toggleAct}" class="desk-btn ${s.enabled ? "" : "primary"}">${toggleLabel}</button>
@@ -825,7 +855,8 @@ function renderExecStats(session) {
       const childRows = basket
         .map((leg) => {
           const legOpen = !!leg.in_trade;
-          const legCap = Number(leg.capital != null ? leg.capital : invested / Math.max(basket.length, 1));
+          const legCap = Number(leg.allocated != null ? leg.allocated : leg.capital != null ? leg.capital : invested / Math.max(basket.length, 1));
+          const legUsed = Number(leg.notional != null ? leg.notional : leg.deployed) || 0;
           const legPnl = Number(leg.leg_pnl != null ? leg.leg_pnl : (legOpen ? leg.unrealized : leg.realized) || 0);
           const legGen = legCap + legPnl;
           const legMarket = leg.last != null ? money(leg.last) : "—";
@@ -842,6 +873,8 @@ function renderExecStats(session) {
           const legQty = Math.abs(Number(leg.qty) || Number(leg.filled_qty) || Number(leg.planned_qty) || 0);
           const legQtyLabel = legQty > 0 ? String(legQty) : "—";
           const tradedToday = Number(leg.trades_today || 0) >= 1;
+          const legWin =
+            leg.leg_win === true ? "W" : leg.leg_win === false ? "L" : tradedToday ? "—" : "—";
           // Entry column: price when filled; otherwise leave blank (status stays under symbol).
           const legEntryHint = "";
           return `
@@ -853,7 +886,7 @@ function renderExecStats(session) {
               </div>
               <div class="meta">${escapeHtml(leg.status || "")}${leg.side ? ` · ${escapeHtml(String(leg.side))}` : ""}${tradedToday && !legOpen ? " · 1/day" : ""}</div>
             </td>
-            <td data-label="Capital" class="mono" title="Allocated to this symbol ₹${money(legCap)}">₹${moneyShort(legCap)}</td>
+            <td data-label="Capital" class="mono">${capitalCell(legCap, legUsed, { usedLabel: legOpen ? "in use" : "used" })}</td>
             <td data-label="Generated" class="mono ${pnlClass(legPnl)}">
               <div>₹${moneyShort(legGen)}</div>
               <div class="meta pnl-sub">day ₹${moneyShort(legPnl)}</div>
@@ -866,7 +899,7 @@ function renderExecStats(session) {
             <td data-label="Qty" class="mono" title="Trade-wise share quantity">${legQtyLabel}</td>
             <td data-label="Stop" class="mono">${legSl}</td>
             <td data-label="Target" class="mono">${legTp}</td>
-            <td data-label="Win" class="mono">—</td>
+            <td data-label="Win" class="mono" title="This leg's closed trade result">${legWin}</td>
             <td data-label="Actions" class="desk-actions-cell"><span class="meta">leg</span></td>
           </tr>`;
         })
@@ -878,15 +911,15 @@ function renderExecStats(session) {
 
   root.innerHTML = `
     <p class="hint desk-legend tight">
-      ▶ basket symbols show live MARKET. After exit, Qty / Stop / Target stay visible (1 trade/symbol/day — no re-entry).
-      Open = in-trade count · Qty = shares.
+      ▶ Capital = allocated bank. Under it, used = actual money in trades (qty × entry).
+      Win = wins÷(wins+losses) on closed trades · leg W/L is that symbol's result · 1 trade/symbol/day.
     </p>
     <div class="table-wrap desk-table-wrap">
       <table class="data-table dense cards-on-mobile" id="execStatsTable">
         <thead>
           <tr>
             <th>Strategy</th>
-            <th title="Paper capital">Capital</th>
+            <th title="Allocated paper capital · used = qty × entry">Capital</th>
             <th title="Capital + day PnL">Generated</th>
             <th title="Live / settled day PnL">PnL</th>
             <th title="Live mark while in trade">Market</th>
@@ -896,7 +929,7 @@ function renderExecStats(session) {
             <th title="Share / lot quantity">Qty</th>
             <th>Stop</th>
             <th>Target</th>
-            <th>Win</th>
+            <th title="Win rate = wins ÷ (wins+losses); leg shows W/L for that trade">Win</th>
             <th>Actions</th>
           </tr>
         </thead>
