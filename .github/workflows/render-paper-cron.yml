@@ -20,36 +20,39 @@
 #   15:40 IST post-market email → 10:10 UTC
 #   15:45 IST sleep → 10:15 UTC
 #
-# Note: GitHub schedule can skip or delay under load. Multiple wake pings
-# make a missed single cron less likely. Check Actions → this workflow
-# for event=schedule (not only workflow_dispatch).
+# Note: GitHub schedule is best-effort and often skips/delays. Prefer also
+# UptimeRobot (or cron-job.org) hitting GET /api/cron/heartbeat every 5 min
+# with ?cron_secret=CRON_SECRET — that endpoint auto-wakes, sleeps, and
+# sends once-daily open/close emails even if Actions is late.
 
 name: Render paper desk cron
 
 on:
   schedule:
-    # Keep free instance warm Mon–Fri from ~08:00 IST through post-close buffer
-    - cron: "*/10 2-10 * * 1-5"
+    # Heartbeat keep-alive Mon–Fri ~08:00–15:50 IST (offset minutes avoid :00 pile-up)
+    - cron: "3,8,13,18,23,28,33,38,43,48,53,58 2-10 * * 1-5"
     # Redundant pre-market wakes (GitHub cron is often late or skipped)
-    - cron: "50 2 * * 1-5"   # ~08:20 IST
-    - cron: "10 3 * * 1-5"   # ~08:40 IST
-    - cron: "20 3 * * 1-5"   # ~08:50 IST
-    - cron: "35 3 * * 1-5"   # ~09:05 IST
+    - cron: "47 2 * * 1-5"   # ~08:17 IST
+    - cron: "7 3 * * 1-5"    # ~08:37 IST
+    - cron: "17 3 * * 1-5"   # ~08:47 IST
+    - cron: "27 3 * * 1-5"   # ~08:57 IST
+    - cron: "37 3 * * 1-5"   # ~09:07 IST
     # Pre-market deep health + email (~08:55 IST) — after wake, before cash open
     - cron: "25 3 * * 1-5"   # ~08:55 IST
     # Post-market deep health + email (~15:40 IST), then sleep at 15:45
     - cron: "10 10 * * 1-5"  # ~15:40 IST
-    - cron: "15 10 * * 1-5"  # ~15:45 IST sleep
+    - cron: "17 10 * * 1-5"  # ~15:47 IST sleep
     # Dhan SELF RenewToken (~every 6h IST daytime + evening) → persists to Postgres
-    - cron: "20 4,10,16,22 * * *"  # ~09:50 / 15:50 / 21:50 / 03:50 IST
+    - cron: "23 4,10,16,22 * * *"  # ~09:53 / 15:53 / 21:53 / 03:53 IST
   workflow_dispatch:
     inputs:
       action:
-        description: "health | wake | sleep | report_open | report_close | dhan_renew"
+        description: "heartbeat | health | wake | sleep | report_open | report_close | dhan_renew"
         required: true
-        default: health
+        default: heartbeat
         type: choice
         options:
+          - heartbeat
           - health
           - wake
           - sleep
@@ -77,7 +80,7 @@ jobs:
           # schedule: github.event.schedule is the cron expression that fired
           CRON='${{ github.event.schedule }}'
           case "$CRON" in
-            "50 2 * * 1-5"|"10 3 * * 1-5"|"20 3 * * 1-5"|"35 3 * * 1-5")
+            "47 2 * * 1-5"|"7 3 * * 1-5"|"17 3 * * 1-5"|"27 3 * * 1-5"|"37 3 * * 1-5")
               echo "action=wake" >> "$GITHUB_OUTPUT"
               ;;
             "25 3 * * 1-5")
@@ -86,14 +89,15 @@ jobs:
             "10 10 * * 1-5")
               echo "action=report_close" >> "$GITHUB_OUTPUT"
               ;;
-            "15 10 * * 1-5")
+            "17 10 * * 1-5")
               echo "action=sleep" >> "$GITHUB_OUTPUT"
               ;;
-            "20 4,10,16,22 * * *")
+            "23 4,10,16,22 * * *")
               echo "action=dhan_renew" >> "$GITHUB_OUTPUT"
               ;;
             *)
-              echo "action=health" >> "$GITHUB_OUTPUT"
+              # Default keep-alive slot → smart heartbeat (wake + once-daily email)
+              echo "action=heartbeat" >> "$GITHUB_OUTPUT"
               ;;
           esac
 
@@ -130,7 +134,7 @@ jobs:
               echo "$body" | sed '$d' | head -c 1200
               echo
               # For report endpoints, also print the trailing email status object
-              echo "$body" | sed '$d' | tr ',' '\n' | grep -E '"email"|"provider"|"message_id"|"smtp_configured"|"summary"|"ok"' | head -n 40 || true
+              echo "$body" | sed '$d' | tr ',' '\n' | grep -E '"email"|"provider"|"message_id"|"smtp_configured"|"summary"|"ok"|"actions"|"message"' | head -n 40 || true
               echo "http=${code}"
               if [ "$code" = "200" ]; then
                 return 0
@@ -143,6 +147,10 @@ jobs:
           # Warm the free instance before wake/sleep/report so cold-start does not fail.
           case "$ACTION" in
             health) attempt GET  /api/health ;;
+            heartbeat)
+              attempt GET /api/health || true
+              attempt GET "/api/cron/heartbeat?poll_seconds=15&send_email=true"
+              ;;
             wake)
               attempt GET /api/health || true
               attempt POST "/api/session/wake?poll_seconds=15"

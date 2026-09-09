@@ -73,21 +73,34 @@ docs/          paper-trading.md, dhan-mcp.md, architecture
 2. Create a **Web Service** from the repo (or apply `render.yaml` Blueprint).
 3. Set env vars in the Dashboard: `DHAN_CLIENT_ID`, `DHAN_ACCESS_TOKEN`, `DATABASE_URL` (Supabase), `CRON_SECRET`, plus email vars below for digests.
 4. Open the service URL → configure strategies once → Start live (or let cron wake).
-5. Free tier sleeps after ~15 min idle. **GitHub Actions** (not paid Render Cron) keeps it alive:
+5. Free tier sleeps after ~15 min idle. **Do not rely on GitHub Actions alone** — its `schedule` often skips or runs hours late.
 
-### Cron (GitHub Actions — free)
+### Keep Render awake automatically (required)
+
+GitHub cron is best-effort. Add a free **UptimeRobot** (or cron-job.org) HTTP monitor:
+
+1. Create monitor → type **HTTPS**
+2. URL (every **5 minutes**):
+   `https://algo-paper-desk.onrender.com/api/cron/heartbeat?cron_secret=YOUR_CRON_SECRET&send_email=true`
+3. That single ping will:
+   - keep the free instance warm
+   - auto-**wake** live paper Mon–Fri 08:00–15:45 IST
+   - auto-**sleep** after 15:45 IST
+   - send **pre-market / post-market Brevo emails once per day** (even if GitHub is late)
+
+Use the same `CRON_SECRET` value as on Render.
+
+### Cron (GitHub Actions — backup)
 
 Workflow: `.github/workflows/render-paper-cron.yml`
 
-IST = UTC+5:30 (no DST). Schedules are written in UTC and mapped carefully.
-
 | When (IST, Mon–Fri) | Action |
 |---------------------|--------|
-| Every ~10 min, ~08:00–15:50 | `GET /api/health` (keep awake) |
-| ~08:20 / 08:40 / 08:50 / 09:05 | `POST /api/session/wake` (start live; redundant for reliability) |
-| ~08:55 | wake → deep health (REST + WebSocket) → email **pre-market** report |
-| ~15:40 | deep health → email **post-market** report |
-| ~15:45 | `POST /api/session/sleep` (stop live) |
+| ~every 5 min, 08:00–15:50 | `GET /api/cron/heartbeat` (wake + once-daily email) |
+| ~08:17 / 08:37 / 08:47 / 08:57 / 09:07 | extra `wake` pings |
+| ~08:55 | `report_open` email |
+| ~15:40 | `report_close` email |
+| ~15:47 | `sleep` |
 
 Repo secrets (GitHub Actions):
 
@@ -101,9 +114,12 @@ Render env for email digests (to `dharmikvalani57@gmail.com`):
 - `BREVO_API_KEY` = Brevo transactional API key (preferred; uses HTTPS, ignores `EMAIL_HOST`)
 - Optional SMTP fallback: `SMTP_USER` + `SMTP_PASSWORD` + `EMAIL_HOST` / `SMTP_HOST`
 
+If Brevo says sent but Gmail is empty, check **Spam / Promotions**, and confirm `mail.weupsell.com` has SPF/DKIM in Brevo.
+
 Manual test (Actions → this workflow → Run workflow):
 
-- `report_open` / `report_close` — full deep check + email
+- `heartbeat` — wake + digest if due
+- `report_open` / `report_close` — force email
 - `wake` / `sleep` / `health` — session only
 
 Also grant Render’s GitHub app access to this **private** repo, or deploys will fail to clone.

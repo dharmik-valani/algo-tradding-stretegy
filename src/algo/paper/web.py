@@ -29,12 +29,16 @@ app = FastAPI(title="Algo Paper Desk", version="0.1.0")
 app.mount("/static", StaticFiles(directory=STATIC), name="static")
 
 
-def _require_cron_secret(x_cron_secret: str | None) -> None:
-    """If CRON_SECRET is set on the service, cron callers must send matching header."""
+def _require_cron_secret(
+    x_cron_secret: str | None,
+    cron_secret_query: str | None = None,
+) -> None:
+    """If CRON_SECRET is set on the service, cron callers must send matching header or query."""
     expected = (os.environ.get("CRON_SECRET") or "").strip()
     if not expected:
         return
-    if (x_cron_secret or "").strip() != expected:
+    got = (x_cron_secret or "").strip() or (cron_secret_query or "").strip()
+    if got != expected:
         raise HTTPException(status_code=401, detail="invalid cron secret")
 
 
@@ -122,6 +126,24 @@ def report_close(
     from algo.paper.health_report import run_market_report
 
     return run_market_report("close", send=send_email)
+
+
+@app.api_route("/api/cron/heartbeat", methods=["GET", "POST"])
+def cron_heartbeat(
+    poll_seconds: float = Query(15.0, ge=5.0, le=120.0),
+    send_email: bool = Query(True),
+    cron_secret: str | None = Query(default=None),
+    x_cron_secret: str | None = Header(default=None, alias="X-Cron-Secret"),
+) -> dict:
+    """External keep-alive + auto wake/sleep + once-daily digests (IST).
+
+    Prefer this over bare ``/api/health`` for UptimeRobot / cron-job.org.
+    Auth: ``X-Cron-Secret`` header **or** ``?cron_secret=`` query (for GET monitors).
+    """
+    _require_cron_secret(x_cron_secret, cron_secret)
+    from algo.paper.cron_heartbeat import run_heartbeat
+
+    return run_heartbeat(poll_seconds=poll_seconds, send_email=send_email)
 
 
 @app.post("/api/session/reload")
