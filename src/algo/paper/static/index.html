@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="/static/styles.css?v=desk45" />
+  <link rel="stylesheet" href="/static/styles.css?v=desk46" />
 </head>
 <body>
   <div class="app">
@@ -51,6 +51,7 @@
       <div class="topbar-copy">
         <h1 id="viewTitle">Analytics</h1>
         <p class="subtitle" id="viewSubtitle">Day / week / month and strategy performance</p>
+        <p class="phase-log" id="phaseLog" hidden></p>
       </div>
       <div class="top-actions">
         <button id="btnStart" class="primary">Start</button>
@@ -216,7 +217,7 @@
             <h2>On desk</h2>
             <span class="count-pill" id="deskCount">0</span>
           </div>
-          <p class="hint tight">09:15–15:30 IST · scan 09:30 → basket legs · fill on breakout · max 10 trades/strategy/day · 1 trade/symbol/day · flatten 15:00</p>
+          <p class="hint tight">09:13 premarket WS check · open 09:15 · basket scan 09:18 · flatten 15:00 IST · max 10 trades/strategy/day · 1 trade/symbol/day</p>
           <div id="execDeskList" class="exec-desk-list"></div>
         </div>
 
@@ -540,6 +541,6 @@
     </div>
   </div>
 
-  <script src="/static/app.js?v=desk45"></script>
+  <script src="/static/app.js?v=desk46"></script>
 </body>
 </html>

@@ -1969,9 +1969,19 @@ async function refreshReports() {
 function render(session) {
   lastSession = session;
   setText("sessionMsg", session.message || "");
+  const phaseEl = $("phaseLog");
+  if (phaseEl) {
+    const log = session.phase_log || "";
+    phaseEl.textContent = log;
+    phaseEl.hidden = !log;
+    phaseEl.dataset.phase = session.market_phase || "";
+  }
   const pill = $("statusPill");
   if (pill) {
-    pill.textContent = session.running ? `${session.mode} · running` : session.mode || "idle";
+    const phase = session.market_phase && session.running ? session.market_phase : null;
+    pill.textContent = session.running
+      ? `${session.mode}${phase ? ` · ${phase}` : " · running"}`
+      : session.mode || "idle";
     pill.classList.toggle("running", !!session.running);
   }
   renderSummary(session);

@@ -11,7 +11,7 @@ from algo.config import Settings
 from algo.paper.broker import PaperBroker, utcnow
 from algo.paper.equity_orb import _EquityOrbBase
 from algo.paper.equity_orb_tier import _EquityOrbTierBase
-from algo.paper.journal import close_trade, list_trades, open_trade, record_selections
+from algo.paper.journal import close_trade, list_selections, list_trades, open_trade, record_selections
 from algo.paper.models import Bar, Position, Side, SignalAction, StrategyState
 from algo.paper.quotes import LiveQuoteProvider
 from algo.paper.universe import resolve_universe
@@ -151,7 +151,10 @@ class BasketRunner:
         cash = self.cash_pool
         n_sel = max(len(self.selected) or len(self.brokers) or 1, 1)
         per_leg_cash = float(self.starting_cash) / n_sel
-        for sym, broker in self.brokers.items():
+        for sym in (self.selected or list(self.brokers.keys())):
+            broker = self.brokers.get(sym)
+            if broker is None:
+                continue
             hist = self.histories.get(sym) or []
             px = hist[-1].close if hist else None
             if px is not None:
@@ -447,10 +450,66 @@ class BasketRunner:
             st.note = f"{st.note} · flat (realized)" if st.note else "flat (realized)"
         return st
 
+    def restore_today_basket_selection(self) -> list[str]:
+        """Reload today's locked top_n basket from paper_selections (not only traded legs).
+
+        Restarts used to restore fills-only, then skip the real 09:18 top-10 and later
+        re-scan a different set. Prefer the earliest full top_n batch today.
+        """
+        today = datetime.now(IST).date().isoformat()
+        top_n = int(self.max_trades_per_day() or 10)
+        try:
+            rows = list_selections(
+                strategy_id=self.strategy.id,
+                from_date=today,
+                to_date=today,
+                limit=300,
+            )
+        except Exception as exc:
+            self._log(f"selection restore skipped: {exc}")
+            return []
+        mine = [
+            r
+            for r in rows
+            if str(r.get("instance_id") or "") == self.instance_id
+            and str(r.get("symbol") or "").strip()
+        ]
+        if not mine:
+            mine = [r for r in rows if str(r.get("symbol") or "").strip()]
+        if not mine:
+            return []
+        batches: dict[str, list[str]] = {}
+        for r in mine:
+            key = str(r.get("selected_at") or "")
+            sym = str(r.get("symbol") or "").upper()
+            if not sym:
+                continue
+            bucket = batches.setdefault(key, [])
+            if sym not in bucket:
+                bucket.append(sym)
+        for key in sorted(k for k in batches if k):
+            syms = batches[key]
+            if len(syms) >= top_n:
+                return list(syms)[:top_n]
+        if not batches:
+            return []
+        best_key = max(batches, key=lambda k: (len(batches[k]), k or ""))
+        return list(batches[best_key])[:top_n]
+
+    def _ensure_brokers_for_selected(self) -> None:
+        n = max(len(self.selected) or 1, 1)
+        for sym in self.selected:
+            if sym not in self.brokers:
+                b = PaperBroker(starting_cash=self.starting_cash / n)
+                b.bind(self.strategy.id, f"NSE:EQ:{sym}", sym)
+                self.brokers[sym] = b
+                self.histories.setdefault(sym, [])
+
     def restore_today_from_journal(self) -> int:
         """Rebuild same-day locks + open/closed levels from journal after process restart.
 
         Prevents re-entry on symbols already traded today and keeps qty/stop/target visible.
+        Does NOT shrink the day's locked top_n basket — only merges trade state.
         """
         today = datetime.now(IST).date()
 
@@ -483,14 +542,17 @@ class BasketRunner:
         if not by_sym:
             return 0
 
-        # Attach same-day journal symbols for review / open management.
-        # New entries are still hard-capped by max_trades_per_day; ensure_selection
-        # also skips a fresh top_n scan once today's journal exists.
+        # Merge traded names into the locked basket — never replace a full top_n with fills-only.
+        top_n = int(self.max_trades_per_day() or 10)
+        locked_full = len(self.selected) >= top_n
         for sym in by_sym:
             if sym not in self.selected:
+                # If today's top_n is already locked, keep review via brokers/legs only —
+                # do not grow the visible basket past top_n with later stray fills.
+                if locked_full:
+                    continue
                 self.selected.append(sym)
         self.strategy.selected = list(self.selected)
-        self._scanned = bool(self.selected)
         n_sel = max(len(self.selected) or 1, 1)
         restored = 0
 
@@ -525,7 +587,6 @@ class BasketRunner:
             leg = legs_map[sym]
 
             if closed:
-                # Already finished today — lock 1/day and keep levels for review.
                 t = closed[0]
                 qty = int(t.get("quantity") or (t.get("meta") or {}).get("qty") or 0)
                 stop = t.get("stop_price")
@@ -563,7 +624,6 @@ class BasketRunner:
                         "exit_at": exit_at,
                     }
                 ]
-                # Drop orphan open journal ids so we don't manage ghost positions.
                 self.open_trade_ids.pop(sym, None)
                 restored += 1
                 continue
@@ -617,27 +677,49 @@ class BasketRunner:
         return restored
 
     def ensure_selection(self, quotes: LiveQuoteProvider) -> None:
-        # Prefer same-day journal + already-locked basket over a fresh top_n scan.
-        # Re-scanning after restart was merging a new top_n with yesterday's journal
-        # names and blowing past the 10-trade daily cap.
-        if not self._scanned:
+        # Prefer same-day locked basket (paper_selections) + journal fills over a fresh scan.
+        top_n = int(self.max_trades_per_day() or 10)
+        if not self._scanned or len(self.selected) < top_n:
             try:
-                restored = self.restore_today_from_journal()
+                locked = self.restore_today_basket_selection()
             except Exception as exc:
-                restored = 0
-                self._log(f"pre-scan journal restore failed: {exc}")
-            if self.selected:
+                locked = []
+                self._log(f"pre-scan selection restore failed: {exc}")
+            if locked:
+                self.selected = list(locked)[:top_n]
                 self.strategy.selected = list(self.selected)
+                self._ensure_brokers_for_selected()
                 self._scanned = True
-                if restored:
-                    self._log(
-                        f"Locked today's basket ({len(self.selected)} symbols, "
-                        f"{self.trades_used_today()}/{self.max_trades_per_day()} trades) — skip re-scan"
-                    )
+                self._log(
+                    f"Locked today's basket ({len(self.selected)}): "
+                    f"{', '.join(self.selected)} — skip re-scan"
+                )
+            try:
+                self.restore_today_from_journal()
+            except Exception as exc:
+                self._log(f"pre-scan journal restore failed: {exc}")
+            if locked:
+                self.selected = list(locked)[:top_n]
+                self.strategy.selected = list(self.selected)
+                self._ensure_brokers_for_selected()
+            if self._scanned and self.selected:
                 return
-        if self._scanned and self.strategy.selected:
-            self.selected = list(self.strategy.selected)
+
+        if self._scanned:
+            # Never re-scan the same IST day once a basket is locked.
+            if len(self.selected) != top_n:
+                try:
+                    locked = self.restore_today_basket_selection()
+                except Exception:
+                    locked = []
+                if locked:
+                    self.selected = list(locked)[:top_n]
+            if self.strategy.selected and not self.selected:
+                self.selected = list(self.strategy.selected)
+            self.strategy.selected = list(self.selected)
+            self._ensure_brokers_for_selected()
             return
+
         # Back off after a rate-limit — do not re-hammer the universe every poll.
         cool_until = float(getattr(self, "_scan_cool_until", 0.0) or 0.0)
         if cool_until and time.time() < cool_until:
@@ -658,8 +740,6 @@ class BasketRunner:
         universe = resolve_universe(self.strategy.params)
         snaps: list[dict[str, Any]] = []
         try:
-            # Colleague / Kite pattern: timed REST OHLC for the universe once,
-            # then WS only the selected names (session.set_subscriptions).
             batch = quotes.equity_day_snapshots(universe, prefer_rest=True)
             snaps = list(batch.values())
             src = "rest" if any(s.get("source") == "dhan" for s in snaps) else quotes.feed_status
@@ -675,22 +755,15 @@ class BasketRunner:
             self._log(f"batch scan failed ({exc}) — will retry next poll (no per-symbol REST)")
             return
         if len(snaps) < max(5, len(universe) // 10):
-            # Too thin to trust rankings — cool briefly, then retry REST.
             self._scan_cool_until = time.time() + 60.0
             self._log(f"Scan incomplete ({len(snaps)} snaps) — waiting before re-scan")
             return
         picked = self.strategy.select_symbols(snaps)
-        # Hard-cap selection to top_n / max trades so the basket never grows past quota.
         max_day = self.max_trades_per_day()
         self.selected = list(picked)[:max_day]
         self.strategy.selected = list(self.selected)
         self._scanned = True
-        for sym in self.selected:
-            if sym not in self.brokers:
-                b = PaperBroker(starting_cash=self.starting_cash / max(len(self.selected), 1))
-                b.bind(self.strategy.id, f"NSE:EQ:{sym}", sym)
-                self.brokers[sym] = b
-                self.histories.setdefault(sym, [])
+        self._ensure_brokers_for_selected()
         self._seed_opening_ranges(quotes, p)
         if self.journal_session_id:
             record_selections(
@@ -703,13 +776,11 @@ class BasketRunner:
             f"Selected {len(self.selected)}: {', '.join(self.selected) or 'none'} "
             f"(from {len(snaps)} scanned, max {max_day}/day) — REST seed then WS selected only"
         )
-        # Immediately REST-seed selected LTPs so the same poll can trade / show marks.
         try:
             seeded = quotes.seed_ltps_rest_first(self.selected, wait_ws_sec=1.0)
             self._log(f"REST-seeded {len(seeded)}/{len(self.selected)} selected LTPs")
         except Exception as exc:
             self._log(f"REST seed after scan failed: {exc}")
-        # Re-apply same-day journal locks after select_symbols rebuilds empty legs.
         try:
             self.restore_today_from_journal()
         except Exception as exc:
@@ -782,7 +853,11 @@ class BasketRunner:
         self._apply(symbol, broker, signal, fill_px, bar.timestamp)
 
     def tick_live(
-        self, quotes: LiveQuoteProvider, *, skip_selection: bool = False
+        self,
+        quotes: LiveQuoteProvider,
+        *,
+        skip_selection: bool = False,
+        symbols: list[str] | None = None,
     ) -> list[str]:
         # Migrate older saved flatten_at=15:20 → 15:00 IST
         flat = str(self.strategy.params.get("flatten_at") or "").strip()
@@ -815,10 +890,15 @@ class BasketRunner:
                 pass
         labels = []
         # Marks should already be REST-seeded + WS-subscribed by session.
-        for sym in list(self.selected):
+        # Optional `symbols` = WS dirty set (tick-driven); else all selected.
+        want = [s.upper() for s in symbols] if symbols is not None else list(self.selected)
+        selected = set(self.selected or [])
+        for sym in want:
+            if sym not in selected:
+                continue
             try:
                 price, ts, src = quotes.get_ltp(
-                    sym, allow_rest=False, wait_ws_sec=0.2, max_stale_sec=300
+                    sym, allow_rest=False, wait_ws_sec=0.0, max_stale_sec=300
                 )
                 bar = Bar(timestamp=ts, open=price, high=price, low=price, close=price, volume=0)
                 self.on_symbol_bar(sym, bar)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import date, datetime, time as time_cls
+from datetime import date, datetime, time as time_cls, timedelta
 from typing import Any
 from zoneinfo import ZoneInfo
 
@@ -753,6 +753,18 @@ class PaperSession:
         self._rest_seeded_day: date | None = None
         self._rest_seeded_syms: frozenset[str] = frozenset()
         self._feed_phase: str = "idle"  # idle | rest_ok | ws_live
+        # WS-tick drive: coalesce dirty symbols; poll only when socket is down.
+        self._tick_wake = threading.Event()
+        self._dirty_syms: set[str] = set()
+        self._dirty_lock = threading.Lock()
+        self._drive_mode: str = "idle"  # ws_tick | poll_fallback | idle
+        self._last_ws_mark_at: float = 0.0
+        self._last_housekeep_at: float = 0.0
+        self._last_ws_reconnect_at: float = 0.0
+        # IST desk clock for header: premarket check → open → scan → live
+        self._market_phase: str = "idle"
+        self._phase_log: str = ""
+        self._premarket_warmed_day: date | None = None
 
     def available_strategies(self) -> list[dict]:
         return list_strategies()
@@ -1321,6 +1333,10 @@ class PaperSession:
                 updated_at=self.updated_at,
                 strategies=[r.state() for r in self.runners.values()],
                 message=self.message,
+                drive_mode=self._drive_mode,
+                market_phase=self._market_phase,
+                phase_log=self._phase_log,
+                poll_seconds=float(self.poll_seconds or 15.0),
             )
 
     def analytics(self) -> dict[str, Any]:
@@ -1406,7 +1422,7 @@ class PaperSession:
             raise RuntimeError("Add at least one strategy first")
         source = (self.settings.paper_price_source or "dhan-ws").lower()
         if source in {"dhan", "dhan-ws", "auto", "public"}:
-            from algo.providers.dhan.auth import TokenRotator, current_token, ensure_fresh_token
+            from algo.providers.dhan.auth import TokenRotator, current_token
 
             TokenRotator.instance().start()
             if source in {"dhan", "dhan-ws"}:
@@ -1414,11 +1430,8 @@ class PaperSession:
                     raise RuntimeError(
                         "DHAN_CLIENT_ID / access token required — paste a fresh token in Settings"
                     )
-            try:
-                ensure_fresh_token(self.settings)
-            except Exception as exc:
-                if source in {"dhan", "dhan-ws"}:
-                    raise RuntimeError(str(exc)) from exc
+            # Do NOT call ensure_fresh_token here — Dhan profile can hang and block
+            # /api/session/start|/wake for 60s+. TokenRotator renews in background.
         self.mode = "live"
         self.running = True
         self.poll_seconds = poll_seconds
@@ -1433,35 +1446,19 @@ class PaperSession:
             except Exception:
                 pass
         self._quotes = LiveQuoteProvider(self.settings)
+        self._quotes.set_on_mark(self._on_ws_mark)
         self._rest_seeded_day = None
         self._rest_seeded_syms = frozenset()
         self._feed_phase = "idle"
-        try:
-            # Policy: REST verify/seed first, then soft-start WS for live stream.
-            probe = ["NIFTY", "RELIANCE"]
-            with self._lock:
-                boot_syms: list[str] = []
-                for r in self.runners.values():
-                    if not r.enabled:
-                        continue
-                    if isinstance(r, BasketRunner):
-                        boot_syms.extend(r.selected or [])
-                    else:
-                        boot_syms.append(getattr(r, "symbol", "") or "")
-            seed_list = list(dict.fromkeys([*probe, *[s for s in boot_syms if s]]))
-            seeded = self._quotes.seed_ltps_rest_first(seed_list, wait_ws_sec=2.0)
-            self._feed_phase = "rest_ok" if seeded else "idle"
-            if seeded:
-                self._rest_seeded_day = datetime.now(IST).date()
-                self._rest_seeded_syms = frozenset(seeded)
-            # Soft WS wait — do not treat socket-up alone as success.
-            self._quotes.wait_for_ws(timeout=5.0)
-            if seed_list and self._quotes.mark_coverage(seed_list) >= 0.5:
-                self._feed_phase = "ws_live"
-        except Exception:
-            pass
-        feed = self._quotes.feed_status
-        seeded_n = len(self._rest_seeded_syms)
+        self._drive_mode = "idle"
+        self._market_phase = "idle"
+        self._phase_log = "Starting live — waiting premarket WS check…"
+        self._premarket_warmed_day = None
+        with self._dirty_lock:
+            self._dirty_syms.clear()
+        self._tick_wake.clear()
+        self._last_housekeep_at = 0.0
+        self._runtime_tick = 0
         # New IST day → clear prior-day review before rehydrate/scan.
         with self._lock:
             for r in self.runners.values():
@@ -1487,7 +1484,22 @@ class PaperSession:
                 if isinstance(r, BasketRunner):
                     try:
                         r.journal_session_id = self.journal_session_id
+                        # Full 09:18 top_n first, then merge journal fills (never fills-only).
+                        try:
+                            locked = r.restore_today_basket_selection()
+                            if locked:
+                                r.selected = list(locked)
+                                r.strategy.selected = list(locked)
+                                r._ensure_brokers_for_selected()
+                                r._scanned = True
+                        except Exception:
+                            locked = []
                         r.restore_today_from_journal()
+                        # Journal may append traded extras — keep canonical top_n lock.
+                        if locked:
+                            r.selected = list(locked)[: int(r.max_trades_per_day() or 10)]
+                            r.strategy.selected = list(r.selected)
+                            r._ensure_brokers_for_selected()
                         if r._desk_settled:
                             r._prune_untraded_legs()
                     except Exception:
@@ -1499,9 +1511,11 @@ class PaperSession:
                         r._journal_restored = True
                     except Exception:
                         pass
+        # REST seed + WS subscribe run in _run_live (non-blocking wake/HTTP).
         self.message = (
-            f"Live paper REST→WS ({self._feed_phase}, seeded {seeded_n}) via {feed} · "
-            f"poll {poll_seconds:.0f}s — virtual fills only (no Dhan orders)"
+            f"Live paper starting (REST seed + WS in background) · "
+            f"WS-tick drive (poll fallback {poll_seconds:.0f}s if WS down) — "
+            f"virtual fills only (no Dhan orders)"
         )
         self._thread = threading.Thread(target=self._run_live, daemon=True)
         self._thread.start()
@@ -1518,11 +1532,13 @@ class PaperSession:
             pass
         self._stop.set()
         self.running = False
+        self._tick_wake.set()  # unblock waiters
         end_journal_session(self.journal_session_id, message="Stopped")
         self.message = "Stopped"
         self.updated_at = utcnow()
         if self._quotes is not None:
             try:
+                self._quotes.set_on_mark(None)
                 self._quotes.close()
             except Exception:
                 pass
@@ -1683,6 +1699,169 @@ class PaperSession:
             self.running = False
             self.updated_at = utcnow()
 
+    def _session_clocks(self, runners: list[Any]) -> tuple[time_cls, time_cls, time_cls]:
+        """Earliest session_open / scan_at across desk; premarket check = open − 2m."""
+        open_t = time_cls(9, 15)
+        scan_t = time_cls(9, 18)
+        opens: list[time_cls] = []
+        scans: list[time_cls] = []
+        for runner in runners:
+            if not getattr(runner, "enabled", True):
+                continue
+            strat = getattr(runner, "strategy", None)
+            params = dict(getattr(strat, "params", None) or {})
+            try:
+                raw_open = str(params.get("session_open") or "09:15").strip()
+                oh, om = [int(x) for x in raw_open.split(":")[:2]]
+                opens.append(time_cls(oh, om))
+            except Exception:
+                opens.append(time_cls(9, 15))
+            raw_scan = str(params.get("scan_at") or "").strip()
+            if raw_scan:
+                try:
+                    sh, sm = [int(x) for x in raw_scan.split(":")[:2]]
+                    scans.append(time_cls(sh, sm))
+                except Exception:
+                    pass
+            elif isinstance(runner, BasketRunner):
+                scans.append(time_cls(9, 18))
+        if opens:
+            open_t = min(opens)
+        if scans:
+            scan_t = min(scans)
+        # Premarket WS verify a couple minutes before cash open (e.g. 09:13).
+        check_dt = datetime.combine(datetime.now(IST).date(), open_t) - timedelta(minutes=2)
+        check_t = check_dt.time().replace(tzinfo=None)
+        return check_t, open_t, scan_t
+
+    def _basket_selected_count(self, runners: list[Any]) -> int:
+        n = 0
+        for runner in runners:
+            if not getattr(runner, "enabled", True):
+                continue
+            if isinstance(runner, BasketRunner):
+                n += len(runner.selected or [])
+        return n
+
+    def _premarket_symbols(self, runners: list[Any]) -> list[str]:
+        """Symbols to WS-subscribe before open (NIFTY CE/PE underlyings, not basket scan)."""
+        syms: list[str] = []
+        for runner in runners:
+            if not getattr(runner, "enabled", True):
+                continue
+            if isinstance(runner, BasketRunner):
+                continue
+            sym = (getattr(runner, "symbol", "") or "").upper()
+            if sym:
+                syms.append(sym)
+        return list(dict.fromkeys(syms))
+
+    def _maybe_premarket_warm(self, runners: list[Any], quotes: LiveQuoteProvider) -> None:
+        """~09:13: subscribe NIFTY (and other non-basket) + seed once so feed is proven before open."""
+        today = datetime.now(IST).date()
+        if self._premarket_warmed_day == today:
+            return
+        check_t, open_t, _scan_t = self._session_clocks(runners)
+        now_t = datetime.now(IST).time().replace(tzinfo=None)
+        if now_t < check_t:
+            return
+        # After late morning no need to "warm" again for this day.
+        if now_t >= time_cls(10, 0) and self._premarket_warmed_day is None:
+            self._premarket_warmed_day = today
+            return
+        warm = self._premarket_symbols(runners)
+        if not warm:
+            self._premarket_warmed_day = today
+            return
+        try:
+            seeded = quotes.seed_ltps_rest_first(warm, wait_ws_sec=1.0)
+            quotes.set_subscriptions(warm)
+            ok = bool(seeded) or quotes.mark_coverage(warm) >= 0.5
+            self._premarket_warmed_day = today
+            if ok:
+                self._feed_phase = "ws_live" if self._ws_feed_ok(quotes) else "rest_ok"
+                self._phase_log = (
+                    f"Premarket OK @ {datetime.now(IST).strftime('%H:%M:%S')} — "
+                    f"WS subscribe {', '.join(warm)} · open {open_t.strftime('%H:%M')}"
+                )
+            else:
+                self._phase_log = (
+                    f"Premarket warn — no marks yet for {', '.join(warm)}; "
+                    f"retrying until open {open_t.strftime('%H:%M')}"
+                )
+                # Allow another warm attempt next housekeep if marks missing.
+                self._premarket_warmed_day = None
+        except Exception as exc:
+            self._phase_log = f"Premarket check error: {exc}"
+            self._premarket_warmed_day = None
+
+    def _refresh_market_phase(self, runners: list[Any], quotes: LiveQuoteProvider) -> None:
+        """Update header phase_log from IST clock + WS/scan state."""
+        if not self.running or self.mode != "live":
+            self._market_phase = "idle"
+            if not self._phase_log:
+                self._phase_log = self.message or "Idle"
+            return
+
+        check_t, open_t, scan_t = self._session_clocks(runners)
+        now = datetime.now(IST)
+        now_t = now.time().replace(tzinfo=None)
+        ws_ok = self._ws_feed_ok(quotes)
+        want = self._collect_want_syms(runners)
+        selected = self._basket_selected_count(runners)
+        try:
+            marks = len(getattr(quotes, "_mark_cache", {}) or {})
+        except Exception:
+            marks = 0
+        drive = self._drive_mode or "idle"
+        open_s = open_t.strftime("%H:%M")
+        scan_s = scan_t.strftime("%H:%M")
+        check_s = check_t.strftime("%H:%M")
+
+        if now_t >= time_cls(15, 0):
+            phase = "eod"
+            log = f"EOD / flatten window · drive {drive} · want {len(want)} · marks {marks}"
+        elif now_t < check_t:
+            phase = "waiting"
+            log = (
+                f"Waiting {check_s} premarket WS check · "
+                f"open {open_s} · basket scan {scan_s}"
+            )
+        elif now_t < open_t:
+            phase = "premarket"
+            warm = self._premarket_symbols(runners)
+            names = ", ".join(warm) if warm else "NIFTY"
+            log = (
+                f"Premarket {check_s}–{open_s} — subscribe {names} CE/PE · "
+                f"verify WS before open · scan later {scan_s}"
+            )
+        elif now_t < scan_t:
+            phase = "open"
+            log = (
+                f"Market open {open_s} — NIFTY ORB range building · "
+                f"baskets wait scan {scan_s} · drive {drive}"
+            )
+        elif selected == 0 and now_t < time_cls(10, 0):
+            phase = "scan"
+            log = (
+                f"Scan {scan_s} — picking gainers/losers · "
+                f"then WS subscribe selected · drive {drive}"
+            )
+        else:
+            phase = "live"
+            log = (
+                f"Live WS-tick · selected {selected} · want {len(want)} · "
+                f"marks {marks} · drive {drive}"
+            )
+
+        if not ws_ok:
+            log += " · WS DOWN (poll fallback)"
+        elif drive == "ws_tick":
+            log += " · socket OK"
+
+        self._market_phase = phase
+        self._phase_log = log
+
     def _collect_want_syms(self, runners: list[Any]) -> list[str]:
         want_syms: list[str] = []
         for runner in runners:
@@ -1697,7 +1876,257 @@ class PaperSession:
                 want_syms.append(getattr(runner, "symbol", "") or "")
         return [s for s in dict.fromkeys(want_syms) if s]
 
+    def _on_ws_mark(self, symbol: str, price: float) -> None:
+        """WS thread → wake live loop so SL/TP/UI update on the tick."""
+        if self._stop.is_set() or not self.running:
+            return
+        sym = (symbol or "").upper()
+        if not sym:
+            return
+        with self._dirty_lock:
+            self._dirty_syms.add(sym)
+        self._last_ws_mark_at = time.time()
+        self._tick_wake.set()
+
+    def _drain_dirty_syms(self) -> set[str]:
+        with self._dirty_lock:
+            dirty = set(self._dirty_syms)
+            self._dirty_syms.clear()
+        return dirty
+
+    def _ws_feed_ok(self, quotes: LiveQuoteProvider) -> bool:
+        """True only when the socket is up AND marks are still arriving.
+
+        A half-dead WS (connected=True, no packets) used to freeze MARKET forever
+        in ws_tick wait. Treat mark silence as feed-down → poll_fallback + reconnect.
+        """
+        ws = quotes._ws
+        if ws is None:
+            return False
+        if not bool(ws.connected) or ws.rate_limited():
+            return False
+        now = time.time()
+        # Cash session: require a recent WS mark callback.
+        t = datetime.now(IST).time().replace(tzinfo=None)
+        in_session = time_cls(9, 10) <= t <= time_cls(15, 35)
+        if not in_session:
+            return True
+        if self._last_ws_mark_at <= 0:
+            # Allow a short boot window before demanding ticks.
+            return self._runtime_tick < 5
+        age = now - self._last_ws_mark_at
+        if age > 12.0:
+            # Kick a reconnect occasionally so a stalled socket can recover.
+            if (now - self._last_ws_reconnect_at) >= 25.0:
+                self._last_ws_reconnect_at = now
+                try:
+                    ws.force_reconnect()
+                except Exception:
+                    pass
+            return False
+        return True
+
+    def _live_housekeep(self, runners: list[Any], quotes: LiveQuoteProvider) -> list[str]:
+        """Selection + REST seed + WS subscribe (not on every tick)."""
+        # ~09:13: prove NIFTY CE/PE feed before cash open; baskets still wait scan_at.
+        try:
+            self._maybe_premarket_warm(runners, quotes)
+        except Exception:
+            pass
+
+        for runner in runners:
+            if not runner.enabled or not isinstance(runner, BasketRunner):
+                continue
+            try:
+                runner.journal_session_id = self.journal_session_id
+                runner._maybe_roll_trading_day()
+                runner.ensure_selection(quotes)
+            except Exception:
+                pass
+
+        want_syms = self._collect_want_syms(runners)
+        # Before basket scan, still keep premarket underlyings subscribed.
+        if not want_syms:
+            want_syms = self._premarket_symbols(runners)
+        today = datetime.now(IST).date()
+        want_key = frozenset(want_syms)
+        coverage = quotes.mark_coverage(want_syms) if want_syms else 1.0
+        ws_down = not self._ws_feed_ok(quotes)
+        need_rest_seed = bool(want_syms) and (
+            self._rest_seeded_day != today
+            or want_key != self._rest_seeded_syms
+            or (
+                (coverage < 0.75 or ws_down)
+                and (self._runtime_tick == 0 or self._runtime_tick % 3 == 0)
+            )
+        )
+
+        try:
+            if need_rest_seed and want_syms:
+                seeded = quotes.seed_ltps_rest_first(
+                    want_syms, wait_ws_sec=1.0 if not ws_down else 0.0
+                )
+                if seeded:
+                    self._rest_seeded_day = today
+                    self._rest_seeded_syms = frozenset(want_syms)
+                    self._feed_phase = "rest_ok"
+                    coverage = quotes.mark_coverage(want_syms)
+            elif want_syms:
+                quotes.set_subscriptions(want_syms)
+                quotes.prefetch_ltps(want_syms, wait_ws_sec=0.5, allow_rest=False)
+            if want_syms and coverage >= 0.75 and not ws_down:
+                self._feed_phase = "ws_live"
+        except Exception:
+            pass
+        self._last_housekeep_at = time.time()
+        try:
+            self._refresh_market_phase(runners, quotes)
+        except Exception:
+            pass
+        return want_syms
+
+    def _live_apply_runners(
+        self,
+        runners: list[Any],
+        quotes: LiveQuoteProvider,
+        *,
+        dirty_syms: set[str] | None,
+        allow_rest: bool,
+        drive_tag: str,
+    ) -> None:
+        """Evaluate strategies from marks. dirty_syms=None → all selected/open."""
+        src = f"{quotes.feed_status}|{self._feed_phase}|{drive_tag}"
+        labels: list[str] = []
+        errors: list[str] = []
+        dirty = {s.upper() for s in dirty_syms} if dirty_syms is not None else None
+
+        for runner in runners:
+            if not runner.enabled:
+                continue
+            try:
+                runner.journal_session_id = self.journal_session_id
+                if isinstance(runner, BasketRunner):
+                    if dirty is not None:
+                        hit = [s for s in dirty if s in set(runner.selected or [])]
+                        if not hit:
+                            continue
+                        labels.extend(
+                            runner.tick_live(quotes, skip_selection=True, symbols=hit)
+                        )
+                    else:
+                        labels.extend(runner.tick_live(quotes, skip_selection=True))
+                    src = f"{quotes.feed_status}|{self._feed_phase}|{drive_tag}"
+                elif runner.strategy.id == "zen_credit_spread":
+                    sym = (getattr(runner, "symbol", "") or "").upper()
+                    if dirty is not None and sym and sym not in dirty:
+                        continue
+                    bar = self._live_zen_bar(runner)
+                    runner.on_bar(bar)
+                    a = getattr(runner.strategy, "_structure", None) or "flat"
+                    mark = runner.mark_price
+                    labels.append(
+                        f"ZEN {runner.symbol} {a}"
+                        + (f" mark={mark:.1f}" if mark is not None else f" spot={bar.close:.1f}")
+                    )
+                    src = f"{quotes.feed_status}|{self._feed_phase}|{drive_tag}"
+                elif runner.asset_kind == "option":
+                    sym = (getattr(runner, "symbol", "") or "").upper()
+                    if dirty is not None and sym and sym not in dirty:
+                        continue
+                    p = runner.strategy.params
+                    bar, st = quotes.option_premium_bar(
+                        runner.symbol,
+                        option_type=str(p.get("option_type", "CE")),
+                        strike_mode=str(p.get("strike_mode", "ATM")),
+                        strike_step=int(p.get("strike_step", 50)),
+                        state=runner.option_state,
+                    )
+                    runner.option_state = st
+                    runner.strategy.params["strike"] = int(st.get("strike", 0))
+                    runner.strategy._selected_strike = int(st.get("strike", 0))  # type: ignore[attr-defined]
+                    if not getattr(runner, "_journal_restored", False):
+                        try:
+                            runner.restore_today_from_journal()
+                        except Exception:
+                            pass
+                        runner._journal_restored = True
+                    runner.on_bar(bar)
+                    runner._maybe_eod_flatten(quotes)
+                    labels.append(
+                        f"{runner.symbol}{p.get('option_type', 'CE')}@{int(st.get('strike', 0))}={bar.close:.1f}"
+                    )
+                    src = f"{quotes.feed_status}|{self._feed_phase}|{drive_tag}"
+                else:
+                    sym = (getattr(runner, "symbol", "") or "").upper()
+                    if dirty is not None and sym and sym not in dirty:
+                        continue
+                    price, ts, used = quotes.get_ltp(
+                        runner.symbol,
+                        allow_rest=allow_rest,
+                        wait_ws_sec=0.0 if dirty is not None else 0.5,
+                        max_stale_sec=180,
+                    )
+                    bar = Bar(
+                        timestamp=ts, open=price, high=price, low=price, close=price, volume=0
+                    )
+                    if not getattr(runner, "_journal_restored", False):
+                        try:
+                            runner.restore_today_from_journal()
+                        except Exception:
+                            pass
+                        runner._journal_restored = True
+                    runner.on_bar(bar)
+                    runner._maybe_eod_flatten(quotes)
+                    labels.append(f"{runner.symbol}={price:.2f}")
+                    src = f"{used}|{drive_tag}"
+            except Exception as exc:
+                name = getattr(runner, "symbol", runner.strategy.id)
+                err = str(exc)
+                if "429" in err or "too many" in err.lower() or "rate limited" in err.lower():
+                    errors.append(f"{name}: Dhan 429 — waiting for websocket")
+                else:
+                    errors.append(f"{name}: {err}")
+
+        self.updated_at = utcnow()
+        self._drive_mode = drive_tag
+        try:
+            self._refresh_market_phase(runners, quotes)
+        except Exception:
+            pass
+        if labels:
+            self.message = (
+                f"Live paper ({src}) @ {datetime.now(tz=IST).strftime('%H:%M:%S')} IST — "
+                + ", ".join(labels[:12])
+                + ("…" if len(labels) > 12 else "")
+                + " · virtual fills only"
+            )
+            if errors:
+                self.message += f" · warn: {errors[0]}"
+        elif errors:
+            self.message = (
+                f"Live paper holding last marks ({quotes.feed_status}|{self._feed_phase}|{drive_tag})"
+                f" — {errors[0]}"
+            )
+
+    def _live_checkpoint(self) -> None:
+        if self._runtime_tick == 1 or self._runtime_tick % 8 == 0:
+            try:
+                self.persist_runtime()
+                from algo.paper.desk_store import save_strategies
+
+                save_strategies(
+                    self.desk_configs(),
+                    prefs={
+                        "mode": "live",
+                        "poll_seconds": self.poll_seconds,
+                        "was_running": True,
+                    },
+                )
+            except Exception:
+                pass
+
     def _run_live(self) -> None:
+        """WS-tick primary: each LTP wakes strategy eval. Poll only if WS is down."""
         try:
             while not self._stop.is_set():
                 quotes = self._quotes
@@ -1706,164 +2135,104 @@ class PaperSession:
                 with self._lock:
                     runners = list(self.runners.values())
 
-                # 1) REST scan / selection first (may pick new basket names).
-                for runner in runners:
-                    if not runner.enabled or not isinstance(runner, BasketRunner):
-                        continue
-                    try:
-                        runner.journal_session_id = self.journal_session_id
-                        runner._maybe_roll_trading_day()
-                        runner.ensure_selection(quotes)
-                    except Exception:
-                        pass
-
-                # 2) Rebuild want-set from selected + open legs only.
+                ws_ok = self._ws_feed_ok(quotes)
+                now = time.time()
                 want_syms = self._collect_want_syms(runners)
-                today = datetime.now(IST).date()
-                want_key = frozenset(want_syms)
-                coverage = quotes.mark_coverage(want_syms) if want_syms else 1.0
-                ws_down = bool(
-                    quotes._ws is not None
-                    and (quotes._ws.rate_limited() or not quotes._ws.connected)
-                )
-                need_rest_seed = bool(want_syms) and (
-                    self._rest_seeded_day != today
-                    or want_key != self._rest_seeded_syms
-                    or (
-                        (coverage < 0.75 or ws_down)
-                        and (self._runtime_tick == 0 or self._runtime_tick % 3 == 0)
+
+                # Apply marks FIRST so MARKET/PnL update even if housekeep/WS is slow.
+                # (WS handshake can hang for minutes after a 429 storm.)
+                if not ws_ok or self._runtime_tick == 0:
+                    self._drive_mode = "poll_fallback" if not ws_ok else "ws_boot"
+                    self._live_apply_runners(
+                        runners,
+                        quotes,
+                        dirty_syms=None,
+                        allow_rest=True,
+                        drive_tag=self._drive_mode,
                     )
-                )
+                    self._runtime_tick += 1
+                    self._live_checkpoint()
 
-                try:
-                    if need_rest_seed and want_syms:
-                        # 3) REST LTP first (verify + seed), then subscribe WS.
-                        seeded = quotes.seed_ltps_rest_first(
-                            want_syms, wait_ws_sec=1.0 if not ws_down else 0.0
-                        )
-                        if seeded:
-                            self._rest_seeded_day = today
-                            self._rest_seeded_syms = frozenset(want_syms)
-                            self._feed_phase = "rest_ok"
-                            coverage = quotes.mark_coverage(want_syms)
-                    elif want_syms:
-                        # Already seeded — WS-only warm (no REST unless coverage falls).
-                        quotes.set_subscriptions(want_syms)
-                        quotes.prefetch_ltps(
-                            want_syms, wait_ws_sec=0.8, allow_rest=False
-                        )
-                    if want_syms and coverage >= 0.75 and not ws_down:
-                        self._feed_phase = "ws_live"
-                except Exception:
-                    pass
-
-                # Adaptive cadence: more active symbols → slower poll (Dhan-safe).
-                sleep_for = suggested_poll_seconds(
-                    len(want_syms), base=float(self.poll_seconds or 15.0)
+                # Housekeep (scan/seed/subscribe) on a slow timer — never blocks mark apply.
+                housekeep_every = 8.0 if not ws_ok else 20.0
+                need_housekeep = (
+                    self._runtime_tick <= 1
+                    or (now - self._last_housekeep_at) >= housekeep_every
                 )
-                src = f"{quotes.feed_status}|{self._feed_phase}"
-                labels: list[str] = []
-                errors: list[str] = []
-                for runner in runners:
-                    if not runner.enabled:
-                        continue
+                if need_housekeep:
                     try:
-                        runner.journal_session_id = self.journal_session_id
-                        if isinstance(runner, BasketRunner):
-                            # Selection already done above; tick marks only.
-                            labels.extend(runner.tick_live(quotes, skip_selection=True))
-                            src = f"{quotes.feed_status}|{self._feed_phase}"
-                        elif runner.strategy.id == "zen_credit_spread":
-                            bar = self._live_zen_bar(runner)
-                            runner.on_bar(bar)
-                            a = getattr(runner.strategy, "_structure", None) or "flat"
-                            mark = runner.mark_price
-                            labels.append(
-                                f"ZEN {runner.symbol} {a}"
-                                + (f" mark={mark:.1f}" if mark is not None else f" spot={bar.close:.1f}")
-                            )
-                            src = f"{quotes.feed_status}|{self._feed_phase}"
-                        elif runner.asset_kind == "option":
-                            p = runner.strategy.params
-                            bar, st = quotes.option_premium_bar(
-                                runner.symbol,
-                                option_type=str(p.get("option_type", "CE")),
-                                strike_mode=str(p.get("strike_mode", "ATM")),
-                                strike_step=int(p.get("strike_step", 50)),
-                                state=runner.option_state,
-                            )
-                            runner.option_state = st
-                            runner.strategy.params["strike"] = int(st.get("strike", 0))
-                            runner.strategy._selected_strike = int(st.get("strike", 0))  # type: ignore[attr-defined]
-                            if not getattr(runner, "_journal_restored", False):
-                                try:
-                                    runner.restore_today_from_journal()
-                                except Exception:
-                                    pass
-                                runner._journal_restored = True
-                            runner.on_bar(bar)
-                            runner._maybe_eod_flatten(quotes)
-                            labels.append(
-                                f"{runner.symbol}{p.get('option_type', 'CE')}@{int(st.get('strike', 0))}={bar.close:.1f}"
-                            )
-                            src = f"{quotes.feed_status}|{self._feed_phase}"
-                        else:
-                            price, ts, used = quotes.get_ltp(
-                                runner.symbol, allow_rest=False, wait_ws_sec=0.5, max_stale_sec=180
-                            )
-                            bar = Bar(
-                                timestamp=ts, open=price, high=price, low=price, close=price, volume=0
-                            )
-                            if not getattr(runner, "_journal_restored", False):
-                                try:
-                                    runner.restore_today_from_journal()
-                                except Exception:
-                                    pass
-                                runner._journal_restored = True
-                            runner.on_bar(bar)
-                            runner._maybe_eod_flatten(quotes)
-                            labels.append(f"{runner.symbol}={price:.2f}")
-                            src = used
-                    except Exception as exc:
-                        name = getattr(runner, "symbol", runner.strategy.id)
-                        err = str(exc)
-                        if "429" in err or "too many" in err.lower() or "rate limited" in err.lower():
-                            errors.append(f"{name}: Dhan 429 — waiting for websocket")
-                        else:
-                            errors.append(f"{name}: {err}")
-                self.updated_at = utcnow()
-                if labels:
-                    self.message = (
-                        f"Live paper ({src}) @ {datetime.now(tz=IST).strftime('%H:%M:%S')} IST — "
-                        + ", ".join(labels[:12])
-                        + ("…" if len(labels) > 12 else "")
-                        + " · virtual fills only"
-                    )
-                    if errors:
-                        self.message += f" · warn: {errors[0]}"
-                elif errors:
-                    # Soft degrade — keep last marks; short WS cool must not freeze the desk.
-                    self.message = (
-                        f"Live paper holding last marks ({quotes.feed_status}|{self._feed_phase}) — {errors[0]}"
-                    )
-                self._runtime_tick += 1
-                # Checkpoint often so a crash/laptop sleep can resume open trades.
-                if self._runtime_tick == 1 or self._runtime_tick % 3 == 0:
-                    try:
-                        self.persist_runtime()
-                        from algo.paper.desk_store import save_strategies
-
-                        save_strategies(
-                            self.desk_configs(),
-                            prefs={
-                                "mode": "live",
-                                "poll_seconds": self.poll_seconds,
-                                "was_running": True,
-                            },
-                        )
+                        want_syms = self._live_housekeep(runners, quotes)
                     except Exception:
                         pass
-                time.sleep(sleep_for)
+                    ws_ok = self._ws_feed_ok(quotes)
+
+                if ws_ok:
+                    self._drive_mode = "ws_tick"
+                    # Wait for the next WS mark; short timeout only for housekeep/EOD.
+                    woke = self._tick_wake.wait(timeout=3.0)
+                    if self._stop.is_set():
+                        break
+                    if woke:
+                        # Coalesce a burst of ticks into one strategy pass.
+                        time.sleep(0.05)
+                        dirty = self._drain_dirty_syms()
+                        self._tick_wake.clear()
+                        # Catch any ticks that arrived during clear.
+                        dirty |= self._drain_dirty_syms()
+                        if dirty:
+                            self._live_apply_runners(
+                                runners,
+                                quotes,
+                                dirty_syms=dirty,
+                                allow_rest=False,
+                                drive_tag="ws_tick",
+                            )
+                            self._runtime_tick += 1
+                            self._live_checkpoint()
+                    else:
+                        # Quiet book — if marks went silent, fall through to poll next loop.
+                        # Otherwise still run EOD flatten via basket housekeep path.
+                        stale = (
+                            self._last_ws_mark_at > 0
+                            and (time.time() - self._last_ws_mark_at) > 12.0
+                        ) or (
+                            self._last_ws_mark_at <= 0 and self._runtime_tick >= 5
+                        )
+                        if stale:
+                            self._drive_mode = "poll_fallback"
+                            self._live_apply_runners(
+                                runners,
+                                quotes,
+                                dirty_syms=None,
+                                allow_rest=True,
+                                drive_tag="poll_fallback",
+                            )
+                            self._runtime_tick += 1
+                            self._live_checkpoint()
+                        else:
+                            for runner in runners:
+                                if not runner.enabled or not isinstance(runner, BasketRunner):
+                                    continue
+                                try:
+                                    runner._maybe_eod_flatten(quotes)
+                                except Exception:
+                                    pass
+                            try:
+                                self._refresh_market_phase(runners, quotes)
+                            except Exception:
+                                pass
+                else:
+                    # Fallback: WS down — poll REST/cache until socket returns.
+                    # Short sleep so MARKET recovers quickly after token paste.
+                    sleep_for = min(
+                        8.0,
+                        suggested_poll_seconds(
+                            len(want_syms), base=float(self.poll_seconds or 15.0)
+                        ),
+                    )
+                    self._tick_wake.wait(timeout=sleep_for)
+                    self._tick_wake.clear()
+                    self._drain_dirty_syms()
         except Exception as exc:
             self.message = f"Live paper error: {exc}"
         finally:

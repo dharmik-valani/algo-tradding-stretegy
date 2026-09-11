@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from collections.abc import Callable
 from typing import Any
 from zoneinfo import ZoneInfo
 import time
@@ -32,10 +33,10 @@ _DHAN_SOURCES = {"dhan", "dhan-ws", "auto", "public"}
 
 
 def suggested_poll_seconds(want_count: int, *, base: float = 15.0) -> float:
-    """Scale live poll interval with active symbol load (keeps WS healthy).
+    """Fallback poll interval when WebSocket is down (REST-safe cadence).
 
-    Official Quote REST is 1/s; we prefer WS, but denser books still need
-    slower poll loops so subscribe/reconnect storms stay rare.
+    Live trading is WS-tick driven; this only applies while the socket is
+    disconnected / rate-limited so we do not hammer Quote REST.
     """
     n = max(0, int(want_count))
     if n <= 20:
@@ -74,6 +75,9 @@ class LiveQuoteProvider:
         # Last-known marks for risk checks when the socket briefly drops (keep trading).
         # symbol -> (price, monotonic_ts, source)
         self._mark_cache: dict[str, tuple[float, float, str]] = {}
+        # (segment, security_id) -> symbol for WS tick fan-out
+        self._sid_to_sym: dict[tuple[str, str], str] = {}
+        self._on_mark: Callable[[str, float], None] | None = None
         self._enable_dhan_feed = enable_dhan_feed
         self._429_strikes = 0
         # Diagnostics for rate-limit monitoring (ring buffer).
@@ -106,6 +110,7 @@ class LiveQuoteProvider:
                         client_id=settings.dhan_client_id,
                         token_provider=self._live_token,
                         prefer_quote=True,
+                        on_tick=self._on_ws_tick,
                     )
                     # Lazy-start on first subscribe.
                     rotator = TokenRotator.instance()
@@ -211,6 +216,8 @@ class LiveQuoteProvider:
             },
             "recent_rate_limits": list(self._rl_events[-10:]),
             "suggested_poll_seconds": suggested_poll_seconds(len(self._last_want_syms)),
+            "drive_mode": "ws_tick",
+            "fallback_poll_when": "ws_down_or_429",
             "adaptive_poll_table": {
                 "<=20": 15,
                 "21-50": 25,
@@ -218,6 +225,32 @@ class LiveQuoteProvider:
                 ">100": 60,
             },
         }
+
+    def set_on_mark(self, callback: Callable[[str, float], None] | None) -> None:
+        """Session hook: called on each WS LTP for a subscribed symbol."""
+        self._on_mark = callback
+
+    def _register_sid(self, symbol: str, segment: str, security_id: str) -> None:
+        self._sid_to_sym[(str(segment), str(security_id))] = symbol.upper()
+
+    def _on_ws_tick(self, segment: str, security_id: str, fields: dict[str, Any]) -> None:
+        sym = self._sid_to_sym.get((str(segment), str(security_id)))
+        if not sym:
+            return
+        ltp = fields.get("ltp")
+        if ltp is None:
+            return
+        px = float(ltp)
+        if px <= 0:
+            return
+        self._remember_mark(sym, px, "dhan-ws")
+        self._dhan_feed_ok = True
+        cb = self._on_mark
+        if cb is not None:
+            try:
+                cb(sym, px)
+            except Exception:
+                pass
 
     def _clear_rate_limit_on_success(self) -> None:
         if not self._rest_cooling():
@@ -240,6 +273,7 @@ class LiveQuoteProvider:
         return price, datetime.now(tz=IST), tag
 
     def close(self) -> None:
+        self._on_mark = None
         try:
             from algo.providers.dhan.auth import TokenRotator
 
@@ -247,6 +281,10 @@ class LiveQuoteProvider:
         except Exception:
             pass
         if self._ws is not None:
+            try:
+                self._ws.set_on_tick(None)
+            except Exception:
+                pass
             self._ws.stop()
             self._ws = None
         if self._dhan is not None:
@@ -285,7 +323,9 @@ class LiveQuoteProvider:
         instruments: list[tuple[str, str]] = []
         for sym in cleaned:
             try:
-                instruments.append(self._resolve_dhan_key(sym))
+                seg, sid = self._resolve_dhan_key(sym)
+                instruments.append((seg, sid))
+                self._register_sid(sym, seg, sid)
             except Exception:
                 continue
         if instruments:
@@ -306,11 +346,17 @@ class LiveQuoteProvider:
         if not self._ws._thread or not self._ws._thread.is_alive():
             self._ws.start()
         instruments: list[tuple[str, str]] = []
+        sid_map: dict[tuple[str, str], str] = {}
         for sym in self._last_want_syms:
             try:
-                instruments.append(self._resolve_dhan_key(sym))
+                seg, sid = self._resolve_dhan_key(sym)
+                key = (seg, sid)
+                instruments.append(key)
+                sid_map[key] = sym
             except Exception:
                 continue
+        # Replace reverse map for the active want-set (drop unsubscribed names).
+        self._sid_to_sym = sid_map
         self._ws.set_wanted(instruments)
 
     def _ws_quote(self, symbol: str) -> dict | None:

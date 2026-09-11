@@ -124,3 +124,9 @@ class SessionSnapshot(BaseModel):
     updated_at: datetime | None = None
     strategies: list[StrategyState] = Field(default_factory=list)
     message: str = ""
+    drive_mode: str = "idle"
+    # IST session clock: waiting | premarket | open | scan | live | eod | idle
+    market_phase: str = "idle"
+    # One-line header status so the desk phase is obvious at a glance.
+    phase_log: str = ""
+    poll_seconds: float = 15.0

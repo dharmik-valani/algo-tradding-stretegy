@@ -142,10 +142,12 @@ class DhanLiveFeed:
         client_id: str,
         token_provider: Callable[[], str],
         prefer_quote: bool = True,
+        on_tick: Callable[[str, str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.client_id = client_id
         self._token_provider = token_provider
         self._prefer_quote = prefer_quote
+        self._on_tick = on_tick
         self._lock = threading.RLock()
         self._wanted: set[tuple[str, str]] = set()  # (segment, security_id)
         self._subscribed: set[tuple[str, str]] = set()
@@ -162,6 +164,12 @@ class DhanLiveFeed:
         self._rate_limited_until = 0.0
         self._backoff = 1.0
         self._429_hits = 0
+
+    def set_on_tick(
+        self, callback: Callable[[str, str, dict[str, Any]], None] | None
+    ) -> None:
+        """Optional listener: (segment, security_id, fields) after each LTP upsert."""
+        self._on_tick = callback
 
     @property
     def connected(self) -> bool:
@@ -309,7 +317,7 @@ class DhanLiveFeed:
                     ping_interval=20,
                     ping_timeout=40,
                     max_size=2_000_000,
-                    open_timeout=20,
+                    open_timeout=12,
                     ssl=ssl_ctx,
                 ) as ws:
                     self._ws_ref = ws
@@ -448,3 +456,11 @@ class DhanLiveFeed:
             row.update({k: v for k, v in fields.items() if v is not None})
             row["updated_at"] = datetime.now(tz=IST).isoformat()
             self._cache[key] = row
+            snapshot = dict(row)
+        # Notify outside the lock so listeners can read the cache safely.
+        cb = self._on_tick
+        if cb is not None and snapshot.get("ltp") is not None:
+            try:
+                cb(str(segment), str(security_id), snapshot)
+            except Exception:
+                logger.debug("dhan-ws on_tick listener failed", exc_info=True)

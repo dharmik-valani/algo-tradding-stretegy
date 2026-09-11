@@ -161,6 +161,22 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   letter-spacing: -0.03em;
 }
 .subtitle { margin: 0.1rem 0 0; color: var(--muted); font-size: 0.72rem; }
+.phase-log {
+  margin: 0.28rem 0 0;
+  font-family: var(--mono);
+  font-size: 0.7rem;
+  line-height: 1.35;
+  color: #9fd9c6;
+  letter-spacing: 0.01em;
+  max-width: 58rem;
+  white-space: normal;
+}
+.phase-log[data-phase="waiting"],
+.phase-log[data-phase="premarket"] { color: #c9b87a; }
+.phase-log[data-phase="open"],
+.phase-log[data-phase="scan"] { color: #8ec8e8; }
+.phase-log[data-phase="live"] { color: #8fe0c8; }
+.phase-log[data-phase="eod"] { color: #c9a0a0; }
 .top-actions { display: flex; gap: 0.4rem; flex-shrink: 0; }
 
 .status-pill {
