@@ -107,7 +107,7 @@ def _load_master_csv() -> str:
 
 
 def _parse_nse_equity_ids(text: str) -> dict[str, str]:
-    """NSE cash EQ series only (skip bonds / SDL / SM)."""
+    """NSE cash EQ series only (skip bonds / SDL / SM SME)."""
     reader = csv.DictReader(io.StringIO(text))
     out: dict[str, str] = {}
     for row in reader:
@@ -125,3 +125,71 @@ def _parse_nse_equity_ids(text: str) -> dict[str, str]:
             continue
         out[sym] = sid
     return out
+
+
+def _parse_bse_mainboard_ids(text: str) -> dict[str, str]:
+    """BSE main-board series A only (skip SME MT/XT and junk series)."""
+    reader = csv.DictReader(io.StringIO(text))
+    out: dict[str, str] = {}
+    for row in reader:
+        exch = (row.get("SEM_EXM_EXCH_ID") or "").strip().upper()
+        seg = (row.get("SEM_SEGMENT") or "").strip().upper()
+        inst = (row.get("SEM_INSTRUMENT_NAME") or "").strip().upper()
+        series = (row.get("SEM_SERIES") or "").strip().upper()
+        if exch != "BSE" or seg != "E" or inst != "EQUITY":
+            continue
+        if series != "A":
+            continue
+        sym = (row.get("SEM_TRADING_SYMBOL") or "").strip().upper()
+        sid = (row.get("SEM_SMST_SECURITY_ID") or "").strip()
+        if not sym or not sid:
+            continue
+        # Prefer bare symbol without exchange suffix noise
+        out[sym] = sid
+    return out
+
+
+_BSE_MAP: dict[str, str] | None = None
+_BSE_LOADED_AT = 0.0
+
+
+def get_bse_a_map(*, force_refresh: bool = False) -> dict[str, str]:
+    """BSE series-A securityId map (main board; not SME)."""
+    global _BSE_MAP, _BSE_LOADED_AT
+    now = time.time()
+    if not force_refresh and _BSE_MAP is not None and (now - _BSE_LOADED_AT) < CACHE_MAX_AGE_SEC:
+        return _BSE_MAP
+    mapping: dict[str, str] = {}
+    try:
+        text = _load_master_csv()
+        mapping.update(_parse_bse_mainboard_ids(text))
+    except Exception:
+        pass
+    _BSE_MAP = mapping
+    _BSE_LOADED_AT = now
+    return mapping
+
+
+def list_mainboard_symbols(*, include_bse: bool = False) -> list[str]:
+    """NSE EQ (+ optional BSE A) trading symbols — SME series excluded."""
+    nse = sorted(get_nse_eq_map().keys())
+    if not include_bse:
+        return nse
+    bse = get_bse_a_map()
+    # Prefer NSE listing when the same ticker exists on both
+    nse_set = set(nse)
+    extra = sorted(s for s in bse if s not in nse_set)
+    return nse + extra
+
+
+def resolve_equity_segment(symbol: str) -> tuple[str, str] | None:
+    """Return (exchangeSegment, securityId) for NSE EQ or BSE A."""
+    symbol = symbol.upper().replace(".NS", "").replace(".BO", "")
+    sid = nse_eq_security_id(symbol)
+    if sid:
+        return "NSE_EQ", sid
+    bse = get_bse_a_map()
+    sid_b = bse.get(symbol)
+    if sid_b:
+        return "BSE_EQ", sid_b
+    return None

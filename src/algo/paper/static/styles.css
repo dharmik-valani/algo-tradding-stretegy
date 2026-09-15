@@ -448,6 +448,11 @@ button:focus-visible, a:focus-visible, select:focus-visible, input:focus-visible
   color: var(--accent);
   background: var(--accent-soft);
 }
+.badge.done {
+  border-color: rgba(120, 140, 150, 0.45);
+  color: #8aa399;
+  background: rgba(138, 163, 153, 0.12);
+}
 .sr-only {
   position: absolute;
   width: 1px;

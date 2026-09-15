@@ -119,5 +119,15 @@ def resolve_universe(params: dict | None = None) -> list[str]:
     raw = (params or {}).get("universe") or ""
     if isinstance(raw, str) and raw.strip():
         return [s.strip().upper() for s in raw.split(",") if s.strip()]
+    mode = str((params or {}).get("universe_mode") or "liquid").strip().lower()
     limit = int((params or {}).get("scan_size") or len(NIFTY500_PAPER_UNIVERSE))
-    return list(NIFTY500_PAPER_UNIVERSE[: max(1, limit)])
+    limit = max(1, limit)
+    if mode in {"nse_eq", "nse", "all_nse"}:
+        from algo.paper.dhan_equity_ids import list_mainboard_symbols
+
+        return list_mainboard_symbols(include_bse=False)[:limit]
+    if mode in {"nse_bse_eq", "nse_bse", "all"}:
+        from algo.paper.dhan_equity_ids import list_mainboard_symbols
+
+        return list_mainboard_symbols(include_bse=True)[:limit]
+    return list(NIFTY500_PAPER_UNIVERSE[:limit])

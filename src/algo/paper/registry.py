@@ -19,6 +19,7 @@ from algo.paper.equity_orb_tier import (
     Nifty500TopGainerBrkStrategy,
     Nifty500TopLoserBrkStrategy,
 )
+from algo.paper.vcp_ema import VcpEmaBreakoutStrategy
 from algo.paper.zen_credit import ZenCreditSpreadOvernightStrategy
 
 _REGISTRY: dict[str, type[Strategy]] = {
@@ -35,6 +36,7 @@ _REGISTRY: dict[str, type[Strategy]] = {
     Nifty500LoserOrbCashStrategy.id: Nifty500LoserOrbCashStrategy,
     Nifty500TopGainerBrkStrategy.id: Nifty500TopGainerBrkStrategy,
     Nifty500TopLoserBrkStrategy.id: Nifty500TopLoserBrkStrategy,
+    VcpEmaBreakoutStrategy.id: VcpEmaBreakoutStrategy,
 }
 
 

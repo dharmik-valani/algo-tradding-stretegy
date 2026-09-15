@@ -162,7 +162,8 @@ function isBasketId(id) {
     id === "nifty500_gainer_orb_cash" ||
     id === "nifty500_loser_orb_cash" ||
     id === "nifty500_top_gainer_brk" ||
-    id === "nifty500_top_loser_brk"
+    id === "nifty500_top_loser_brk" ||
+    id === "vcp_ema_breakout"
   );
 }
 
@@ -836,7 +837,8 @@ function renderAnalyticsDeskRows(strategies) {
       const tradedToday =
         !!(lc && (lc.exit != null || lc.entry != null)) ||
         Number(tv.closed_count || 0) > 0 ||
-        Number(j.trades || 0) > 0;
+        Number(j.trades || 0) > 0 ||
+        !!tv.day_done;
       const pnlSub =
         journalNet != null && Number(j.trades || 0) > 0
           ? `journal · ${j.trades || 0} closed`
@@ -849,14 +851,16 @@ function renderAnalyticsDeskRows(strategies) {
               : Math.abs(realized) > 1e-9
                 ? `realized`
                 : tradedToday
-                  ? `flat`
+                  ? `done · 1/day`
                   : `no fill today`;
       const nameSub = escapeHtml(
         [s.params?.option_type, s.timeframe, isBasket ? "basket" : s.instrument]
           .filter(Boolean)
           .join(" · ")
       );
-      const status = s.enabled ? "run" : "paused";
+      const dayDone = !isBasket && !isOpen && tradedToday;
+      const status = !s.enabled ? "paused" : isOpen ? "open" : dayDone ? "done" : "run";
+      const badgeClass = isOpen ? "on" : dayDone ? "done" : s.enabled ? "on" : "";
       if (isBasket && basket.length > 0 && (inTrade > 0 || selected > 0 || settled) && !anExpanded.has(`seen:${id}`)) {
         anExpanded.add(id);
         anExpanded.add(`seen:${id}`);
@@ -868,14 +872,14 @@ function renderAnalyticsDeskRows(strategies) {
         : "";
 
       const parent = `
-      <tr class="desk-row ${s.enabled ? "is-run" : "is-paused"} ${isOpen ? "has-open" : "is-flat"} ${expanded ? "is-expanded" : ""}" data-an-id="${escapeHtml(id)}">
+      <tr class="desk-row ${s.enabled ? "is-run" : "is-paused"} ${isOpen ? "has-open" : "is-flat"} ${dayDone ? "is-done" : ""} ${expanded ? "is-expanded" : ""}" data-an-id="${escapeHtml(id)}">
         <td data-label="Strategy" class="col-strategy">
           <div class="row-title">
             ${expandBtn}
-            <span class="badge ${s.enabled ? "on" : ""}">${status}</span>
+            <span class="badge ${badgeClass}">${status}</span>
             <span class="strat-name">${escapeHtml(s.name || s.strategy_id)}</span>
           </div>
-          <div class="meta">${nameSub}${canExpand ? ` · max ${maxTrades}/day` : " · 1 trade/day"}</div>
+          <div class="meta">${nameSub}${canExpand ? ` · max ${maxTrades}/day` : dayDone ? " · done · 1/day" : " · 1 trade/day"}</div>
         </td>
         <td data-label="Capital" class="mono">${capitalCell(
           invested,
@@ -1234,7 +1238,9 @@ function renderExecStats(session) {
       }
 
       const tradedToday =
-        !!(lc && (lc.exit != null || lc.entry != null)) || Number(tv.closed_count || 0) > 0;
+        !!(lc && (lc.exit != null || lc.entry != null)) ||
+        Number(tv.closed_count || 0) > 0 ||
+        !!tv.day_done;
       const pnlSub = settled
         ? tradedToday
           ? `settled day`
@@ -1244,14 +1250,16 @@ function renderExecStats(session) {
           : Math.abs(realized) > 1e-9
             ? `realized`
             : tradedToday
-              ? `flat`
+              ? `done · 1/day`
               : `no fill today`;
       const nameSub = escapeHtml(
         [s.params?.option_type, s.timeframe, isBasket ? "basket" : s.instrument]
           .filter(Boolean)
           .join(" · ")
       );
-      const status = s.enabled ? "run" : "paused";
+      const dayDone = !isBasket && !isOpen && tradedToday;
+      const status = !s.enabled ? "paused" : isOpen ? "open" : dayDone ? "done" : "run";
+      const badgeClass = isOpen ? "on" : dayDone ? "done" : s.enabled ? "on" : "";
       const toggleLabel = s.enabled ? "Pause" : "Resume";
       const toggleAct = s.enabled ? "pause" : "start";
       // Auto-expand baskets that already scanned / have open legs so qty rows are visible.
@@ -1266,14 +1274,14 @@ function renderExecStats(session) {
         : "";
 
       const parent = `
-      <tr class="click-row desk-row ${s.enabled ? "is-run" : "is-paused"} ${isOpen ? "has-open" : "is-flat"} ${expanded ? "is-expanded" : ""}" data-id="${escapeHtml(id)}" tabindex="0" role="button" aria-label="Open settings for ${escapeHtml(s.name)}">
+      <tr class="click-row desk-row ${s.enabled ? "is-run" : "is-paused"} ${isOpen ? "has-open" : "is-flat"} ${dayDone ? "is-done" : ""} ${expanded ? "is-expanded" : ""}" data-id="${escapeHtml(id)}" tabindex="0" role="button" aria-label="Open settings for ${escapeHtml(s.name)}">
         <td data-label="Strategy" class="col-strategy">
           <div class="row-title">
             ${expandBtn}
-            <span class="badge ${s.enabled ? "on" : ""}">${status}</span>
+            <span class="badge ${badgeClass}">${status}</span>
             <span class="strat-name">${escapeHtml(s.name)}</span>
           </div>
-          <div class="meta">${nameSub}${canExpand ? ` · max ${maxTrades}/day` : " · 1 trade/day"}</div>
+          <div class="meta">${nameSub}${canExpand ? ` · max ${maxTrades}/day` : dayDone ? " · done · 1/day" : " · 1 trade/day"}</div>
         </td>
         <td data-label="Capital" class="mono">${capitalCell(
           invested,
@@ -1496,19 +1504,30 @@ function renderDeskCards(rootId, session) {
       const total = (s.realized_pnl || 0) + (s.unrealized_pnl || 0);
       const id = s.instance_id || s.strategy_id;
       const a = map[id] || {};
-      const status = s.enabled ? "run" : "paused";
+      const tv = s.trade_view || {};
+      const isBasket = (s.basket || []).length > 0 || (s.params?.selected || []).length > 0;
+      const posQty = s.position?.quantity || 0;
+      const isOpen = !!(s.legs_in_trade || (posQty && !isBasket) || tv.in_trade);
+      const lc = tv.last_closed || null;
+      const tradedToday =
+        !!(lc && (lc.exit != null || lc.entry != null)) ||
+        Number(tv.closed_count || 0) > 0 ||
+        !!tv.day_done;
+      const dayDone = !isBasket && !isOpen && tradedToday;
+      const status = !s.enabled ? "paused" : isOpen ? "open" : dayDone ? "done" : "run";
+      const badgeClass = isOpen ? "on" : dayDone ? "done" : s.enabled ? "on" : "";
       const toggleLabel = s.enabled ? "Pause" : "Resume";
       const toggleAct = s.enabled ? "pause" : "start";
       const sub = escapeHtml(
         [s.asset_kind || "index", s.instrument, s.timeframe].filter(Boolean).join(" · ")
       );
       return `
-      <article class="exec-card ${s.enabled ? "is-run" : "is-paused"}" data-id="${id}">
+      <article class="exec-card ${s.enabled ? "is-run" : "is-paused"} ${dayDone ? "is-done" : ""}" data-id="${id}">
         <button type="button" class="exec-card-main" data-act="open">
           <div class="exec-card-top">
             <div class="exec-card-title">
               <strong>${escapeHtml(s.name)}</strong>
-              <span class="badge ${s.enabled ? "on" : ""}">${status}</span>
+              <span class="badge ${badgeClass}">${status}</span>
             </div>
             <span class="exec-card-chevron" aria-hidden="true">›</span>
           </div>

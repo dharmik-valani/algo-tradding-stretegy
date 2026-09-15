@@ -8,7 +8,7 @@ import time
 
 from algo.config import Settings
 from algo.ingest.rate_limiter import RateLimiter
-from algo.paper.dhan_equity_ids import nse_eq_security_id
+from algo.paper.dhan_equity_ids import nse_eq_security_id, resolve_equity_segment
 from algo.paper.models import Bar
 from algo.providers.base import ProviderError
 from algo.providers.dhan.client import DhanClient
@@ -799,6 +799,64 @@ class LiveQuoteProvider:
             for c in candles
         ]
 
+    def load_daily_bars(self, symbol: str, *, days: int = 400) -> list[Bar]:
+        """Daily OHLCV from Dhan /charts/historical (for VCP / EMA screens)."""
+        if self._dhan is None:
+            raise ProviderError(
+                self._last_dhan_error or "Dhan client required for historical bars",
+                code="NO_DHAN",
+            )
+        if self._rest_cooling():
+            wait = int(max(0, self._rest_cooldown_until - time.time()))
+            raise ProviderError(
+                f"Dhan charts deferred {wait}s after REST 429 (WS live marks continue)",
+                code="429",
+            )
+        segment, security_id = self._resolve_dhan_key(symbol.upper())
+        instrument = "INDEX" if segment == "IDX_I" else "EQUITY"
+        end = date.today()
+        start = end - timedelta(days=max(30, int(days)))
+        self._rest_calls["data"] = self._rest_calls.get("data", 0) + 1
+        try:
+            payload = self._dhan.post_json(
+                "/charts/historical",
+                {
+                    "securityId": str(security_id),
+                    "exchangeSegment": segment,
+                    "instrument": instrument,
+                    "expiryCode": 0,
+                    "oi": False,
+                    "fromDate": start.isoformat(),
+                    "toDate": end.isoformat(),
+                },
+            )
+        except Exception as exc:
+            self._mark_rate_limited(exc, kind="data", context=f"daily:{symbol}")
+            raise
+        self._rest_ok["data"] = self._rest_ok.get("data", 0) + 1
+        if not isinstance(payload, dict):
+            payload = {}
+        candles = parse_columnar_candles(
+            payload,
+            instrument_id=f"{segment}:{security_id}",
+            timeframe="1D",
+            source="dhan",
+        )
+        self._clear_rate_limit_on_success()
+        return [
+            Bar(
+                timestamp=c.timestamp.astimezone(IST)
+                if c.timestamp.tzinfo
+                else c.timestamp.replace(tzinfo=IST),
+                open=float(c.open),
+                high=float(c.high),
+                low=float(c.low),
+                close=float(c.close),
+                volume=float(c.volume or 0),
+            )
+            for c in candles
+        ]
+
     def synthetic_bars(self, symbol: str, *, n: int = 300, start: float | None = None) -> list[Bar]:
         """Deterministic walk for offline UI demos when no feed is available."""
         if start is None:
@@ -818,6 +876,9 @@ class LiveQuoteProvider:
     def _resolve_dhan_key(self, symbol: str) -> tuple[str, str]:
         if symbol in INDEX_LTP_KEYS:
             return INDEX_LTP_KEYS[symbol]
+        resolved = resolve_equity_segment(symbol)
+        if resolved:
+            return resolved
         sid = nse_eq_security_id(symbol)
         if sid:
             return "NSE_EQ", sid

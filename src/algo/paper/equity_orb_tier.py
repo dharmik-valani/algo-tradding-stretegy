@@ -77,7 +77,8 @@ class _EquityOrbTierBase(Strategy):
             "scan_at": "09:30",
             "range_minutes": 5,
             "top_n": 10,
-            "buffer_pct": 0.2,
+            # Wider SL gap so stops are not parked on the range extreme (was 0.2%).
+            "buffer_pct": 1.0,
             "wide_range_pct": 1.0,
             "risk_reward_1": 2.0,
             "risk_reward_2": 3.0,
@@ -91,8 +92,9 @@ class _EquityOrbTierBase(Strategy):
             "one_trade_per_symbol": True,
             # Hard daily cap for the whole basket (defaults to top_n = 10).
             "max_trades_per_day": 10,
-            "qty_per_symbol": 50,  # fallback when price outside tiers
-            "qty_tiers": "80-200:500,200-500:200,500-600:150,600-900:100,900-1500:50",
+            # Flat 10 shares per name (set qty_tiers to re-enable price bands).
+            "qty_per_symbol": 10,
+            "qty_tiers": "flat",
         }
 
     def param_schema(self) -> list[dict[str, Any]]:
@@ -146,8 +148,8 @@ class _EquityOrbTierBase(Strategy):
                 "min": 0,
                 "max": 5,
                 "step": 0.1,
-                "help": "Stop buffer beyond range / entry-candle extreme.",
-                "example": "0.2",
+                "help": "Stop buffer beyond range / entry-candle extreme (gap below low / above high).",
+                "example": "1.0",
             },
             {
                 "key": "wide_range_pct",
@@ -213,17 +215,17 @@ class _EquityOrbTierBase(Strategy):
                 "key": "qty_tiers",
                 "label": "Qty tiers",
                 "type": "text",
-                "help": "Price bands → shares: min-max:qty,... (adjust anytime).",
-                "example": "80-200:500,200-500:200,600-900:100",
+                "help": "Use 'flat' for fixed qty_per_symbol, or price bands min-max:qty,...",
+                "example": "flat",
             },
             {
                 "key": "qty_per_symbol",
-                "label": "Fallback qty",
+                "label": "Qty / symbol",
                 "type": "number",
                 "min": 1,
                 "max": 2000,
-                "help": "Used when price is outside all tiers.",
-                "example": "50",
+                "help": "Shares per name when qty_tiers is flat (or fallback outside tiers).",
+                "example": "10",
             },
             {
                 "key": "scan_size",
@@ -278,8 +280,12 @@ class _EquityOrbTierBase(Strategy):
 
     def qty_for_price(self, price: float) -> int:
         p = {**self.default_params(), **self.params}
-        tiers = parse_qty_tiers(p.get("qty_tiers"))
-        return qty_for_price(price, tiers=tiers, fallback=int(p.get("qty_per_symbol") or 50))
+        flat_qty = max(1, int(p.get("qty_per_symbol") or 10))
+        raw_tiers = p.get("qty_tiers")
+        if raw_tiers is None or str(raw_tiers).strip().lower() in {"", "flat", "off", "none", "fixed"}:
+            return flat_qty
+        tiers = parse_qty_tiers(raw_tiers)
+        return qty_for_price(price, tiers=tiers, fallback=flat_qty)
 
     def reset(self) -> None:
         self.selected: list[str] = []
@@ -647,10 +653,10 @@ class Nifty500TopGainerBrkStrategy(_EquityOrbTierBase):
     name = "NIFTY500 Top10 Gainers 5m Brk"
     description = (
         "At scan time pick top 10 NIFTY500 gainers by % (skip >₹1500). "
-        "Long when price breaks first 5m high; SL = 5m low−0.2% "
-        "(or entry-candle low−0.2% if 1st 5m range >1%); book 1:2 then 1:3. "
+        "Long when price breaks first 5m high; SL = 5m low−1% "
+        "(or entry-candle low−1% if 1st 5m range >1%); book 1:2 then 1:3. "
         "Max 10 trades/day for the basket — no new entries after the quota. "
-        "Qty by price tier (80–200→500, 200–500→200, 600–900→100)."
+        "Fixed 10 shares per symbol."
     )
     mode: Mode = "gainer"
 
@@ -660,10 +666,10 @@ class Nifty500TopLoserBrkStrategy(_EquityOrbTierBase):
     name = "NIFTY500 Top10 Losers 5m Brk"
     description = (
         "At scan time pick top 10 NIFTY500 losers by % (skip >₹1500). "
-        "Short when price breaks first 5m low; SL = 5m high+0.2% "
-        "(or entry-candle high+0.2% if 1st 5m range >1%); book 1:2 then 1:3. "
+        "Short when price breaks first 5m low; SL = 5m high+1% "
+        "(or entry-candle high+1% if 1st 5m range >1%); book 1:2 then 1:3. "
         "Max 10 trades/day for the basket — no new entries after the quota. "
-        "Qty by price tier (adjustable)."
+        "Fixed 10 shares per symbol."
     )
     mode: Mode = "loser"
 

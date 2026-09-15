@@ -14,10 +14,11 @@ from algo.paper.equity_orb_tier import _EquityOrbTierBase
 from algo.paper.journal import close_trade, list_selections, list_trades, open_trade, record_selections
 from algo.paper.models import Bar, Position, Side, SignalAction, StrategyState
 from algo.paper.quotes import LiveQuoteProvider
+from algo.paper.strategy import Strategy
 from algo.paper.universe import resolve_universe
 
 IST = ZoneInfo("Asia/Kolkata")
-_BasketStrategy = _EquityOrbBase | _EquityOrbTierBase
+_BasketStrategy = _EquityOrbBase | _EquityOrbTierBase | Strategy
 
 
 class BasketRunner:
@@ -739,6 +740,44 @@ class BasketRunner:
                 pass
         universe = resolve_universe(self.strategy.params)
         snaps: list[dict[str, Any]] = []
+        scan_fn = getattr(self.strategy, "scan_universe", None)
+        if callable(scan_fn):
+            try:
+                picked = scan_fn(quotes, universe)
+            except Exception as exc:
+                err = str(exc)
+                if "429" in err or "too many" in err.lower():
+                    self._scan_cool_until = time.time() + 300.0
+                    self._log(f"VCP/daily scan rate-limited — cooling 300s ({exc})")
+                    return
+                self._log(f"custom scan failed ({exc}) — will retry next poll")
+                return
+            max_day = self.max_trades_per_day()
+            self.selected = list(picked)[:max_day]
+            self.strategy.selected = list(self.selected)
+            self._scanned = True
+            self._ensure_brokers_for_selected()
+            if self.journal_session_id:
+                record_selections(
+                    session_id=self.journal_session_id,
+                    strategy_id=self.strategy.id,
+                    instance_id=self.instance_id,
+                    rows=getattr(self.strategy, "selection_meta", []),
+                )
+            self._log(
+                f"Selected {len(self.selected)}: {', '.join(self.selected) or 'none'} "
+                f"(from {len(universe)} scanned via strategy.scan_universe, max {max_day}/day)"
+            )
+            try:
+                seeded = quotes.seed_ltps_rest_first(self.selected, wait_ws_sec=1.0)
+                self._log(f"REST-seeded {len(seeded)}/{len(self.selected)} selected LTPs")
+            except Exception as exc:
+                self._log(f"REST seed after scan failed: {exc}")
+            try:
+                self.restore_today_from_journal()
+            except Exception as exc:
+                self._log(f"post-scan journal restore failed: {exc}")
+            return
         try:
             batch = quotes.equity_day_snapshots(universe, prefer_rest=True)
             snaps = list(batch.values())

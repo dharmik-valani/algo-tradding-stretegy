@@ -22,6 +22,7 @@ from algo.paper.equity_orb_tier import (
     Nifty500TopLoserBrkStrategy,
     _EquityOrbTierBase,
 )
+from algo.paper.vcp_ema import VcpEmaBreakoutStrategy
 from algo.paper.journal import end_journal_session, list_open_trades, start_journal_session
 from algo.paper.models import Bar, SessionSnapshot, Side, SignalAction, StrategyState
 from algo.paper.quotes import LiveQuoteProvider, suggested_poll_seconds
@@ -40,6 +41,7 @@ BASKET_IDS = {
     Nifty500LoserOrbCashStrategy.id,
     Nifty500TopGainerBrkStrategy.id,
     Nifty500TopLoserBrkStrategy.id,
+    VcpEmaBreakoutStrategy.id,
 }
 
 
@@ -491,15 +493,16 @@ class StrategyRunner:
             }
         )
         if not in_trade and last_closed and not self._desk_settled:
-            # Desk shows last closed levels so PnL isn't "mystery money".
-            st.note = st.note or self.last_signal or "HOLD"
-            if "flat" not in (st.note or "").lower() and "waiting" not in (st.note or "").lower():
-                if abs(float(st.realized_pnl or 0)) > 1e-9:
-                    st.note = f"{st.note} · flat (realized)"
-                else:
-                    st.note = f"{st.note} · flat (last closed)"
+            # One-trade-per-day ORB: after exit, desk shows DONE (not still "run/flat").
+            st.note = "done · 1 trade/day"
         day_pnl = float(self._day_pnl if self._desk_settled else day_realized)
         invested = float(st.starting_cash or 0)
+        trades_today = int(
+            getattr(self.strategy, "_trades_today", 0)
+            or (1 if last_closed else 0)
+            or 0
+        )
+        day_done = bool(not in_trade and (last_closed is not None or trades_today >= 1))
         st.trade_view = {
             **(st.trade_view or {}),
             "invested": invested,
@@ -507,6 +510,8 @@ class StrategyRunner:
             "day_pnl": day_pnl,
             "generated": invested + day_pnl,
             "desk_settled": bool(self._desk_settled),
+            "day_done": day_done,
+            "trades_today_count": trades_today,
         }
         return st
 

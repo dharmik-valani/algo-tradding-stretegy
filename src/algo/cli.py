@@ -237,6 +237,83 @@ def paper_list() -> None:
         console.print(f"  defaults: {item['default_params']}")
 
 
+@paper_app.command("screen")
+def paper_screen(
+    strategy: str = typer.Option("vcp_ema_breakout", "--strategy"),
+    scan_size: int = typer.Option(40, "--scan-size", help="Symbols to scan (rate-limit safe)"),
+    top_n: int = typer.Option(10, "--top-n"),
+    universe_mode: str = typer.Option(
+        "liquid",
+        "--universe-mode",
+        help="liquid | nse_eq | nse_bse_eq (SME excluded)",
+    ),
+    target_pct: float = typer.Option(35.0, "--target-pct"),
+) -> None:
+    """Run a one-shot equity screen (VCP+EMA) and print the watchlist."""
+    from algo.paper.quotes import LiveQuoteProvider
+    from algo.paper.registry import create_strategy
+    from algo.paper.universe import resolve_universe
+
+    settings = get_settings()
+    get_engine(settings)
+    params = {
+        "scan_size": scan_size,
+        "top_n": top_n,
+        "universe_mode": universe_mode,
+        "target_pct": target_pct,
+    }
+    strat = create_strategy(strategy, params=params)
+    if not hasattr(strat, "scan_universe"):
+        console.print(f"[red]Strategy '{strategy}' has no scan_universe hook[/red]")
+        raise typer.Exit(code=1)
+
+    universe = resolve_universe(params)
+    console.print(
+        f"Screening [bold]{strategy}[/bold] over {len(universe)} symbols "
+        f"(mode={universe_mode}, top_n={top_n})…"
+    )
+    quotes = LiveQuoteProvider(settings)
+    try:
+        picked = strat.scan_universe(quotes, universe)  # type: ignore[attr-defined]
+    except Exception as exc:
+        console.print(f"[red]Screen failed:[/red] {exc}")
+        raise typer.Exit(code=1) from exc
+
+    meta = getattr(strat, "selection_meta", []) or []
+    table = Table(title=f"VCP + EMA setups ({len(picked)} / {len(universe)})")
+    table.add_column("Symbol")
+    table.add_column("Score", justify="right")
+    table.add_column("Pivot", justify="right")
+    table.add_column("VCP low (SL)", justify="right")
+    table.add_column("Risk %", justify="right")
+    table.add_column("Target", justify="right")
+    table.add_column("Near EMA")
+    table.add_column("Vol dry")
+    if not meta:
+        console.print("[yellow]No VCP setups matched filters right now.[/yellow]")
+        console.print("Tips: raise --scan-size, or try --universe-mode nse_eq (slower).")
+        return
+    for row in meta:
+        pivot = float(row.get("pivot") or 0)
+        target = pivot * (1.0 + target_pct / 100.0) if pivot else 0.0
+        table.add_row(
+            str(row.get("symbol")),
+            f"{float(row.get('score') or 0):.3f}",
+            f"{pivot:.2f}",
+            f"{float(row.get('vcp_low') or 0):.2f}",
+            f"{float(row.get('risk_pct') or 0):.2f}",
+            f"{target:.2f}",
+            str(row.get("near_ema") or ""),
+            f"{float(row.get('vol_dry_ratio') or 0):.2f}",
+        )
+    console.print(table)
+    console.print(
+        "Entry: price breaks pivot with volume. SL = VCP low. "
+        f"Target ≈ +{target_pct:.0f}% from entry/pivot."
+    )
+    console.print("Add via Paper Desk → strategy [bold]vcp_ema_breakout[/bold] for live paper.")
+
+
 @paper_app.command("run")
 def paper_run(
     strategy: str = typer.Option("ema_cross", "--strategy"),
