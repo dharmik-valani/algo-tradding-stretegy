@@ -111,6 +111,20 @@ def _token_age_sec(token: str) -> float | None:
         return None
 
 
+def _normalize_auth_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Dhan sometimes returns ``token`` instead of ``accessToken`` on RenewToken."""
+    out = dict(payload)
+    if not str(out.get("accessToken") or "").strip():
+        alt = str(out.get("token") or out.get("access_token") or "").strip()
+        if alt:
+            out["accessToken"] = alt
+    if not str(out.get("expiryTime") or "").strip():
+        alt_exp = out.get("expiryTime") or out.get("tokenValidity") or out.get("createTime")
+        if alt_exp:
+            out["expiryTime"] = str(alt_exp)
+    return out
+
+
 def renew_access_token(*, client_id: str, access_token: str, timeout: float = 20.0) -> dict[str, Any]:
     """Renew an *active* web SELF token via GET ``/v2/RenewToken``.
 
@@ -141,8 +155,10 @@ def renew_access_token(*, client_id: str, access_token: str, timeout: float = 20
     try:
         response = requests.get(url, headers=headers, timeout=timeout)
         payload = response.json() if response.content else {}
-        if response.status_code == 200 and isinstance(payload, dict) and payload.get("accessToken"):
-            return payload
+        if response.status_code == 200 and isinstance(payload, dict):
+            payload = _normalize_auth_payload(payload)
+            if payload.get("accessToken"):
+                return payload
         msg = (
             (payload.get("errorMessage") if isinstance(payload, dict) else None)
             or (payload.get("message") if isinstance(payload, dict) else None)
@@ -154,8 +170,10 @@ def renew_access_token(*, client_id: str, access_token: str, timeout: float = 20
         last_err = exc
     try:
         payload = _login(client_id).renew_token(access_token)
-        if isinstance(payload, dict) and payload.get("accessToken"):
-            return payload
+        if isinstance(payload, dict):
+            payload = _normalize_auth_payload(payload)
+            if payload.get("accessToken"):
+                return payload
     except Exception as exc:
         last_err = exc
     raise ProviderError(
@@ -229,6 +247,7 @@ def _seconds_left(token: str) -> float | None:
 
 def apply_auth_payload(settings: Settings, payload: dict[str, Any], *, source: str) -> str:
     client_id = _client_id(settings)
+    payload = _normalize_auth_payload(payload if isinstance(payload, dict) else {})
     new_tok = str(payload.get("accessToken") or "").strip()
     if not new_tok:
         raise ProviderError("empty accessToken in auth payload", code="AUTH")
