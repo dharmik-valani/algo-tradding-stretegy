@@ -798,7 +798,13 @@ class PaperSession:
                 if key in self.runners:
                     raise ValueError(f"Strategy instance already on desk: {key}")
                 get_engine(self.settings)
-                assert isinstance(strategy, (_EquityOrbBase, _EquityOrbTierBase))
+                # Basket runners accept ORB bases and any Strategy with is_basket / scan_universe
+                # (e.g. VcpEmaBreakoutStrategy).
+                if not (
+                    isinstance(strategy, (_EquityOrbBase, _EquityOrbTierBase))
+                    or getattr(strategy, "is_basket", False)
+                ):
+                    raise ValueError(f"Strategy {strategy_id} is not a basket strategy")
                 runner = BasketRunner(
                     instance_id=key,
                     strategy=strategy,
