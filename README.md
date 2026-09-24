@@ -22,9 +22,19 @@ algo doctor
 algo instruments sync
 algo data download --instrument NIFTY --timeframe 5m --start 2025-01-01 --end 2026-01-01
 
+# Bulk history for backtest + paper replay (indices then equities)
+algo data bootstrap
+algo data inventory
+
+# Keep candles filling in the background (token renew + bootstrap every 6h)
+algo data daemon --background
+#   log:  data/logs/data-sync-daemon.log
+#   stop: algo data daemon --stop
+
 # Paper Desk UI (multi-strategy)
 algo paper ui
 # → http://127.0.0.1:8787
+# Settings → Mode: Backtest (historical replay) | Paper trade (live marks)
 ```
 
 Or CLI replay tonight:

@@ -572,10 +572,93 @@ function renderCalendar(cal) {
       const day = c.date.slice(-2);
       const pnl = c.pnl;
       const cls = pnl == null ? "" : pnlClass(pnl);
-      return `<div class="cal-cell ${cls}"><span class="d">${day}</span><strong>${pnl == null ? "—" : `₹${money(pnl)}`}</strong></div>`;
+      const active = selectedCalDay === c.date ? "is-active" : "";
+      return `<button type="button" class="cal-cell ${cls} ${active}" data-cal-day="${escapeHtml(c.date)}" title="Open trades for ${escapeHtml(c.date)}"><span class="d">${day}</span><strong>${pnl == null ? "—" : `₹${money(pnl)}`}</strong></button>`;
     })
     .join("");
+  if (!calGrid.dataset.wiredClick) {
+    calGrid.dataset.wiredClick = "1";
+    calGrid.addEventListener("click", (e) => {
+      const btn = e.target.closest("[data-cal-day]");
+      if (!btn) return;
+      openCalendarDay(btn.dataset.calDay);
+    });
+  }
 }
+
+let selectedCalDay = null;
+
+async function openCalendarDay(day) {
+  if (!day) return;
+  selectedCalDay = day;
+  const detail = $("calDayDetail");
+  const body = $("calDayBody");
+  const title = $("calDayTitle");
+  if (detail) detail.classList.remove("hidden");
+  if (title) title.textContent = `Trades · ${day}`;
+  if ($("anFrom")) $("anFrom").value = day;
+  if ($("anTo")) $("anTo").value = day;
+  if ($("rpFrom")) $("rpFrom").value = day;
+  if ($("rpTo")) $("rpTo").value = day;
+  const strat = ($("anStrategy")?.value || $("rpStrategy")?.value || "").trim();
+  if (body) {
+    body.innerHTML = `<tr><td colspan="8" class="empty-cell">Loading ${escapeHtml(day)}…</td></tr>`;
+  }
+  try {
+    const q = new URLSearchParams({ from_date: day, to_date: day });
+    if (strat) q.set("strategy_id", strat);
+    const data = await api(`/api/reports/trades?${q.toString()}`);
+    const trades = data.trades || [];
+    if (!body) return;
+    if (!trades.length) {
+      body.innerHTML = `<tr><td colspan="8" class="empty-cell">No journal trades on ${escapeHtml(day)} for this filter.</td></tr>`;
+      return;
+    }
+    body.innerHTML = trades
+      .map((t) => {
+        const meta = t.meta || {};
+        const structure = String(meta.structure || "").toLowerCase();
+        const shortLeg = String(meta.short_leg || "");
+        const longLeg = String(meta.long_leg || "");
+        const reason = t.reason || meta.reason || "";
+        const cePe =
+          meta.option_type ||
+          (structure.includes("put") || shortLeg.includes(" PE") || /put/i.test(reason)
+            ? "PE"
+            : structure.includes("call") || shortLeg.includes(" CE") || /call/i.test(reason)
+              ? "CE"
+              : "");
+        const side = meta.structure || t.side || meta.option_type || "—";
+        const label = [side, cePe].filter(Boolean).join(" · ");
+        const legs = [shortLeg, longLeg].filter(Boolean).join(" / ");
+        const hint = legs || reason || meta.structure || "";
+        return `<tr>
+          <td class="mono">${escapeHtml(formatIst(t.entry_at || t.exit_at || ""))}</td>
+          <td>${escapeHtml(t.strategy_id || "")}</td>
+          <td>${escapeHtml(label || "—")}</td>
+          <td>${escapeHtml(t.symbol || "")}</td>
+          <td class="mono">${t.entry_price != null ? money(t.entry_price) : "—"}</td>
+          <td class="mono">${t.exit_price != null ? money(t.exit_price) : "—"}</td>
+          <td class="mono ${pnlClass(t.realized_pnl)}">${t.realized_pnl != null ? `₹${money(t.realized_pnl)}` : "—"}</td>
+          <td class="hint">${escapeHtml(String(hint).slice(0, 120))}</td>
+        </tr>`;
+      })
+      .join("");
+  } catch (err) {
+    if (body) {
+      body.innerHTML = `<tr><td colspan="8" class="empty-cell">${escapeHtml(err.message || String(err))}</td></tr>`;
+    }
+  }
+  refreshAnalyticsBoard();
+}
+
+$("calDayClose")?.addEventListener("click", () => {
+  selectedCalDay = null;
+  $("calDayDetail")?.classList.add("hidden");
+  renderCalendar({ year: calYear, month: calMonth, cells: [], month_pnl: 0 });
+  refreshAnalyticsBoard();
+});
+
 
 async function refreshAnalyticsBoard() {
   const seq = ++analyticsBoardSeq;

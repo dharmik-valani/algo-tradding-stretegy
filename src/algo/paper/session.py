@@ -32,6 +32,38 @@ from algo.storage.db import get_engine
 from algo.storage.repositories import get_instrument_by_symbol
 from algo.storage.db import session_scope
 
+# Cached Dhan rolling ATM±wing marks for Zen paper replay (optional).
+_ZEN_SURFACE: dict[int, dict[str, float]] | None = None
+_ZEN_SURFACE_LOADED = False
+
+
+def _load_zen_option_surface() -> dict[int, dict[str, float]] | None:
+    """Load data/rolling/nifty_zen_sept_2026.json once for Zen credit replay marks."""
+    global _ZEN_SURFACE, _ZEN_SURFACE_LOADED
+    if _ZEN_SURFACE_LOADED:
+        return _ZEN_SURFACE
+    _ZEN_SURFACE_LOADED = True
+    try:
+        import json
+        from pathlib import Path
+
+        # Prefer project data/rolling (cwd may be repo root or elsewhere).
+        candidates = [
+            Path("data/rolling/nifty_zen_6m_2026.json"),
+            Path("data/rolling/nifty_zen_sept_2026.json"),
+            Path(__file__).resolve().parents[3] / "data" / "rolling" / "nifty_zen_6m_2026.json",
+            Path(__file__).resolve().parents[3] / "data" / "rolling" / "nifty_zen_sept_2026.json",
+        ]
+        for path in candidates:
+            if path.is_file():
+                raw = json.loads(path.read_text())
+                surface = raw.get("surface") or {}
+                _ZEN_SURFACE = {int(k): v for k, v in surface.items()}
+                return _ZEN_SURFACE
+    except Exception:
+        _ZEN_SURFACE = None
+    return _ZEN_SURFACE
+
 IST = ZoneInfo("Asia/Kolkata")
 
 BASKET_IDS = {
@@ -123,10 +155,12 @@ class StrategyRunner:
         self.last_signal = "HOLD"
         self.last_bar_at: datetime | None = None
         self.enabled = True
+        self.mode = "idle"  # live | replay — set by PaperSession
         self.option_state: dict[str, float] = {}
         self.mark_price: float | None = None
         self._forming_bar: Bar | None = None
-        self._desk_day = datetime.now(IST).date()
+        # Start unset so first bar establishes the day without a false roll.
+        self._desk_day: date | None = None
         self.journal_session_id: str | None = None
         self.open_trade_id: str | None = None
         self._desk_settled = False
@@ -521,7 +555,13 @@ class StrategyRunner:
         today = bar.timestamp.astimezone(IST).date()
         if self._desk_day != today:
             # New IST day — reset desk counters; journal history stays in DB.
-            if self.broker.position.quantity == 0:
+            # Replay must keep continuous indicator history + capital (multi-day EMA/SMA).
+            # Live desk still rolls a fresh virtual book when flat (day PnL UX).
+            if self.mode == "replay":
+                self._desk_settled = False
+                self._day_pnl = 0.0
+                self._eod_done_day = None
+            elif self.broker.position.quantity == 0:
                 self.strategy.reset()
                 self.broker = PaperBroker(
                     starting_cash=self.broker.starting_cash,
@@ -553,10 +593,12 @@ class StrategyRunner:
         if signal.meta.get("mark_price") is not None:
             self.mark_price = float(signal.meta["mark_price"])
         fill_px = float(signal.meta["fill_price"]) if signal.meta.get("fill_price") is not None else float(bar.close)
-        self._log(
-            f"{bar.timestamp.astimezone(IST).strftime('%H:%M:%S')} "
-            f"{signal.action.value} @ {fill_px:.2f} — {signal.reason}"
-        )
+        # Replay: skip per-bar HOLD spam (keeps memory/CPU sane on multi-year runs).
+        if self.mode != "replay" or signal.action is not SignalAction.HOLD:
+            self._log(
+                f"{bar.timestamp.astimezone(IST).strftime('%H:%M:%S')} "
+                f"{signal.action.value} @ {fill_px:.2f} — {signal.reason}"
+            )
         pos_qty = self.broker.position.quantity
         meta = signal.meta or {}
         if signal.action is SignalAction.BUY and pos_qty <= 0:
@@ -827,7 +869,15 @@ class PaperSession:
                 kind = "index"
                 if "bar_minutes" not in params:
                     params["bar_minutes"] = 5
-                    strategy.params = params
+                # Stratzy Dhan Algos: min ₹1L / max ₹3.2L ≈ 1–4 NIFTY lots (65).
+                # Qty field is FO units; default to lot_size when caller passes 1.
+                lot = max(int(params.get("lot_size") or 65), 1)
+                if int(quantity or 1) <= 1:
+                    quantity = lot
+                # Stratzy spotlight: flatten next day ~15:00 if SL not hit.
+                if "overnight_exit" not in (params or {}):
+                    params["overnight_exit"] = "15:00"
+                strategy.params = params
             opt = str(params.get("option_type", "CE")).upper()
             strike_mode = str(params.get("strike_mode", "ATM"))
             key = instance_id or f"{strategy_id}:{symbol.upper()}:{kind}:{opt}:{strike_mode}"
@@ -1602,11 +1652,15 @@ class PaperSession:
         self.running = True
         self.started_at = utcnow()
         self.message = "Replay…"
+        self.journal_session_id = start_journal_session(mode="replay", message="Paper replay")
+        for r in self.runners.values():
+            r.journal_session_id = self.journal_session_id
         try:
             self._run_replay(max_bars)
         finally:
             self.running = False
-            self.message = "Replay complete"
+            self.message = self.message if self.message else "Replay complete"
+            end_journal_session(self.journal_session_id, message=self.message)
             self.updated_at = utcnow()
         return self.snapshot()
 
@@ -1614,14 +1668,39 @@ class PaperSession:
         symbol = runner.symbol
         timeframe = runner.timeframe
         if runner.strategy.id == "zen_credit_spread":
+            # Prefer Dhan-ingested NIFTY 5m. Alpha warmup ≈ 800m → need history before the
+            # visible backtest window (Jul–Sep ⇒ load from ~1 Jun).
+            zen_max = max(max_bars or 8000, 8000)
+            days_back = max(120, int(zen_max / 75) + 20)
+            start = (datetime.now(IST).date() - timedelta(days=days_back)).isoformat()
+            try:
+                df = load_candles(symbol, "5m", start=start)
+                if not df.empty:
+                    bars = [
+                        Bar(
+                            timestamp=ts.to_pydatetime(),
+                            open=float(row.open),
+                            high=float(row.high),
+                            low=float(row.low),
+                            close=float(row.close),
+                            volume=float(row.volume or 0),
+                        )
+                        for ts, row in df.iterrows()
+                    ]
+                    self.message = (
+                        f"Replay Zen credit-spread on DB {symbol} 5m "
+                        f"({len(bars)} bars from {start})…"
+                    )
+                    return bars[-zen_max:]
+            except Exception:
+                pass
             quotes = LiveQuoteProvider(self.settings, enable_dhan_feed=False)
             try:
-                # Need ≥800 minutes of 5m history for alpha lookback.
                 bars = quotes.load_public_bars(symbol, interval="5m", range_="60d")
                 self.message = f"Replay Zen credit-spread on public {symbol} 5m bars…"
-                return bars[-max_bars:] if max_bars else bars
+                return bars[-zen_max:]
             except Exception:
-                bars = quotes.synthetic_bars(symbol, n=max(max_bars or 900, 900))
+                bars = quotes.synthetic_bars(symbol, n=max(zen_max, 900))
                 self.message = f"Replay Zen using synthetic {symbol} 5m bars…"
                 return bars
 
@@ -1648,7 +1727,22 @@ class PaperSession:
                 # reinterpret synthetic as premium-like levels
                 return bars
 
-        df = load_candles(symbol, timeframe)
+        # Load only the window we need (full-history pull from Postgres is too slow).
+        start = None
+        if max_bars:
+            per_day = {
+                "1m": 375,
+                "5m": 75,
+                "15m": 25,
+                "1h": 7,
+                "1D": 1,
+            }.get(timeframe, 75)
+            days = max(5, int(max_bars / max(per_day, 1)) + 10)
+            start = (datetime.now(IST).date() - timedelta(days=days)).isoformat()
+        try:
+            df = load_candles(symbol, timeframe, start=start)
+        except Exception:
+            df = load_candles(symbol, timeframe)
         if not df.empty:
             bars = [
                 Bar(
@@ -1690,9 +1784,18 @@ class PaperSession:
                 if not bars:
                     self.message = f"No bars available for {runner.symbol} {runner.timeframe}"
                     continue
+                runner.mode = "replay"
                 if runner.asset_kind == "option" and bars and bars[0].volume:
                     runner.strategy.params["strike"] = int(bars[0].volume)
                     runner.strategy._selected_strike = int(bars[0].volume)  # type: ignore[attr-defined]
+                if runner.strategy.id == "zen_credit_spread":
+                    surface = _load_zen_option_surface()
+                    if surface:
+                        runner.strategy.option_surface = surface  # type: ignore[attr-defined]
+                        self.message = (
+                            f"Replay Zen with Dhan rolling option marks "
+                            f"({len(surface)} surface bars)…"
+                        )
                 for bar in bars:
                     if self._stop.is_set():
                         break

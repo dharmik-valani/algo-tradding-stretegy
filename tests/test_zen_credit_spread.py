@@ -36,6 +36,22 @@ def test_zen_registered():
     s = create_strategy("zen_credit_spread")
     assert s.default_params()["entry_start"] == "10:15"
     assert s.default_params()["spread_width"] == 400
+    assert s.default_params()["hold_overnight"] is True
+    assert s.default_params()["lot_size"] == 65
+    assert s.default_params()["overnight_exit"] == "15:00"
+
+
+def test_overnight_theta_reduces_atm_premium():
+    """Flat overnight must shrink ATM premium (Stratzy edge = theta + direction)."""
+    from algo.paper.zen_credit import _bs_premium, _years_to_weekly_expiry
+
+    entry = datetime(2026, 9, 21, 14, 0, tzinfo=IST)  # Monday
+    exit_ = datetime(2026, 9, 22, 10, 15, tzinfo=IST)  # Tuesday morning
+    t0 = _years_to_weekly_expiry(entry)
+    t1 = _years_to_weekly_expiry(exit_)
+    pe0 = _bs_premium(24500, 24500, opt="PE", iv=0.15, tte=t0)
+    pe1 = _bs_premium(24500, 24500, opt="PE", iv=0.15, tte=t1)
+    assert pe1 < pe0, f"expected overnight decay {pe0} → {pe1}"
 
 
 def test_percentile_rank_extremes():
@@ -85,6 +101,9 @@ def test_zen_bullish_enters_put_credit():
             "alpha_long": 0.8,
             "alpha_short": 0.2,
             "min_impulse_pts": 25,
+            "entry_weekdays": "all",
+            "confirm_bars": 1,
+            "tp_credit_frac": 0.0,
         }
     )
     day = datetime(2026, 9, 7, 9, 15, tzinfo=IST)
