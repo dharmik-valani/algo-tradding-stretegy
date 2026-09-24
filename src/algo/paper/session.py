@@ -2131,9 +2131,9 @@ class PaperSession:
                         labels.extend(runner.tick_live(quotes, skip_selection=True))
                     src = f"{quotes.feed_status}|{self._feed_phase}|{drive_tag}"
                 elif runner.strategy.id == "zen_credit_spread":
-                    sym = (getattr(runner, "symbol", "") or "").upper()
-                    if dirty is not None and sym and sym not in dirty:
-                        continue
+                    # Index LTP is often REST-seeded and rarely WS-dirty while
+                    # equity baskets keep the socket busy. Skip the dirty filter
+                    # so Zen alphas/MTM still advance on every wake.
                     bar = self._live_zen_bar(runner)
                     runner.on_bar(bar)
                     a = getattr(runner.strategy, "_structure", None) or "flat"
@@ -2324,6 +2324,25 @@ class PaperSession:
                             self._runtime_tick += 1
                             self._live_checkpoint()
                         else:
+                            # Quiet book but feed alive — still advance Zen from
+                            # cached index mark (equities may be the only WS ticks).
+                            zen_dirty = {
+                                (getattr(r, "symbol", "") or "").upper()
+                                for r in runners
+                                if r.enabled
+                                and getattr(r.strategy, "id", "") == "zen_credit_spread"
+                                and (getattr(r, "symbol", "") or "")
+                            }
+                            if zen_dirty:
+                                self._live_apply_runners(
+                                    runners,
+                                    quotes,
+                                    dirty_syms=zen_dirty,
+                                    allow_rest=False,
+                                    drive_tag="ws_tick",
+                                )
+                                self._runtime_tick += 1
+                                self._live_checkpoint()
                             for runner in runners:
                                 if not runner.enabled or not isinstance(runner, BasketRunner):
                                     continue
