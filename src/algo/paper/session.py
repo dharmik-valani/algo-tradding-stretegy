@@ -2062,6 +2062,11 @@ class PaperSession:
         # Before basket scan, still keep premarket underlyings subscribed.
         if not want_syms:
             want_syms = self._premarket_symbols(runners)
+        # Always pin index underlyings (NIFTY for Zen) so basket set_subscriptions
+        # never drops IDX_I:13 from the live want-set.
+        for sym in self._premarket_symbols(runners):
+            if sym and sym not in want_syms:
+                want_syms.append(sym)
         today = datetime.now(IST).date()
         want_key = frozenset(want_syms)
         coverage = quotes.mark_coverage(want_syms) if want_syms else 1.0
@@ -2074,6 +2079,13 @@ class PaperSession:
                 and (self._runtime_tick == 0 or self._runtime_tick % 3 == 0)
             )
         )
+        # IDX_I ticks are sparse vs NSE_EQ — REST-refresh index LTPs each housekeep
+        # so Zen alphas see a fresh spot even when the last index packet is old.
+        index_syms = [
+            s
+            for s in want_syms
+            if s.upper() in {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX"}
+        ]
 
         try:
             if need_rest_seed and want_syms:
@@ -2088,6 +2100,11 @@ class PaperSession:
             elif want_syms:
                 quotes.set_subscriptions(want_syms)
                 quotes.prefetch_ltps(want_syms, wait_ws_sec=0.5, allow_rest=False)
+            if index_syms and not quotes._rest_cooling():
+                try:
+                    quotes.prefetch_ltps(index_syms, wait_ws_sec=0.0, allow_rest=True)
+                except Exception:
+                    pass
             if want_syms and coverage >= 0.75 and not ws_down:
                 self._feed_phase = "ws_live"
         except Exception:
@@ -2395,8 +2412,11 @@ class PaperSession:
                 if not runner.history:
                     runner.history = []
 
+        # Never block the WS-tick loop waiting on index packets — NIFTY IDX_I
+        # updates are sparser than equities. Use cache immediately; housekeep
+        # REST-refreshes the index on a timer so marks stay fresh.
         price, ts, _ = self._quotes.get_ltp(
-            runner.symbol, allow_rest=False, wait_ws_sec=0.8, max_stale_sec=180
+            runner.symbol, allow_rest=False, wait_ws_sec=0.0, max_stale_sec=180
         )
         if not runner.history:
             # Still no history — emit a single forming bar so UI is not stuck on LTP error.

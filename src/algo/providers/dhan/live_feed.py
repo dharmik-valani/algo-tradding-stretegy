@@ -400,6 +400,19 @@ class DhanLiveFeed:
                 ],
             }
             await ws.send(json.dumps(body))
+            # IDX_I often streams ResponseCode=1 (index) via ticker path more
+            # reliably than quote-only — dual-subscribe indexes for faster LTP.
+            idx_chunk = [(seg, sid) for seg, sid in chunk if seg == "IDX_I"]
+            if idx_chunk and code != REQ_SUB_TICKER:
+                idx_body = {
+                    "RequestCode": REQ_SUB_TICKER,
+                    "InstrumentCount": len(idx_chunk),
+                    "InstrumentList": [
+                        {"ExchangeSegment": seg, "SecurityId": sid}
+                        for seg, sid in idx_chunk
+                    ],
+                }
+                await ws.send(json.dumps(idx_body))
             with self._lock:
                 self._subscribed.update(chunk)
             await asyncio.sleep(0.05)
@@ -438,8 +451,27 @@ class DhanLiveFeed:
                     {"prev_close": pkt["prev_close"]},
                 )
             elif code == RESP_INDEX:
-                # Index packet — treat first float after header as LTP when long enough
-                if len(buf) >= 12:
+                # Index packet (IDX_I / NIFTY50). Layout: header(8) + LTP float32.
+                # Longer frames may also carry OHLC like a quote — accept both.
+                if len(buf) >= 50:
+                    try:
+                        pkt = parse_quote_payload(buf[:50])
+                        self._upsert(
+                            pkt["segment"],
+                            pkt["security_id"],
+                            {
+                                "ltp": pkt["ltp"],
+                                "ltt": pkt.get("ltt"),
+                                "open": pkt.get("open"),
+                                "high": pkt.get("high"),
+                                "low": pkt.get("low"),
+                                "close": pkt.get("close"),
+                            },
+                        )
+                    except Exception:
+                        _, _, segment, sid = parse_header(buf)
+                        self._upsert(segment, sid, {"ltp": _f32(buf, 8)})
+                elif len(buf) >= 12:
                     _, _, segment, sid = parse_header(buf)
                     self._upsert(segment, sid, {"ltp": _f32(buf, 8)})
             elif code == RESP_DISCONNECT:

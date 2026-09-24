@@ -605,7 +605,15 @@ class LiveQuoteProvider:
             return price, datetime.now(tz=IST), "dhan-ws"
 
         cached = self._cached_mark(symbol, max_stale_sec=stale_budget)
-        if cached is not None:
+        # Indexes update slowly on WS — if the cached mark is older than 15s,
+        # fall through to REST (when not cooling) instead of serving a stale spot.
+        if cached is not None and symbol in INDEX_LTP_KEYS:
+            row = self._mark_cache.get(symbol)
+            age = (time.monotonic() - row[1]) if row else 999.0
+            if age <= 15.0 or self._rest_cooling() or not allow_rest and self._dhan is None:
+                return cached
+            # age > 15s → try REST below
+        elif cached is not None:
             return cached
 
         # REST seed when WS is silent (connected-but-no-equity-ticks is common on Dhan).
@@ -624,7 +632,12 @@ class LiveQuoteProvider:
                 self._clear_rate_limit_on_success()
                 return px, ts, "dhan-rest"
             except Exception:
+                if cached is not None:
+                    return cached
                 pass
+
+        if cached is not None:
+            return cached
 
         raise ProviderError(
             "No Dhan mark yet — REST/WS both empty; waiting for next poll",
